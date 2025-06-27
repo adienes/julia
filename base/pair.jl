@@ -68,6 +68,5 @@ function convert(::Type{Pair{A,B}}, x::Pair) where {A,B}
 end
 
 function promote_rule(::Type{Pair{A1,B1}}, ::Type{Pair{A2,B2}}) where {A1,B1,A2,B2}
-    ptup = promote_type(Tuple{A1,B1}, Tuple{A2,B2})
-    return Pair{fieldtype(ptup, 1), fieldtype(ptup, 2)}
+    return Pair{typejoin(A1,B1), typejoin(A2,B2)}
 end
