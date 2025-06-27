@@ -61,11 +61,16 @@ last(p::Pair) = p.second
 convert(::Type{Pair{A,B}}, x::Pair{A,B}) where {A,B} = x
 function convert(::Type{Pair{A,B}}, x::Pair) where {A,B}
     a = getfield(x, :first)
-    a isa A || (a = convert(A, a))
+    a_ = a isa A ? a : convert(A, a)
     b = getfield(x, :second)
-    b isa B || (b = convert(B, b))
-    return Pair{A,B}(a, b)::Pair{A,B}
+    b_ = b isa B ? b : convert(B, b)
+    if !(isequal(a, a_) && isequal(b, b_))
+        throw(ArgumentError("$a_ => $b_ is not a valid key for type $(Pair{A,B})"))
+    end
+    return Pair{A,B}(a_, b_)::Pair{A,B}
 end
 
-promote_rule(::Type{Pair{A1,B1}}, ::Type{Pair{A2,B2}}) where {A1,B1,A2,B2} =
-    Pair{promote_type(A1, A2), promote_type(B1, B2)}
+function promote_rule(::Type{Pair{A1,B1}}, ::Type{Pair{A2,B2}}) where {A1,B1,A2,B2}
+    ptup = promote_type(Tuple{A1,B1}, Tuple{A2,B2})
+    return Pair{fieldtype(ptup, 1), fieldtype(ptup, 2)}
+end
