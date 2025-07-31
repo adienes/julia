@@ -36,12 +36,14 @@ end
     @test convert(Pair{Float64,Int}, 17 => 4711) === (17.0 => 4711)
     @test convert(Pair{Any,Any}, 17 => 4711) === Pair{Any,Any}(17, 4711)
     @test convert(Pair{Number,Number}, 17 => 4711) === Pair{Number,Number}(17, 4711)
-    @test_throws "promotion of types" promote(1=>1, 2=>2.0)
-    @test_throws "promotion of types" promote(1=>1, 2.0=>2)
+    @test promote(1=>1, 2=>2.0) === (Pair{Int64, Real}(1, 1), Pair{Int64, Real}(2, 2.0))
+    @test promote(1=>1, 2.0=>2) === (Pair{Real, Int64}(1, 1), Pair{Real, Int64}(2.0, 2))
+    @test promote(1=>1.0, 2.0=>2) === (Pair{Real, Real}(1, 1.0), Pair{Real, Real}(2.0, 2))
+    @test promote(1=>1, :b=>2.0) === (Pair{Any, Real}(1, 1), Pair{Any, Real}(:b, 2.0))
     @test isa([:a=>1, :b=>2], Vector{Pair{Symbol, Int}})
-    @test isa([:a=>1, :b=>2.0], Vector{Pair{Symbol}})
-    @test isa(["a"=>1, :b=>2], Vector{Pair{A, Int} where A})
-    @test isa(["a"=>1, :b=>2.0], Vector{Pair})
+    @test isa([:a=>1, :b=>2.0], Vector{Pair{Symbol, Real}})
+    @test isa(["a"=>1, :b=>2], Vector{Pair{Any, Int}})
+    @test isa(["a"=>1, :b=>2.0], Vector{Pair{Any, Real}})
 
     p = 1=>:foo
     @test first(p) == 1

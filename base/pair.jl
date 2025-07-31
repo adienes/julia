@@ -66,3 +66,6 @@ function convert(::Type{Pair{A,B}}, x::Pair) where {A,B}
     b isa B || (b = convert(B, b))
     return Pair{A,B}(a, b)::Pair{A,B}
 end
+
+promote_rule(::Type{Pair{A1,B1}}, ::Type{Pair{A2,B2}}) where {A1,B1,A2,B2} =
+    Pair{typejoin(A1, A2), typejoin(B1, B2)}
