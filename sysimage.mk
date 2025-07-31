@@ -18,7 +18,7 @@ $(build_private_libdir)/%.$(SHLIB_EXT): $(build_private_libdir)/%-o.a
 	@$(call PRINT_LINK, $(CXX) $(LDFLAGS) -shared $(fPIC) -L$(build_private_libdir) -L$(build_libdir) -L$(build_shlibdir) -o $@ \
 		$(WHOLE_ARCHIVE) $< $(NO_WHOLE_ARCHIVE) \
 		$(if $(findstring -debug,$(notdir $@)),-ljulia-internal-debug -ljulia-debug,-ljulia-internal -ljulia) \
-		$$([ $(OS) = WINNT ] && echo '' $(LIBM) -lssp --disable-auto-import --disable-runtime-pseudo-reloc))
+		$$([ $(OS) = WINNT ] && echo '' $(LIBM) -lssp -Wl,--disable-auto-import -Wl,--disable-runtime-pseudo-reloc))
 	@$(INSTALL_NAME_CMD)$(notdir $@) $@
 	@$(DSYMUTIL) $@
 
@@ -31,32 +31,48 @@ COMPILER_SRCS := $(addprefix $(JULIAHOME)/, \
 		base/abstractset.jl \
 		base/iddict.jl \
 		base/idset.jl \
+		base/anyall.jl \
 		base/array.jl \
+		base/baseext.jl \
 		base/bitarray.jl \
 		base/bitset.jl \
 		base/bool.jl \
+		base/c.jl \
+		base/checked.jl \
+		base/cmem.jl \
+		base/coreio.jl \
+		base/coreir.jl \
 		base/ctypes.jl \
 		base/error.jl \
 		base/essentials.jl \
 		base/expr.jl \
 		base/exports.jl \
+		base/flfrontend.jl \
+		base/float.jl \
+		base/gcutils.jl \
 		base/generator.jl \
+		base/genericmemory.jl \
 		base/int.jl \
 		base/indices.jl \
 		base/iterators.jl \
 		base/invalidation.jl \
 		base/module.jl \
 		base/namedtuple.jl \
+		base/ntuple.jl \
 		base/number.jl \
 		base/operators.jl \
 		base/options.jl \
+		base/ordering.jl \
 		base/pair.jl \
 		base/pointer.jl \
 		base/promotion.jl \
+		base/public.jl \
 		base/range.jl \
-		base/runtime_internals.jl \
-		base/traits.jl \
 		base/refvalue.jl \
+		base/rounding.jl \
+		base/runtime_internals.jl \
+		base/strings/lazy.jl \
+		base/traits.jl \
 		base/tuple.jl)
 COMPILER_SRCS += $(shell find $(JULIAHOME)/Compiler/src -name \*.jl -and -not -name verifytrim.jl -and -not -name show.jl)
 # sort these to remove duplicates
