@@ -436,8 +436,8 @@ end
 
 @propagate_inbounds function getindex(a::ReinterpretArray{T,N,S}, i::Int) where {T,N,S}
     check_readable(a)
+    check_ptr_indexable(a) && return _getindex_ptr(a, i)
     if isa(IndexStyle(a), IndexLinear)
-        check_ptr_indexable(a) && return _getindex_ptr(a, i)
         return _getindex_ra(a, i, ())
     end
     # Convert to full indices here, to avoid needing multiple conversions in
@@ -598,8 +598,8 @@ end
 
 @propagate_inbounds function setindex!(a::ReinterpretArray{T,N,S}, v, i::Int) where {T,N,S}
     check_writable(a)
+    check_ptr_indexable(a) && return _setindex_ptr!(a, v, i)
     if isa(IndexStyle(a), IndexLinear)
-        check_ptr_indexable(a) && return _setindex_ptr!(a, v, i)
         return _setindex_ra!(a, v, i, ())
     end
     inds = _to_subscript_indices(a, i)
