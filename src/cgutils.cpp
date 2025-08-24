@@ -4427,35 +4427,109 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
                 return ret;
             }
         }
+        // Late-rooting optimization: find first field that may allocate
+        size_t first_alloc_field = nf;
+        for (size_t i = 0; i < nargs; i++) {
+            jl_value_t *ft = jl_svecref(sty->types, i);
+            // Check if this field might allocate when boxing or converting
+            if (jl_field_isptr(sty, i)) {
+                // Pointer fields may need boxing if rhs is not already boxed
+                if (!argv[i].isboxed) {
+                    first_alloc_field = i;
+                    break;
+                }
+            }
+            else if (jl_is_uniontype(ft)) {
+                // Union types may allocate during conversion
+                first_alloc_field = i;
+                break;
+            }
+            else if (!jl_is_concrete_type(ft) || !jl_is_pointerfree(ft)) {
+                // Non-concrete or non-pointerfree types may allocate
+                first_alloc_field = i;
+                break;
+            }
+        }
+
         Value *strct = emit_allocobj(ctx, sty, nargs >= nf);
         setName(ctx.emission_context, strct, arg_typename);
-        jl_cgval_t strctinfo = mark_julia_type(ctx, strct, true, ty);
-        strct = decay_derived(ctx, strct);
-        undef_derived_strct(ctx, strct, sty, strctinfo.tbaa);
+
+        // Don't create strctinfo (which adds to gcframe) until we need it
+        Value *strct_decayed = decay_derived(ctx, strct);
+
+        // Initialize undefined fields to NULL (required for GC safety)
+        undef_derived_strct(ctx, strct_decayed, sty, ctx.tbaa().tbaa_mutab);
+
+        // Initialize union selectors for uninitialized fields first (no allocation)
         for (size_t i = nargs; i < nf; i++) {
             if (!jl_field_isptr(sty, i) && jl_is_uniontype(jl_field_type(sty, i))) {
-                jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, strctinfo.tbaa);
+                jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_mutab);
                 ai.decorateInst(ctx.builder.CreateAlignedStore(
                         ConstantInt::get(getInt8Ty(ctx.builder.getContext()), 0),
-                        emit_ptrgep(ctx, strct, jl_field_offset(sty, i) + jl_field_size(sty, i) - 1),
+                        emit_ptrgep(ctx, strct_decayed, jl_field_offset(sty, i) + jl_field_size(sty, i) - 1),
                         Align(1)));
             }
         }
-        // TODO: verify that nargs <= nf (currently handled by front-end)
-        for (size_t i = 0; i < nargs; i++) {
+
+        // Process fields before first_alloc_field without rooting
+        for (size_t i = 0; i < first_alloc_field && i < nargs; i++) {
             jl_cgval_t rhs = argv[i];
-            bool need_wb; // set to true if the store might cause the allocation of a box newer than the struct
-            if (jl_field_isptr(sty, i))
-                need_wb = !rhs.isboxed;
-            else
-                need_wb = false;
             jl_value_t *ft = jl_svecref(sty->types, i);
-            emit_typecheck(ctx, rhs, ft, "new"); // n.b. ty argument must be concrete
+            emit_typecheck(ctx, rhs, ft, "new");
             rhs = update_julia_type(ctx, rhs, ft);
             if (rhs.typ == jl_bottom_type)
                 return jl_cgval_t();
-            emit_setfield(ctx, sty, strctinfo, i, rhs, jl_cgval_t(), need_wb, AtomicOrdering::NotAtomic, AtomicOrdering::NotAtomic, nullptr, true, false, false, false, false, nullptr, "new");
+
+            // For non-allocating fields, we can store directly without rooting
+            assert(jl_field_isptr(sty, i) ? rhs.isboxed : true);
+
+            if (jl_field_isptr(sty, i)) {
+                // Store already-boxed pointer field
+                size_t byte_offset = jl_field_offset(sty, i);
+                Value *addr = emit_ptrgep(ctx, strct_decayed, byte_offset);
+                jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_mutab);
+                ai.decorateInst(ctx.builder.CreateAlignedStore(
+                    boxed(ctx, rhs), addr, Align(jl_field_align(sty, i))));
+            }
+            else {
+                // Store bits field
+                size_t byte_offset = jl_field_offset(sty, i);
+                Value *addr = emit_ptrgep(ctx, strct_decayed, byte_offset);
+                unsigned align = jl_field_align(sty, i);
+                emit_unbox_store(ctx, rhs, addr, ctx.tbaa().tbaa_mutab,
+                                 Align(julia_alignment(ft)), Align(align));
+            }
         }
+
+        // Now root the object if we have allocating fields
+        jl_cgval_t strctinfo;
+        if (first_alloc_field < nargs) {
+            // Root the object before processing allocating fields
+            strctinfo = mark_julia_type(ctx, strct, true, ty);
+
+            // Process remaining fields (which may allocate)
+            for (size_t i = first_alloc_field; i < nargs; i++) {
+                jl_cgval_t rhs = argv[i];
+                bool need_wb;
+                if (jl_field_isptr(sty, i))
+                    need_wb = !rhs.isboxed;
+                else
+                    need_wb = false;
+                jl_value_t *ft = jl_svecref(sty->types, i);
+                emit_typecheck(ctx, rhs, ft, "new");
+                rhs = update_julia_type(ctx, rhs, ft);
+                if (rhs.typ == jl_bottom_type)
+                    return jl_cgval_t();
+                emit_setfield(ctx, sty, strctinfo, i, rhs, jl_cgval_t(), need_wb,
+                             AtomicOrdering::NotAtomic, AtomicOrdering::NotAtomic,
+                             nullptr, true, false, false, false, false, nullptr, "new");
+            }
+        }
+        else {
+            // No allocating fields, can delay rooting until return
+            strctinfo = mark_julia_type(ctx, strct, true, ty);
+        }
+
         return strctinfo;
     }
     else {
