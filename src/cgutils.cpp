@@ -950,6 +950,9 @@ static bool is_uniontype_allunboxed(jl_value_t *typ)
 static Value *emit_typeof(jl_codectx_t &ctx, Value *v, bool maybenull, bool justtag, bool notag=false);
 static Value *emit_typeof(jl_codectx_t &ctx, const jl_cgval_t &p, bool maybenull=false, bool justtag=false);
 
+// Forward declaration from codegen.cpp
+static MDNode *best_tbaa(jl_tbaacache_t &tbaa_cache, jl_value_t *jt);
+
 static unsigned get_box_tindex(jl_datatype_t *jt, jl_value_t *ut)
 {
     unsigned new_idx = 0;
@@ -4460,8 +4463,9 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
             else if (jl_is_uniontype(ft)) {
                 // Union types may allocate during conversion, unless we know the
                 // value is isbits and the union contains only isbits types
-                may_allocate = true;  // Conservative for now
-                // TODO: Refine with is_union_of_isbits check
+                // TODO: Implement is_union_of_isbits(ft) && is_known_isbits_subtype(rhs)
+                // For now, conservatively assume unions may allocate
+                may_allocate = true;
             }
             else if (!jl_is_concrete_type(ft) || !jl_is_pointerfree(ft)) {
                 // Non-concrete or non-pointerfree types may allocate
@@ -4480,8 +4484,9 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
         // Don't create strctinfo (which adds to gcframe) until we need it
         Value *strct_decayed = decay_derived(ctx, strct);
         
-        // Get the precise TBAA for this datatype (without rooting)
-        MDNode *tbaa_struct = jl_is_mutable(ty) ? ctx.tbaa().tbaa_mutab : ctx.tbaa().tbaa_immut;
+        // Get the datatype-specific TBAA (without rooting) using best_tbaa
+        // This gives us the same TBAA that strctinfo.tbaa would have
+        MDNode *tbaa_struct = best_tbaa(ctx.tbaa(), ty);
 
         // Zero object memory (especially pointer fields) for GC safety
         undef_derived_strct(ctx, strct_decayed, sty, tbaa_struct);
@@ -4507,6 +4512,7 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
             emit_typecheck(ctx, rhs, finfo.ft, "new");
             rhs = update_julia_type(ctx, rhs, finfo.ft);
             if (rhs.typ == jl_bottom_type)
+                // Early return is safe: object is unreachable (not rooted)
                 return jl_cgval_t();
 
             // For non-allocating fields, we can store directly without rooting
@@ -4514,11 +4520,28 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
             assert(finfo.isptr ? rhs.isboxed : true);
 
             if (finfo.isptr) {
-                // Store already-boxed pointer field
+                // Store already-boxed pointer field (must not allocate)
+                // We need to ensure this never calls boxed() which could allocate
+                assert(rhs.isboxed && "Pre-root pointer store must have boxed value");
+                // For boxed values, get the actual pointer
+                Value *v = nullptr;
+                if (rhs.Vboxed) {
+                    v = rhs.Vboxed;
+                }
+                else if (rhs.V) {
+                    v = rhs.V;
+                }
+                else if (rhs.constant) {
+                    // If we have a constant, use literal_pointer_val
+                    v = literal_pointer_val(ctx, rhs.constant);
+                }
+                assert(v && "Must have a boxed value");
+                
                 Value *addr = emit_ptrgep(ctx, strct_decayed, finfo.offset);
+                // Use consistent alignment pattern for all stores
+                unsigned st_align = finfo.align;
                 jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, tbaa_struct);
-                ai.decorateInst(ctx.builder.CreateAlignedStore(
-                    boxed(ctx, rhs), addr, Align(finfo.align)));
+                ai.decorateInst(ctx.builder.CreateAlignedStore(v, addr, Align(st_align)));
             }
             else {
                 // Store bits field with safe alignment
