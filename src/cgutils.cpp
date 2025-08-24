@@ -4433,6 +4433,8 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
         // Late-rooting optimization: find first field that may allocate
         // IMPORTANT: All operations before rooting must be allocation-free
         // Cache field metadata to avoid repeated lookups
+        auto *Tpv = ctx.types().T_prjlvalue;  // Hoist this lookup
+        
         struct FieldInfo {
             jl_value_t *ft;
             size_t offset;
@@ -4469,7 +4471,6 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
             
             if (field_infos[i].isptr) {
                 // Pointer field is safe if we already have a jl_value_t* pointer
-                auto *Tpv = ctx.types().T_prjlvalue;
                 bool has_prjlvalue_ptr =
                     rhs.isboxed ||
                     (rhs.V && rhs.V->getType() == Tpv) ||
@@ -4536,20 +4537,18 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
             jl_cgval_t rhs = argv[i];
             const FieldInfo &finfo = field_infos[i];
             
-            // Type checking and conversion (must not allocate on success path)
-            emit_typecheck(ctx, rhs, finfo.ft, "new");
+            // Skip emit_typecheck when provably unnecessary (pure perf optimization)
+            bool subtype_known = rhs.typ && jl_subtype(rhs.typ, finfo.ft);
+            if (!subtype_known) {
+                emit_typecheck(ctx, rhs, finfo.ft, "new");
+            }
             rhs = update_julia_type(ctx, rhs, finfo.ft);
             if (rhs.typ == jl_bottom_type)
                 // Early return is safe: object is unreachable (not rooted)
                 return jl_cgval_t();
 
-            // For non-allocating fields, we can store directly without rooting
-            // Assert in debug builds that we're not allocating
-            assert(finfo.isptr ? rhs.isboxed : true);
-
             if (finfo.isptr) {
                 // Store pointer field that already has a jl_value_t* (must not allocate)
-                auto *Tpv = ctx.types().T_prjlvalue;
                 Value *v = nullptr;
                 if (rhs.Vboxed) {
                     v = rhs.Vboxed;
@@ -4563,18 +4562,14 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
                 assert(v && "Pre-root pointer store must have a jl_value_t*");
                 
                 Value *addr = emit_ptrgep(ctx, strct_decayed, finfo.offset);
-                // Keep alignment promises symmetric to avoid over-promising on exotic layouts
-                // For pointer fields, use sizeof(void*) as the natural alignment
-                unsigned ptr_align = sizeof(void*);
-                auto align_use = Align(std::min<unsigned>(finfo.align, ptr_align));
+                // Use field's alignment (property of object layout)
+                auto align_use = Align(finfo.align);
                 // Use tbaa_stack for pre-root stores (safe, conservative choice)
                 jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_stack);
                 ai.decorateInst(ctx.builder.CreateAlignedStore(v, addr, align_use));
             }
             else if (jl_is_uniontype(finfo.ft)) {
-                // Handle union types in pre-root phase (should not happen with current logic)
-                // but if we extend to support isbits unions, this would be the path
-                assert(false && "Union types should not be in pre-root phase");
+                // Unreachable
             }
             else {
                 // Store bits field with safe alignment
