@@ -4468,8 +4468,13 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
             bool safe_prefix_field = false;
             
             if (field_infos[i].isptr) {
-                // Pointer field is safe only if rhs is already boxed (no boxing needed)
-                safe_prefix_field = rhs.isboxed;
+                // Pointer field is safe if we already have a jl_value_t* pointer
+                auto *Tpv = ctx.types().T_prjlvalue;
+                bool has_prjlvalue_ptr =
+                    rhs.isboxed ||
+                    (rhs.V && rhs.V->getType() == Tpv) ||
+                    rhs.constant; // literal_pointer_val path
+                safe_prefix_field = has_prjlvalue_ptr;
             }
             else if (jl_is_uniontype(ft)) {
                 // Union types may allocate during conversion
@@ -4507,15 +4512,21 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
             undef_derived_strct(ctx, strct_decayed, sty, ctx.tbaa().tbaa_stack);
         }
 
-        // Initialize union selectors for uninitialized fields first (no allocation)
-        for (size_t i = nargs; i < nf; i++) {
-            if (!jl_field_isptr(sty, i) && jl_is_uniontype(jl_field_type(sty, i))) {
-                // Use proper TBAA for union selector bytes
-                jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_unionselbyte);
-                ai.decorateInst(ctx.builder.CreateAlignedStore(
-                        ConstantInt::get(getInt8Ty(ctx.builder.getContext()), 0),
-                        emit_ptrgep(ctx, strct_decayed, jl_field_offset(sty, i) + jl_field_size(sty, i) - 1),
-                        Align(1)));
+        // Initialize union selectors for uninitialized fields (no allocation)
+        // Skip if we already memset the whole object (nargs < nf)
+        if (nargs == nf) {
+            for (size_t i = nargs; i < nf; i++) {
+                auto ft = jl_svecref(sty->types, i);
+                if (!jl_field_isptr(sty, i) && jl_is_uniontype(ft)) {
+                    const size_t offs = jl_field_offset(sty, i);
+                    const size_t sz = jl_field_size(sty, i);
+                    // Use proper TBAA for union selector bytes
+                    jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_unionselbyte);
+                    ai.decorateInst(ctx.builder.CreateAlignedStore(
+                            ConstantInt::get(getInt8Ty(ctx.builder.getContext()), 0),
+                            emit_ptrgep(ctx, strct_decayed, offs + sz - 1),
+                            Align(1)));
+                }
             }
         }
 
@@ -4537,27 +4548,28 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
             assert(finfo.isptr ? rhs.isboxed : true);
 
             if (finfo.isptr) {
-                // Store already-boxed pointer field (must not allocate)
-                // We need to ensure this never calls boxed() which could allocate
-                assert(rhs.isboxed && "Pre-root pointer store must have boxed value");
-                // For boxed values, get the actual pointer
+                // Store pointer field that already has a jl_value_t* (must not allocate)
+                auto *Tpv = ctx.types().T_prjlvalue;
                 Value *v = nullptr;
                 if (rhs.Vboxed) {
                     v = rhs.Vboxed;
                 }
-                else if (rhs.V) {
+                else if (rhs.V && rhs.V->getType() == Tpv) {
                     v = rhs.V;
                 }
                 else if (rhs.constant) {
-                    // If we have a constant, use literal_pointer_val
                     v = literal_pointer_val(ctx, rhs.constant);
                 }
-                assert(v && "Must have a boxed value");
+                assert(v && "Pre-root pointer store must have a jl_value_t*");
                 
                 Value *addr = emit_ptrgep(ctx, strct_decayed, finfo.offset);
+                // Keep alignment promises symmetric to avoid over-promising on exotic layouts
+                // For pointer fields, use sizeof(void*) as the natural alignment
+                unsigned ptr_align = sizeof(void*);
+                auto align_use = Align(std::min<unsigned>(finfo.align, ptr_align));
                 // Use tbaa_stack for pre-root stores (safe, conservative choice)
                 jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_stack);
-                ai.decorateInst(ctx.builder.CreateAlignedStore(v, addr, Align(finfo.align)));
+                ai.decorateInst(ctx.builder.CreateAlignedStore(v, addr, align_use));
             }
             else if (jl_is_uniontype(finfo.ft)) {
                 // Handle union types in pre-root phase (should not happen with current logic)
