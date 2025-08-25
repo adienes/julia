@@ -24,6 +24,5 @@ function @main(args::Vector{String})::Cint
     cfunc = @cfunction(print_string, Cvoid, (Ptr{Cvoid},))
     fptr = dlsym(Zstd_jll.libzstd_handle, :ZSTD_versionString)
     ccall(cfunc, Cvoid, (Ptr{Cvoid},), fptr)
-
     return 0
 end

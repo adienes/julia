@@ -311,6 +311,7 @@ SimdLoop.simd_inner_length(::SCartesianIndices2{K}, ::Any) where K = K
     SCartesianIndex2{K}(I1+1, Ilast)
 end
 
+_maybe_reshape(::IndexSCartesian2, A::AbstractArray, I...) = _maybe_reshape(IndexCartesian(), A, I...)
 _maybe_reshape(::IndexSCartesian2, A::ReshapedReinterpretArray, I...) = A
 
 # fallbacks
@@ -329,11 +330,25 @@ function _getindex(::IndexSCartesian2, A::AbstractArray{T,N}, ind::SCartesianInd
     J = _ind2sub(tail(axes(A)), ind.j)
     getindex(A, ind.i, J...)
 end
+
+function _getindex(::IndexSCartesian2{2}, A::AbstractArray{T,2}, ind::SCartesianIndex2) where {T}
+    @_propagate_inbounds_meta
+    J = first(axes(A, 2)) + ind.j - 1
+    getindex(A, ind.i, J)
+end
+
 function _setindex!(::IndexSCartesian2, A::AbstractArray{T,N}, v, ind::SCartesianIndex2) where {T,N}
     @_propagate_inbounds_meta
     J = _ind2sub(tail(axes(A)), ind.j)
     setindex!(A, v, ind.i, J...)
 end
+
+function _setindex!(::IndexSCartesian2{2}, A::AbstractArray{T,2}, v, ind::SCartesianIndex2) where {T}
+    @_propagate_inbounds_meta
+    J = first(axes(A, 2)) + ind.j - 1
+    setindex!(A, v, ind.i, J)
+end
+
 eachindex(style::IndexSCartesian2, A::AbstractArray) = eachindex(style, parent(A))
 
 ## AbstractArray interface
@@ -412,7 +427,7 @@ end
     # Convert to full indices here, to avoid needing multiple conversions in
     # the loop in _getindex_ra
     inds = _to_subscript_indices(a, i)
-    isempty(inds) ? _getindex_ra(a, 1, ()) : _getindex_ra(a, inds[1], tail(inds))
+    isempty(inds) ? _getindex_ra(a, firstindex(a), ()) : _getindex_ra(a, inds[1], tail(inds))
 end
 
 @propagate_inbounds function getindex(a::ReshapedReinterpretArray{T,N,S}, ind::SCartesianIndex2) where {T,N,S}
@@ -556,7 +571,7 @@ end
         return _setindex_ra!(a, v, i, ())
     end
     inds = _to_subscript_indices(a, i)
-    _setindex_ra!(a, v, inds[1], tail(inds))
+    isempty(inds) ? _setindex_ra!(a, v, firstindex(a), ()) : _setindex_ra!(a, v, inds[1], tail(inds))
 end
 
 @propagate_inbounds function setindex!(a::ReshapedReinterpretArray{T,N,S}, v, ind::SCartesianIndex2) where {T,N,S}
