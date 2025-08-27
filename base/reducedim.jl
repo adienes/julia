@@ -5,13 +5,9 @@
 # for reductions that expand 0 dims to 1
 reduced_index(i::OneTo{T}) where {T} = OneTo(one(T))
 reduced_index(i::Union{Slice, IdentityUnitRange}) = oftype(i, first(i):first(i))
+reduced_index(i::UnitRange) = first(i):first(i)  # Handle general UnitRange for OffsetArrays
 reduced_index(i::AbstractUnitRange) =
-    throw(ArgumentError(
-"""
-No method is implemented for reducing index range of type $(typeof(i)). Please implement
-reduced_index for this index type or report this as an issue.
-"""
-    ))
+    throw(ArgumentError("no reduced_index for $(typeof(i))"))
 reduced_indices(a::AbstractArrayOrBroadcasted, region) = reduced_indices(axes(a), region)
 
 # for reductions that keep 0 dims as 0

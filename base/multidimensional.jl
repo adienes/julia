@@ -1242,13 +1242,7 @@ function mapreduce_kernel_commutative(f, op, itr, init, ::IteratorSize, n, state
         @nexprs 8 N->begin
             it = iterate(itr, s)
             if it === nothing
-                N > 7 && (v_7 = op(v_7, f(a_7)))
-                N > 6 && (v_6 = op(v_6, f(a_6)))
-                N > 5 && (v_5 = op(v_5, f(a_5)))
-                N > 4 && (v_4 = op(v_4, f(a_4)))
-                N > 3 && (v_3 = op(v_3, f(a_3)))
-                N > 2 && (v_2 = op(v_2, f(a_2)))
-                N > 1 && (v_1 = op(v_1, f(a_1)))
+                @nexprs 7 M->((N > M) && (v_{8-M} = op(v_{8-M}, f(a_{8-M}))))
                 return Some(op(op(op(v_1, v_2), op(v_3, v_4)), op(op(v_5, v_6), op(v_7, v_8))))
             end
             a_N, s = it
