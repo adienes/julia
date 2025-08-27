@@ -5,13 +5,9 @@
 # for reductions that expand 0 dims to 1
 reduced_index(i::OneTo{T}) where {T} = OneTo(one(T))
 reduced_index(i::Union{Slice, IdentityUnitRange}) = oftype(i, first(i):first(i))
+reduced_index(i::UnitRange) = first(i):first(i)  # Handle general UnitRange for OffsetArrays
 reduced_index(i::AbstractUnitRange) =
-    throw(ArgumentError(
-"""
-No method is implemented for reducing index range of type $(typeof(i)). Please implement
-reduced_index for this index type or report this as an issue.
-"""
-    ))
+    throw(ArgumentError("no reduced_index for $(typeof(i))"))
 reduced_indices(a::AbstractArrayOrBroadcasted, region) = reduced_indices(axes(a), region)
 
 # for reductions that keep 0 dims as 0
@@ -51,6 +47,11 @@ mergeindices(b::NTuple{N,Bool}, x::CartesianIndex{N}, y::CartesianIndex{N}) wher
 keep_first_trues(::Tuple{}) = ()
 keep_first_trues(t) = t[1] ? (true, keep_first_trues(tail(t))...) : ntuple(Returns(false), length(t))
 
+# Layout trait for kernel selection (uses types from reduce.jl)
+layout_trait(A, is_inner_dim) =
+    is_inner_dim == keep_first_trues(is_inner_dim) ? Base.ContigInner() :
+    (is_inner_dim[1] ? Base.ContigOuter() : Base.Discontig())
+
 # These functions aren't used in the implementation here, but are used widely in the ecosystem
 promote_union(T::Union) = promote_type(promote_union(T.a), promote_union(T.b))
 promote_union(T) = T
@@ -60,62 +61,91 @@ _realtype(T::Type) = T
 _realtype(::Union{typeof(abs),typeof(abs2)}, T) = _realtype(T)
 _realtype(::Any, T) = T
 
-mapreduce_similar(A, ::Type{T}, dims) where {T} = similar(A, T, dims)
+mapreduce_similar(A, e, dims) = similar(A, typeof(e), dims)
 
-# These special internal types allow exposing both in- and out-of-place array initialization
-# as a comprehension-like function call with a generator
-struct _MapReduceAllocator{T}
-    itr::T
-end
-_similar_for(c::_MapReduceAllocator, ::Type{T}, itr, ::SizeUnknown, ::Nothing) where {T} =
-    mapreduce_similar(c.itr, T, (0,))
-_similar_for(c::_MapReduceAllocator, ::Type{T}, itr, ::HasLength, len::Integer) where {T} =
-    mapreduce_similar(c.itr, T, (len,))
-_similar_for(c::_MapReduceAllocator, ::Type{T}, itr, ::HasShape, axs) where {T} =
-    mapreduce_similar(c.itr, T, axs)
-(mra::_MapReduceAllocator)(itr) = collect_similar(mra, itr)
 
-struct _MapReduceInPlace{T,F}
-    A::T
-    op::F
-    update::Bool
-end
-function (mri::_MapReduceInPlace)(g::Generator{<:AbstractArray})
-    A = mri.A
-    if mri.update
-        for i in g.iter
-            A[i] = mri.op(A[i], g.f(i))
-        end
-    else
-        for i in g.iter
-            A[i] = g.f(i)
-        end
+"""
+    _might_widen(f, op, A, init) -> Bool
+
+Checks if the reduction might widen the type during computation.
+Uses a safe approach with conservative fallback for custom containers.
+"""
+@inline function _might_widen(f, op, A, init)
+    # identity fast-path: same-type reductions almost never widen
+    f === identity && return false
+    T = Base._empty_eltype(A)
+    try
+        z = _mapreduce_start(f, op, A, init, Base.zero(T))
+        return typeof(z) !== typeof(op(z, z))  # quick probe stays in-T if closed
+    catch
+        return true  # be conservative on error
     end
-    return A
-end
-function (mri::_MapReduceInPlace)(g::Generator{<:Iterators.Enumerate{<:AbstractArray}})
-    A = mri.A
-    if mri.update
-        for ki in g.iter
-            A[ki[2]] = mri.op(A[ki[2]], g.f(ki))
-        end
-    else
-        for ki in g.iter
-            A[ki[2]] = g.f(ki)
-        end
-    end
-    return A
 end
 
-if isdefined(Core, :Compiler)
-    _mapreduce_might_widen(_, _, _, _, ::_MapReduceInPlace) = false
-    function _mapreduce_might_widen(f::F, op::G, A::T, init, _) where {F,G,T}
-        return !isconcretetype(Core.Compiler.return_type(x->op(_mapreduce_start(f, op, first(x), init), f(first(x))), Tuple{T}))
-    end
-else
-    _mapreduce_might_widen(_, _, _, _, ::_MapReduceInPlace) = false
-    _mapreduce_might_widen(_, _, _, _, _) = true
+# Sink API for mapreduce - handles both allocation and in-place updates
+abstract type _MRSink end
+
+# Forward declare in-place sink for type dispatch
+struct _MRInPlaceSink{A,OP,UpdateVal} <: _MRSink
+    A::A
+    op::OP
 end
+
+_mapreduce_might_widen(f, op, A, init, sink::_MRInPlaceSink) = false
+_mapreduce_might_widen(f, op, A, init, _) = _might_widen(f, op, A, init)
+
+"Allocate a fresh destination with given element value and axes."
+mapreduce_allocate(::_MRSink, e, axes_tuple) = error("not implemented")
+
+"Set first value at index `I`."
+mapreduce_set!(::_MRSink, R, I, val) = error("not implemented")
+
+"Accumulate subsequent value at index `I`."
+mapreduce_accum!(::_MRSink, R, I, val) = error("not implemented")
+
+"Optionally finalize (usually a no-op)."
+mapreduce_finish(::_MRSink, R) = R
+
+# _MRAllocSink is already defined in reduce.jl for bootstrap ordering
+# Add methods for it here
+mapreduce_allocate(s::_MRAllocSink, e, axs) =
+    mapreduce_similar(s.proto, e, axs)
+
+@inline @propagate_inbounds mapreduce_set!(::_MRAllocSink, R, I, v) = (R[I] = v)
+@inline @propagate_inbounds mapreduce_accum!(::_MRAllocSink, R, I, v) = (R[I] = v)
+mapreduce_finish(::_MRAllocSink, R) = R
+
+# _MRInPlaceSink already defined earlier for type dispatch
+
+_MRInPlaceSink(A, op; update::Bool=false) = 
+    _MRInPlaceSink{typeof(A), typeof(op), Val(update)}(A, op)
+
+mapreduce_allocate(s::_MRInPlaceSink, e, axs) = s.A
+
+@inline @propagate_inbounds function mapreduce_set!(s::_MRInPlaceSink{<:Any,<:Any,Val{false}()}, R, I, v)
+    R[I] = v
+end
+@inline @propagate_inbounds function mapreduce_set!(s::_MRInPlaceSink{<:Any,<:Any,Val{true}()}, R, I, v)
+    R[I] = s.op(R[I], v)
+end
+@inline @propagate_inbounds function mapreduce_accum!(s::_MRInPlaceSink, R, I, v)
+    R[I] = s.op(R[I], v)
+end
+mapreduce_finish(::_MRInPlaceSink, R) = R
+
+# Helper functions for sink operations with proper inbounds propagation
+@inline @propagate_inbounds function _sink_set!(sink::_MRSink, R, I, v)
+    mapreduce_set!(sink, R, I, v)
+end
+@inline @propagate_inbounds function _sink_accum!(sink::_MRSink, R, I, v)
+    mapreduce_accum!(sink, R, I, v)
+end
+
+# Ensure sink types pass through
+_to_sink(x::_MRSink) = x
+_to_sink(x::_MRAllocSink) = x  # Also pass through the allocator sink
+# Create default sink for array inputs
+_to_sink(x) = _MRAllocSink(x)
 
 # When performing dimensional reductions over arrays with singleton dimensions, we have
 # a choice as to whether that singleton dimenion should be a part of the reduction or not;
@@ -128,15 +158,21 @@ compute_inner_dims(flagged_dims, source_size) =
         (false, map((flag,sz)->flag && sz != 1, tail(flagged_dims), tail(source_size))...)
 compute_inner_dims(::Tuple{}, ::Tuple{}) = ()
 
-function mapreducedim(f::F, op::OP, A, init, dims, alloc=_MapReduceAllocator(A)) where {F, OP}
-    if alloc isa _MapReduceInPlace
+function mapreducedim(f::F, op::OP, A, init, dims, sink=_MRAllocSink(A)) where {F, OP}
+    # Check if we should use streaming kernel for "keep dim 1" case
+    if !(1 in dims) && ndims(A) > 1
+        # Use streaming kernel for better performance when dim 1 is kept
+        return _mapreducedim_stream_firstdim(f, op, A, init, dims, sink)
+    end
+    
+    if sink isa _MRInPlaceSink
         # We can ignore dims and just trust the output array's axes. Note that the
         # other branch here optimizes for the case where the input array _also_ has
         # a singleton dimension, but we cannot do that here because OffsetArrays
         # supports reductions into differently-offset singleton dimensions. This means
         # we cannot index directly into A with an `outer` index. The output may also have
         # fewer dimensions than A, so we may need to add trailing dims here:
-        outer = CartesianIndices(ntuple(d->axes(alloc.A, d), ndims(A)))
+        outer = CartesianIndices(ntuple(d->axes(sink.A, d), ndims(A)))
         is_inner_dim = map(==(1), size(outer))
     else
         is_inner_dim = compute_inner_dims(ntuple(d->d in dims, ndims(A)), size(A))
@@ -147,18 +183,32 @@ function mapreducedim(f::F, op::OP, A, init, dims, alloc=_MapReduceAllocator(A))
     # Handle the empty and trivial 1-element cases:
     if (n == 0 || isempty(A))
         # This is broken out of the comprehension to ensure it's called, avoiding an empty Vector{Union{}}
+        # Handle empty case directly with sink API
         v = _mapreduce_start(f, op, A, init)
-        return alloc(v for _ in outer)
+        R = mapreduce_allocate(sink, v, axes(outer))
+        for I in outer
+            mapreduce_set!(sink, R, I, v)
+        end
+        return mapreduce_finish(sink, R)
     end
-    n == 1 && return alloc(_mapreduce_start(f, op, A, init, A[i]) for i in outer)
+    if n == 1
+        # Handle trivial 1-element case with sink API
+        v0 = _mapreduce_start(f, op, A, init, A[first(inner)])
+        R = mapreduce_allocate(sink, v0, axes(outer))
+        for i in outer
+            v = _mapreduce_start(f, op, A, init, A[i])
+            mapreduce_set!(sink, R, i, v)
+        end
+        return mapreduce_finish(sink, R)
+    end
     # Now there are multiple loop ordering strategies depending upon the `dims`:
-    if is_inner_dim == keep_first_trues(is_inner_dim) || _mapreduce_might_widen(f, op, A, init, alloc)
+    if is_inner_dim == keep_first_trues(is_inner_dim) || _mapreduce_might_widen(f, op, A, init, sink)
         # Column major contiguous reduction! This is the easy case
-        return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, alloc)
+        return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
     elseif is_inner_dim[1] # `dims` includes the first dimension
-        return mapreducedim_colmajor(f, op, A, init, is_inner_dim, inner, outer, alloc)
+        return mapreducedim_colmajor(f, op, A, init, is_inner_dim, inner, outer, sink)
     else
-        return mapreducedim_rowmajor(f, op, A, init, is_inner_dim, inner, outer, alloc)
+        return mapreducedim_rowmajor(f, op, A, init, is_inner_dim, inner, outer, sink)
     end
 end
 
@@ -170,76 +220,264 @@ else
 end
 linear_size(::IndexStyle, _, _) = 0
 
-function mapreducedim_naive(f::F, op::OP, A, init, is_inner_dim, inner, outer, alloc) where {F, OP}
+function mapreducedim_naive(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink) where {F, OP}
     lsiz = linear_size(A, is_inner_dim)
+    v0 = _mapreduce_start(f, op, A, init)
+    R = mapreduce_allocate(sink, v0, axes(outer))
+    
     if lsiz > 0
         i0 = first(LinearIndices(A))
-        alloc(mapreduce_pairwise(f, op, A, init, (i0:i0+lsiz-1) .+ (lsiz*(i-1))) for (i,_) in enumerate(outer))
+        linear_range = i0:(i0+lsiz-1)
+        for (idx, i) in enumerate(outer)
+            v = mapreduce_pairwise(f, op, A, init, linear_range .+ (lsiz*(idx-1)))
+            mapreduce_set!(sink, R, i, v)
+        end
     else
-        alloc(mapreduce_pairwise(f, op, A, init, mergeindices(is_inner_dim, inner, i)) for i in outer)
+        for i in outer
+            v = mapreduce_pairwise(f, op, A, init, mergeindices(is_inner_dim, inner, i))
+            mapreduce_set!(sink, R, i, v)
+        end
     end
+    return mapreduce_finish(sink, R)
 end
-function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, alloc, enforce_pairwise=true) where {F, OP}
+"""
+    mapreducedim_colmajor(f, op, A, init, is_inner_dim, inner, outer, sink) -> R
+
+Column-major reduction kernel for cases where the inner dimension is included
+but not fully contiguous. Processes contiguous parts efficiently.
+"""
+function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink, enforce_pairwise=true) where {F, OP}
     is_contiguous_inner = keep_first_trues(is_inner_dim)
     contiguous_inner = mergeindices(is_contiguous_inner, inner, first(inner))
     discontiguous_inner = mergeindices(is_contiguous_inner, first(inner), inner)
-    if enforce_pairwise && length(discontiguous_inner) > pairwise_blocksize(f, op)
-        return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, alloc)
-    end
-    # Initialize our reduction with the result of doing the first contiguous reduction
-    R = alloc(mapreduce_pairwise(f, op, A, init, mergeindices(is_inner_dim, contiguous_inner, o)) for o in outer)
-    for dci in Iterators.drop(discontiguous_inner, 1)
-        for o in outer
-            i = mergeindices(is_inner_dim, dci, o)
-            R[o] = op(R[o], mapreduce_pairwise(f, op, A, init, mergeindices(is_contiguous_inner, contiguous_inner, i)))
-        end
-    end
-    return R
-end
 
-function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, alloc, enforce_pairwise=true) where {F, OP}
-    # This will only be cache-optimal in the fully "backwards" case — that is, dims are `twoplus:ndims(A)`
-    # And even then, it's simply not possible to do this cache-optimally with a pairwise reassociation;
-    # this is effectively a foldl.
-    if enforce_pairwise && length(inner) > pairwise_blocksize(f, op)
-        return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, alloc)
+    # Check if we should fall back to naive for long discontiguous parts
+    bs = Base.pairwise_blocksize(f, op)
+    if enforce_pairwise && length(discontiguous_inner) > max(bs, Base.MIN_BLOCK)
+        return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
     end
-    # Take one element from each outer iteration to initialize R
-    R = alloc(_mapreduce_start(f, op, A, init, A[mergeindices(is_inner_dim, first(inner), o)]) for o in outer)
-    for i in Iterators.drop(inner, 1)
-        @simd for o in outer
-            # SIMD still helps here! It doesn't reassociate _within_ each reduction, but it can allow
-            # evaluations _across_ the multiple reductions to coalesce into a single instruction at times
-            iA = mergeindices(is_inner_dim, i, o)
-            v = op(@inbounds(R[o]), f(@inbounds(A[iA])))
-            @inbounds R[o] = v
+
+    # Initialize with the first contiguous reduction using sink API
+    v0 = _mapreduce_start(f, op, A, init)
+    R = mapreduce_allocate(sink, v0, axes(outer))
+    for o in outer
+        v = mapreduce_pairwise(f, op, A, init, mergeindices(is_inner_dim, contiguous_inner, o))
+        mapreduce_set!(sink, R, o, v)
+    end
+
+    # Handle short discontiguous remainder with optimized kernel if commutative
+    remaining_count = length(discontiguous_inner) - 1
+    if remaining_count > 0 && remaining_count <= 8 && is_commutative_op(op)
+        # Use unrolled commutative kernel across columns for short remainders
+        for dci in Iterators.drop(discontiguous_inner, 1)
+            # Process all outer indices together for better vectorization
+            @inbounds for o in outer
+                # Precompute the merged index only once per inner iteration
+                i = mergeindices(is_inner_dim, dci, o)
+                i_contig = mergeindices(is_contiguous_inner, contiguous_inner, i)
+                val = mapreduce_pairwise(f, op, A, init, i_contig)
+                R[o] = op(R[o], val)
+            end
+        end
+    else
+        # Standard processing for longer remainders
+        for dci in Iterators.drop(discontiguous_inner, 1)
+            for o in outer
+                i = mergeindices(is_inner_dim, dci, o)
+                i_contig = mergeindices(is_contiguous_inner, contiguous_inner, i)
+                R[o] = op(R[o], mapreduce_pairwise(f, op, A, init, i_contig))
+            end
         end
     end
+
     return R
 end
 
 """
-    mapreduce!(f, op, R::AbstractArray, A::AbstractArrayOrBroadcasted; [init])
+    mapreducedim_rowmajor(f, op, A, init, is_inner_dim, inner, outer, sink) -> R
+
+Row-major reduction kernel for fully discontiguous cases.
+Uses @inbounds but avoids @simd for non-vectorizable scalar recurrences.
+"""
+function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink, enforce_pairwise=true) where {F, OP}
+    # Row-major is essentially a foldl, not cache-optimal for pairwise reassociation
+    bs = Base.pairwise_blocksize(f, op)
+    if enforce_pairwise && length(inner) > max(bs, Base.MIN_BLOCK)
+        return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
+    end
+
+    # Initialize with first element from each outer iteration using sink API
+    v0 = _mapreduce_start(f, op, A, init)
+    R = mapreduce_allocate(sink, v0, axes(outer))
+    for o in outer
+        v = _mapreduce_start(f, op, A, init, A[mergeindices(is_inner_dim, first(inner), o)])
+        mapreduce_set!(sink, R, o, v)
+    end
+
+    # Process remaining inner indices
+    # Note: @simd on scalar recurrence doesn't vectorize but can help scheduler
+    for i in Iterators.drop(inner, 1)
+        @inbounds for o in outer
+            iA = mergeindices(is_inner_dim, i, o)
+            v = op(R[o], f(A[iA]))
+            R[o] = v
+        end
+    end
+
+    return R
+end
+
+# Streaming kernel for "keep dim 1" reductions using sink API
+# Works correctly with OffsetArrays and custom axes
+function _mapreducedim_stream_firstdim(f::F, op::OP, A, init, dims, sink) where {F,OP}
+    nd = ndims(A)
+    @assert !(1 in dims) && nd > 1
+
+    axsA = ntuple(d->axes(A,d), nd)
+
+    if isempty(A)
+        v = _mapreduce_start(f, op, A, init)
+        out_axes = ntuple(d -> d==1 ? axsA[1] : reduced_index(axsA[d]), nd)
+        R = mapreduce_allocate(sink, v, out_axes)
+        for I in CartesianIndices(axes(R))
+            @inbounds _sink_set!(sink, R, I, v)
+        end
+        return mapreduce_finish(sink, R)
+    end
+
+    # Seed output with the first "column"
+    v_seed = _mapreduce_start(f, op, A, init, first(A))
+    out_axes = ntuple(d -> d==1 ? axsA[1] : reduced_index(axsA[d]), nd)
+    R = mapreduce_allocate(sink, v_seed, out_axes)
+    out_axes_R = axes(R)
+
+    # Columns are all reduced dims varying, others fixed to their first index
+    cols_axes = ntuple(d -> d==1 ? reduced_index(axsA[1]) :
+                           (d in dims ? axsA[d] : reduced_index(axsA[d])), nd)
+    cols = CartesianIndices(cols_axes)
+
+    # ---- Seed pass with the first column c0 (no double op!) -------------------
+    c0 = first(cols)
+    if nd == ndims(R)
+        # Build a 1-D view along dim-1 once; other dims fixed at their first in R
+        # (Tuple is created once, not per element)
+        fixed = ntuple(d -> d==1 ? Colon() : first(out_axes_R[d]), nd)
+        Rrow = @view R[fixed...]
+        # Also build a 1-D view of A's first column
+        colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c0[d] : first(axsA[d])), nd)
+        Acol = @view A[colAidx...]
+        for i in eachindex(Rrow, Acol)
+            # Only the array accesses are @inbounds, not f or op
+            ai = @inbounds Acol[i]
+            val = _mapreduce_start(f, op, A, init, ai)
+            @inbounds Rrow[i] = val
+        end
+    else
+        # Fallback: R has fewer dims. Use LinearIndices once.
+        LR = LinearIndices(R)
+        colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c0[d] : first(axsA[d])), nd)
+        Acol = @view A[colAidx...]
+        # map linear index i -> LR[i]
+        for i in eachindex(Acol)
+            I = @inbounds LR[i]
+            ai = @inbounds Acol[i]
+            val = _mapreduce_start(f, op, A, init, ai)
+            @inbounds _sink_set!(sink, R, I, val)
+        end
+    end
+
+    # ---- Accumulate the rest of the columns -----------------------------------
+    if nd == ndims(R)
+        fixedR = ntuple(d -> d==1 ? Colon() : first(out_axes_R[d]), nd)
+        Rrow = @view R[fixedR...]
+        for c in Iterators.drop(cols, 1)
+            colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c[d] : first(axsA[d])), nd)
+            Acol = @view A[colAidx...]
+            for i in eachindex(Rrow, Acol)
+                # Only array accesses are @inbounds, not user functions
+                ai = @inbounds Acol[i]
+                ri = @inbounds Rrow[i]
+                val = op(ri, f(ai))
+                @inbounds Rrow[i] = val
+            end
+        end
+    else
+        LR = LinearIndices(R)
+        for c in Iterators.drop(cols, 1)
+            colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c[d] : first(axsA[d])), nd)
+            Acol = @view A[colAidx...]
+            for i in eachindex(Acol)
+                I = @inbounds LR[i]
+                ai = @inbounds Acol[i]
+                val = f(ai)
+                @inbounds _sink_accum!(sink, R, I, val)
+            end
+        end
+    end
+
+    return mapreduce_finish(sink, R)
+end
+
+
+"""
+    mapreduce!(f, op, R::AbstractArray, A::AbstractArrayOrBroadcasted; [init], update=false)
 
 Compute `mapreduce(f, op, A; init, dims)` where `dims` are the singleton dimensions of `R`, storing the result into `R`.
 
+# Arguments
+- `update::Bool=false`: If `true`, combines the reduction result with existing values in `R` using `op`.
+                         If `false` (default), overwrites `R` with the reduction result.
+
+# Examples
+```jldoctest
+julia> R = zeros(1, 4);
+
+julia> A = [1 2 3 4; 5 6 7 8];
+
+julia> mapreduce!(identity, +, R, A);  # update=false overwrites R
+
+julia> R
+1×4 Matrix{Float64}:
+ 6.0  8.0  10.0  12.0
+
+julia> mapreduce!(identity, +, R, A; update=true);  # update=true combines with existing R
+
+julia> R
+1×4 Matrix{Float64}:
+ 12.0  16.0  20.0  24.0
+```
+
 !!! note
-    The previous values in `R` are _not_ used as initial values; they are completely ignored
+    When `update=false`, the previous values in `R` are completely ignored and overwritten.
 """
 function mapreduce!(f, op, R::AbstractArray, A::AbstractArrayOrBroadcasted; init=_InitialValue(), update=false)
+    # Check dimension compatibility
     if ndims(R) > ndims(A) || !all(d->size(R, d) == 1 || axes(R, d) == axes(A, d), 1:max(ndims(R), ndims(A)))
         throw(DimensionMismatch())
     end
-    return mapreducedim(f, op, A, init, nothing, _MapReduceInPlace(R, op, update))
+    # Compute dims from R - the dimensions where R has size 1 are the reduction dimensions
+    # We need to consider up to ndims(A), not just ndims(R)
+    dims = if ndims(R) < ndims(A)
+        # R has fewer dims, so dims beyond ndims(R) are implicitly reduced
+        tuple((d for d in 1:ndims(A) if d > ndims(R) || size(R, d) == 1)...)
+    else
+        # R has same or more dims as A
+        tuple((d for d in 1:ndims(A) if size(R, d) == 1)...)
+    end
+    return mapreducedim(f, op, A, init, dims, _MRInPlaceSink(R, op; update=update))
 end
 
 """
-    reduce!(op, R::AbstractArray, A::AbstractArrayOrBroadcasted; [init])
+    reduce!(op, R::AbstractArray, A::AbstractArrayOrBroadcasted; [init], update=false)
 
 Compute `reduce(op, A; init, dims)` where `dims` are the singleton dimensions of `R`, storing the result into `R`.
 
+# Arguments
+- `update::Bool=false`: If `true`, combines the reduction result with existing values in `R` using `op`.
+                         If `false` (default), overwrites `R` with the reduction result.
+
 !!! note
-    The previous values in `R` are _not_ used as initial values; they are completely ignored
+    When `update=false`, the previous values in `R` are completely ignored and overwritten.
 """
 reduce!(op, R::AbstractArray, A::AbstractArrayOrBroadcasted; init=_InitialValue(), update=false) = mapreduce!(identity, op, R, A; init, update)
 
