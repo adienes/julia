@@ -1100,17 +1100,56 @@ function mapreduce_kernel(f, op, A, init, inds::CartesianIndices{N}) where {N}
     return v
 end
 
-function mapreduce_kernel_commutative(f, op, A, init, inds::AbstractArray)
-    if length(inds) < 16
+function mapreduce_kernel_commutative(f::F, op::G, A, init, inds::AbstractArray) where {F, G}
+    n = length(inds)
+    if n < 8
         i1, iN = firstindex(inds), lastindex(inds)
         v_1 = _mapreduce_start(f, op, A, init, @inbounds A[inds[i1]])
+        i1 == iN && return v_1  # Handle single element case
         for i in i1+1:iN
             a = @inbounds A[inds[i]]
             v_1 = op(v_1, f(a))
         end
         return v_1
     end
+
+    # For large arrays and simple operations, use more aggressive optimization
+    T = eltype(A)
+    if isconcretetype(T) && isbitstype(T)
+        # Use specialized implementation for small types
+        if sizeof(T) <= 4 && n >= 32
+            return _mapreduce_kernel_commutative_small(f, op, A, init, inds)
+        end
+    end
     return _mapreduce_kernel_commutative(f, op, A, init, inds)
+end
+
+# Specialized implementation for small types (<=32 bits) with 16x unrolling
+function _mapreduce_kernel_commutative_small(f, op, A, init, inds, leading=(), trailing=())
+    i1, iN = firstindex(inds), lastindex(inds)
+    n = length(inds)
+    # Use 16x unrolling for better SIMD utilization with small types
+    @nexprs 16 N->a_N = @inbounds A[leading..., inds[i1+(N-1)], trailing...]
+    @nexprs 16 N->v_N = _mapreduce_start(f, op, A, init, a_N)
+    for batch in 1:(n>>4)-1
+        i = i1 + batch*16
+        @nexprs 16 N->a_N = @inbounds A[leading..., inds[i+(N-1)], trailing...]
+        @nexprs 16 N->fa_N = f(a_N)
+        @nexprs 16 N->v_N = op(v_N, fa_N)
+    end
+    # Tree reduction for better parallelism
+    v8_1 = op(op(v_1, v_2), op(v_3, v_4))
+    v8_2 = op(op(v_5, v_6), op(v_7, v_8))
+    v8_3 = op(op(v_9, v_10), op(v_11, v_12))
+    v8_4 = op(op(v_13, v_14), op(v_15, v_16))
+    v = op(op(v8_1, v8_2), op(v8_3, v8_4))
+    i = i1 + (n>>4)*16 - 1
+    i == iN && return v
+    for i in i+1:iN
+        ai = @inbounds A[leading..., inds[i], trailing...]
+        v = op(v, f(ai))
+    end
+    return v
 end
 
 # This special internal method must have at least 8 indices and allows passing

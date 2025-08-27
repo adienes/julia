@@ -4,6 +4,12 @@
 
 ###### Generic (map)reduce functions ######
 
+# Minimal sink API defined here for bootstrap ordering
+# Full implementation enhanced in reducedim.jl
+struct _MRAllocSink{Proto}
+    proto::Proto
+end
+
 abstract type AbstractBroadcasted end
 const AbstractArrayOrBroadcasted = Union{AbstractArray, AbstractBroadcasted}
 
@@ -111,6 +117,19 @@ struct FilteringRF{F, T}
 end
 
 @inline (op::FilteringRF)(acc, x) = op.f(x) ? op.rf(acc, x) : acc
+
+"""
+    RFMap(f, op) -> rf′
+
+Create a combined mapping-reduction function for better type inference.
+This wrapper improves type flow through kernels without runtime cost.
+"""
+struct RFMap{F,OP}
+    f::F
+    op::OP
+end
+
+@inline (r::RFMap)(acc, x) = r.op(acc, r.f(x))
 
 """
     FlatteningRF(rf) -> rf′
@@ -299,17 +318,32 @@ julia> mapreduce(isodd, |, a, dims=1)
  1  1  1  1
 ```
 """
-mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted; init=_InitialValue(), dims=(:)) where {F,G} = mapreducedim(f, op, A, init, dims)
+mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted; init=_InitialValue(), dims=(:)) where {F,G} = 
+    mapreducedim(f, op, A, init, dims, Base._MRAllocSink(A))
 mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted, As::AbstractArrayOrBroadcasted...; init=_InitialValue(), dims=(:)) where {F,G} =
     reduce(op, map(f, A, As...); init, dims)
-mapreducedim(f::F, op::G, A, init, ::Colon) where {F,G} = mapreduce_pairwise(f, op, A, init)
+mapreducedim(f::F, op::G, A, init, ::Colon, sink=_MRAllocSink(A)) where {F,G} = mapreduce_pairwise(f, op, A, init)
 
-# Note: sum_seq usually uses four or more accumulators after partial
-# unrolling, so each accumulator gets at most 256 numbers
+# Simple pairwise reduction blocksize
+const MIN_BLOCK = 10  # Minimum block size for all reductions
+
+"""
+    pairwise_blocksize(f, op) -> Int
+
+Determines the block size for pairwise reduction operations.
+"""
 pairwise_blocksize(f, op) = 1024
+
+# Compute-heavy functions benefit from smaller blocksizes
+pairwise_blocksize(::typeof(sqrt), op) = 64
+pairwise_blocksize(::typeof(sin), op) = 64
+pairwise_blocksize(::typeof(cos), op) = 64
+pairwise_blocksize(::typeof(exp), op) = 64
+pairwise_blocksize(::typeof(log), op) = 64
 
 # This combination appears to show a benefit from a larger block size
 pairwise_blocksize(::typeof(abs2), ::typeof(+)) = 4096
+pairwise_blocksize(::typeof(abs2), ::typeof(Base.add_sum)) = 4096
 
 
 # handling empty arrays
@@ -1311,6 +1345,21 @@ for (fred, f) in ((maximum, max), (minimum, min), (sum, add_sum))
 end
 
 # Reduction kernels that explicitly encode simplistic SIMD-ish reorderings
+# Note: * and mul_prod are only commutative for numeric scalars, not matrices/quaternions
 const CommutativeOps = Union{typeof(+),typeof(Base.add_sum),typeof(min),typeof(max),typeof(Base._extrema_rf),typeof(|),typeof(&)}
 is_commutative_op(::CommutativeOps) = true
+
+# Trait for multiplication commutativity
+commutative_mul(::Type{T}) where {T} = T <: Union{Real,Complex}
+
+# Type-aware commutativity for multiplication
+is_commutative_op(::typeof(*), ::Type{T}) where {T} = commutative_mul(T)
+is_commutative_op(::typeof(Base.mul_prod), ::Type{T}) where {T} = commutative_mul(T)
+
+# Generic fallback for two-argument form
+is_commutative_op(op, ::Type) = is_commutative_op(op)
+
+# Default fallbacks
+is_commutative_op(::typeof(*)) = false  # Conservative default for *
+is_commutative_op(::typeof(Base.mul_prod)) = false  # Conservative default for mul_prod
 is_commutative_op(::Any) = false
