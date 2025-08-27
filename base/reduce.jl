@@ -119,19 +119,6 @@ end
 @inline (op::FilteringRF)(acc, x) = op.f(x) ? op.rf(acc, x) : acc
 
 """
-    RFMap(f, op) -> rf′
-
-Create a combined mapping-reduction function for better type inference.
-This wrapper improves type flow through kernels without runtime cost.
-"""
-struct RFMap{F,OP}
-    f::F
-    op::OP
-end
-
-@inline (r::RFMap)(acc, x) = r.op(acc, r.f(x))
-
-"""
     FlatteningRF(rf) -> rf′
 
 Create a flattening reducing function that is roughly equivalent to

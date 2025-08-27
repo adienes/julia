@@ -5,7 +5,6 @@
 # for reductions that expand 0 dims to 1
 reduced_index(i::OneTo{T}) where {T} = OneTo(one(T))
 reduced_index(i::Union{Slice, IdentityUnitRange}) = oftype(i, first(i):first(i))
-reduced_index(i::UnitRange) = first(i):first(i)  # Handle general UnitRange for OffsetArrays
 reduced_index(i::AbstractUnitRange) =
     throw(ArgumentError("no reduced_index for $(typeof(i))"))
 reduced_indices(a::AbstractArrayOrBroadcasted, region) = reduced_indices(axes(a), region)
@@ -46,11 +45,6 @@ mergeindices(b::NTuple{N,Bool}, x::CartesianIndex{N}, y::CartesianIndex{N}) wher
 
 keep_first_trues(::Tuple{}) = ()
 keep_first_trues(t) = t[1] ? (true, keep_first_trues(tail(t))...) : ntuple(Returns(false), length(t))
-
-# Layout trait for kernel selection (uses types from reduce.jl)
-layout_trait(A, is_inner_dim) =
-    is_inner_dim == keep_first_trues(is_inner_dim) ? Base.ContigInner() :
-    (is_inner_dim[1] ? Base.ContigOuter() : Base.Discontig())
 
 # These functions aren't used in the implementation here, but are used widely in the ecosystem
 promote_union(T::Union) = promote_type(promote_union(T.a), promote_union(T.b))
@@ -140,12 +134,6 @@ end
 @inline @propagate_inbounds function _sink_accum!(sink::_MRSink, R, I, v)
     mapreduce_accum!(sink, R, I, v)
 end
-
-# Ensure sink types pass through
-_to_sink(x::_MRSink) = x
-_to_sink(x::_MRAllocSink) = x  # Also pass through the allocator sink
-# Create default sink for array inputs
-_to_sink(x) = _MRAllocSink(x)
 
 # When performing dimensional reductions over arrays with singleton dimensions, we have
 # a choice as to whether that singleton dimenion should be a part of the reduction or not;
