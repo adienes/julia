@@ -287,6 +287,45 @@ compute_inner_dims(flagged_dims, source_size) =
         (false, map((flag,sz)->flag && sz != 1, tail(flagged_dims), tail(source_size))...)
 compute_inner_dims(::Tuple{}, ::Tuple{}) = ()
 
+# Disambiguating method for AbstractArray with Colon dims
+function mapreducedim(f::F, op::OP, A::AbstractArray{T,N}, init, ::Colon, sink=_MRAllocSink(A)) where {F, OP, T, N}
+    # Colon means reduce over all dimensions - delegate to mapreduce_pairwise
+    return mapreduce_pairwise(f, op, A, init)
+end
+
+# Specialized method for AbstractArrays with compile-time N  
+function mapreducedim(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink=_MRAllocSink(A)) where {F, OP, T, N}
+    # Check if we should use streaming kernel for "keep dim 1" case
+    if !(1 in dims) && N > 1
+        # Use streaming kernel for better performance when dim 1 is kept
+        return _mapreducedim_stream_firstdim(f, op, A, init, dims, sink)
+    end
+
+    # Check if we should use the memory-order streaming kernel
+    is_inner_dim_check = compute_inner_dims(ntuple(d->d in dims, Val(N)), size(A))
+    if _should_use_streaming(is_inner_dim_check, size(A))
+        return _mapreducedim_streaming(f, op, A, init, dims, sink)
+    end
+
+    if sink isa _MRInPlaceSink
+        # We can ignore dims and just trust the output array's axes. Note that the
+        # other branch here optimizes for the case where the input array _also_ has
+        # a singleton dimension, but we cannot do that here because OffsetArrays
+        # supports reductions into differently-offset singleton dimensions. This means
+        # we cannot index directly into A with an `outer` index. The output may also have
+        # fewer dimensions than A, so we may need to add trailing dims here:
+        outer = CartesianIndices(ntuple(d->axes(sink.A, d), Val(N)))
+        is_inner_dim = map(==(1), size(outer))
+    else
+        is_inner_dim = compute_inner_dims(ntuple(d->d in dims, Val(N)), size(A))
+        outer = CartesianIndices(reduced_indices(A, dims))
+    end
+    inner = CartesianIndices(select_outer_dimensions(A, is_inner_dim))
+
+    return _mapreducedim_impl(f, op, A, init, inner, outer, sink)
+end
+
+# Generic fallback for non-AbstractArrays (e.g. Vectors that might be used in bootstrap)
 function mapreducedim(f::F, op::OP, A, init, dims, sink=_MRAllocSink(A)) where {F, OP}
     # Check if we should use streaming kernel for "keep dim 1" case
     if !(1 in dims) && ndims(A) > 1
@@ -646,10 +685,9 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
 end
 
 # Memory-order streaming reduction optimized for scattered dimensions
-function _mapreducedim_streaming(f::F, op::OP, A, init, dims, sink) where {F,OP}
-    nd = ndims(A)
+function _mapreducedim_streaming(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink) where {F,OP,T,N}
     shape = size(A)
-    is_reduced = ntuple(d -> d in dims, nd)
+    is_reduced = ntuple(d -> d in dims, Val(N))
 
     # Build and initialize output
     output_axes = reduced_indices(A, dims)
@@ -674,7 +712,7 @@ function _mapreducedim_streaming(f::F, op::OP, A, init, dims, sink) where {F,OP}
         # Find the largest contiguous block we can process at once
         # This is the product of the first k dimensions that are all reduced
         contiguous_block = 1
-        for d in 1:nd
+        for d in 1:N
             if is_reduced[d]
                 contiguous_block *= shape[d]
             else
@@ -698,7 +736,7 @@ function _mapreducedim_streaming(f::F, op::OP, A, init, dims, sink) where {F,OP}
                 dim_idx = 1
 
                 # Skip the contiguous reduced dimensions at the start
-                for d in 1:nd
+                for d in 1:N
                     if is_reduced[d]
                         dim_idx = d + 1
                     else
@@ -707,7 +745,7 @@ function _mapreducedim_streaming(f::F, op::OP, A, init, dims, sink) where {F,OP}
                 end
 
                 # Compute output index based on remaining dimensions
-                for d in dim_idx:nd
+                for d in dim_idx:N
                     coord = (remaining % shape[d]) + 1
                     remaining ÷= shape[d]
                     if !is_reduced[d]
@@ -729,7 +767,7 @@ function _mapreducedim_streaming(f::F, op::OP, A, init, dims, sink) where {F,OP}
                 # Map to output index
                 remaining = lin_idx - 1
                 out_idx = 1
-                for d in 1:nd
+                for d in 1:N
                     coord = (remaining % shape[d]) + 1
                     remaining ÷= shape[d]
                     if !is_reduced[d]
@@ -743,13 +781,19 @@ function _mapreducedim_streaming(f::F, op::OP, A, init, dims, sink) where {F,OP}
     else
         # Fallback for arrays without fast linear indexing
         @inbounds for I_in in CartesianIndices(A)
-            I_out = CartesianIndex(ntuple(d -> is_reduced[d] ? 1 : I_in[d], nd))
+            I_out = CartesianIndex(ntuple(d -> is_reduced[d] ? 1 : I_in[d], Val(N)))
             val = f(A[I_in])
             R[I_out] = op(R[I_out], val)
         end
     end
 
     return mapreduce_finish(sink, R)
+end
+
+# Helper to compute product of selected dimensions at compile time
+@inline _prod_dims(shape::Tuple{}, mask::Tuple{}) = 1
+@inline function _prod_dims(shape::Tuple, mask::Tuple)
+    first(mask) ? first(shape) * _prod_dims(tail(shape), tail(mask)) : _prod_dims(tail(shape), tail(mask))
 end
 
 # Heuristic to decide if streaming would be more efficient
@@ -786,12 +830,12 @@ function _should_use_streaming(is_inner_dim::NTuple{N,Bool}, shape::NTuple{N,Int
     # Size of contiguous chunks we can process at once
     contiguous_chunk_size = prod(shape[1:contiguous_reduced])
 
-    # Number of output elements
-    output_size = prod(shape[d] for d in 1:N if !is_inner_dim[d])
+    # Number of output elements - compute at compile time
+    output_size = _prod_dims(shape, map(!, is_inner_dim))
 
     # Number of separated reduction positions per output element
     # (how many times standard algorithm jumps for each output)
-    total_reduced_size = prod(shape[d] for d in 1:N if is_inner_dim[d])
+    total_reduced_size = _prod_dims(shape, is_inner_dim)
     jumps_per_output = total_reduced_size ÷ contiguous_chunk_size
 
     # Streaming is beneficial when:
@@ -814,15 +858,14 @@ end
 
 # Streaming kernel for "keep dim 1" reductions using sink API
 # Works correctly with OffsetArrays and custom axes
-function _mapreducedim_stream_firstdim(f::F, op::OP, A, init, dims, sink) where {F,OP}
-    nd = ndims(A)
-    @assert !(1 in dims) && nd > 1
+function _mapreducedim_stream_firstdim(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink) where {F,OP,T,N}
+    @assert !(1 in dims) && N > 1
 
-    axsA = ntuple(d->axes(A,d), nd)
+    axsA = ntuple(d->axes(A,d), Val(N))
 
     if isempty(A)
         v = _mapreduce_start(f, op, A, init)
-        out_axes = ntuple(d -> d==1 ? axsA[1] : reduced_index(axsA[d]), nd)
+        out_axes = ntuple(d -> d==1 ? axsA[1] : reduced_index(axsA[d]), Val(N))
         R = mapreduce_allocate(sink, v, out_axes)
         for I in CartesianIndices(axes(R))
             @inbounds mapreduce_set!(sink, R, I, v)
@@ -832,24 +875,24 @@ function _mapreducedim_stream_firstdim(f::F, op::OP, A, init, dims, sink) where 
 
     # Seed output with the first "column"
     v_seed = _mapreduce_start(f, op, A, init, first(A))
-    out_axes = ntuple(d -> d==1 ? axsA[1] : reduced_index(axsA[d]), nd)
+    out_axes = ntuple(d -> d==1 ? axsA[1] : reduced_index(axsA[d]), Val(N))
     R = mapreduce_allocate(sink, v_seed, out_axes)
     out_axes_R = axes(R)
 
     # Columns are all reduced dims varying, others fixed to their first index
     cols_axes = ntuple(d -> d==1 ? reduced_index(axsA[1]) :
-                           (d in dims ? axsA[d] : reduced_index(axsA[d])), nd)
+                           (d in dims ? axsA[d] : reduced_index(axsA[d])), Val(N))
     cols = CartesianIndices(cols_axes)
 
     # ---- Seed pass with the first column c0 (no double op!) -------------------
     c0 = first(cols)
-    if nd == ndims(R)
+    if N == ndims(R)
         # Build a 1-D view along dim-1 once; other dims fixed at their first in R
         # (Tuple is created once, not per element)
-        fixed = ntuple(d -> d==1 ? Colon() : first(out_axes_R[d]), nd)
+        fixed = ntuple(d -> d==1 ? Colon() : first(out_axes_R[d]), Val(N))
         Rrow = @view R[fixed...]
         # Also build a 1-D view of A's first column
-        colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c0[d] : first(axsA[d])), nd)
+        colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c0[d] : first(axsA[d])), Val(N))
         Acol = @view A[colAidx...]
         for i in eachindex(Rrow, Acol)
             # Only the array accesses are @inbounds, not f or op
@@ -860,7 +903,7 @@ function _mapreducedim_stream_firstdim(f::F, op::OP, A, init, dims, sink) where 
     else
         # Fallback: R has fewer dims. Use LinearIndices once.
         LR = LinearIndices(R)
-        colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c0[d] : first(axsA[d])), nd)
+        colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c0[d] : first(axsA[d])), Val(N))
         Acol = @view A[colAidx...]
         # map linear index i -> LR[i]
         for i in eachindex(Acol)
@@ -872,7 +915,7 @@ function _mapreducedim_stream_firstdim(f::F, op::OP, A, init, dims, sink) where 
     end
 
     # ---- Accumulate the rest of the columns -----------------------------------
-    if nd == ndims(R)
+    if N == ndims(R)
         fixedR = ntuple(d -> d==1 ? Colon() : first(out_axes_R[d]), nd)
         Rrow = @view R[fixedR...]
         for c in Iterators.drop(cols, 1)
