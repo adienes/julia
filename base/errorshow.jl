@@ -654,6 +654,7 @@ end
 # Vector{Any} storing tuples (sf::StackFrame, nrepetitions::Int), and the updater should
 # replace `sf` as needed.
 const update_stackframes_callback = Ref{Function}(identity)
+const _update_stackframes_callback_lock = ReentrantLock()
 
 const STACKTRACE_MODULECOLORS = Iterators.Stateful(Iterators.cycle([:magenta, :cyan, :green, :yellow]))
 const STACKTRACE_FIXEDCOLORS = IdDict(Base => :light_black, Core => :light_black)
@@ -938,7 +939,8 @@ function show_backtrace(io::IO, t::Vector; prefix = nothing)
     end
 
     # Allow external code to edit information in the frames (e.g. line numbers with Revise)
-    try invokelatest(update_stackframes_callback[], filtered) catch end
+    callback = @lock _update_stackframes_callback_lock update_stackframes_callback[]
+    try invokelatest(callback, filtered) catch end
 
     show_processed_backtrace(IOContext(io, :backtrace => true), filtered, nframes, repeated_cycles, max_nested_cycles; print_linebreaks = stacktrace_linebreaks(), prefix)
     nothing

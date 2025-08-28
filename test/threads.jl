@@ -585,3 +585,251 @@ let once = OncePerTask{Int}(() -> error("expected"))
     @test_throws ErrorException("expected") once()
     @test_throws ErrorException("expected") once()
 end
+
+# Test thread safety of callback hooks
+# NOTE: This test suite asserts thread-safety guarantees for callback registration
+# and execution. Base.postoutput and Base.atreplinit are public APIs, but
+# Base._postoutput and Base.__atreplinit are internal. We're testing that concurrent
+# operations don't corrupt internal data structures (safety property), not specific
+# visibility or ordering guarantees (correctness properties).
+if Threads.nthreads() == 1
+    @testset "Thread-safe callback hooks" skip=true begin end
+else
+@testset "Thread-safe callback hooks" begin
+    
+    # Test concurrent postoutput_hooks operations
+    @test begin
+        # Snapshot current state to restore later
+        saved_hooks = copy(Base.postoutput_hooks)
+        errors = Threads.Atomic{Int}(0)
+        n_tasks = min(100, Threads.nthreads() * 20)
+        success = true
+        
+        try
+            # Run multiple iterations to increase confidence
+            for iteration in 1:3
+                gate = Threads.Event()
+                
+                tasks = [Threads.@spawn begin
+                    wait(gate)  # Wait for synchronized start
+                    
+                    # Race to add and execute callbacks
+                    for op in 1:20
+                        try
+                            if op % 2 == 0
+                                Base.postoutput(() -> nothing)
+                            else
+                                Base._postoutput()  # Internal API
+                            end
+                        catch e
+                            if isa(e, InterruptException)
+                                rethrow()  # Don't hide Ctrl-C
+                            else
+                                # Any exception indicates a problem
+                                Threads.atomic_add!(errors, 1)
+                                break
+                            end
+                        end
+                    end
+                end for i in 1:n_tasks]
+                
+                notify(gate)  # Release all tasks simultaneously
+                # Re-throw task exceptions so they count as failures
+                for t in tasks
+                    try
+                        fetch(t)
+                    catch
+                        Threads.atomic_add!(errors, 1)
+                    end
+                end
+                
+                if errors[] > 0
+                    success = false
+                    break
+                end
+            end
+        finally
+            # Restore original hooks
+            empty!(Base.postoutput_hooks)
+            append!(Base.postoutput_hooks, saved_hooks)
+        end
+        
+        # Contract: no corruption errors with proper locking
+        success && errors[] == 0
+    end
+    
+    # Test concurrent repl_hooks operations
+    @test begin
+        # Snapshot current state
+        saved_hooks = copy(Base.repl_hooks)
+        errors = Threads.Atomic{Int}(0)
+        n_tasks = min(100, Threads.nthreads() * 20)
+        success = true
+        
+        try
+            for iteration in 1:3
+                gate = Threads.Event()
+                
+                tasks = [Threads.@spawn begin
+                    wait(gate)  # Synchronized start
+                    
+                    # Race between adding and executing callbacks
+                    for op in 1:20
+                        try
+                            if op % 2 == 0
+                                Base.atreplinit(x -> nothing)
+                            else
+                                Base.__atreplinit(nothing)  # Internal API
+                            end
+                        catch e
+                            if isa(e, InterruptException)
+                                rethrow()
+                            else
+                                Threads.atomic_add!(errors, 1)
+                                break
+                            end
+                        end
+                    end
+                end for i in 1:n_tasks]
+                
+                notify(gate)
+                for t in tasks
+                    try
+                        fetch(t)
+                    catch
+                        Threads.atomic_add!(errors, 1)
+                    end
+                end
+                
+                if errors[] > 0
+                    success = false
+                    break
+                end
+            end
+        finally
+            # Restore original hooks
+            empty!(Base.repl_hooks)
+            append!(Base.repl_hooks, saved_hooks)
+        end
+        
+        success && errors[] == 0
+    end
+    
+    # Test mixed concurrent operations with correctness check
+    @test begin
+        # Snapshot state
+        saved_post = copy(Base.postoutput_hooks)
+        saved_repl = copy(Base.repl_hooks)
+        errors = Threads.Atomic{Int}(0)
+        callback_calls = Threads.Atomic{Int}(0)
+        n_tasks = min(100, Threads.nthreads() * 20)
+        
+        try
+            # Add a counting callback to verify execution
+            Base.postoutput(() -> Threads.atomic_add!(callback_calls, 1))
+            
+            gate = Threads.Event()
+            
+            tasks = [Threads.@spawn begin
+                wait(gate)
+                
+                # Mix different callback operations
+                for op in 1:30
+                    try
+                        if op % 4 == 0
+                            Base.postoutput(() -> nothing)
+                        elseif op % 4 == 1
+                            Base._postoutput()  # Internal API
+                        elseif op % 4 == 2
+                            Base.atreplinit(x -> nothing)
+                        else
+                            Base.__atreplinit(nothing)  # Internal API
+                        end
+                    catch e
+                        if isa(e, InterruptException)
+                            rethrow()
+                        else
+                            Threads.atomic_add!(errors, 1)
+                            break
+                        end
+                    end
+                end
+            end for i in 1:n_tasks]
+            
+            notify(gate)
+            for t in tasks
+                try
+                    fetch(t)
+                catch
+                    Threads.atomic_add!(errors, 1)
+                end
+            end
+            
+            # Execute remaining callbacks to finalize count (bounded)
+            local max_runs = 5 * (length(Base.postoutput_hooks) + 1)
+            for _ in 1:max_runs
+                isempty(Base.postoutput_hooks) && break
+                Base._postoutput()
+            end
+        finally
+            # Restore original state
+            empty!(Base.postoutput_hooks)
+            append!(Base.postoutput_hooks, saved_post)
+            empty!(Base.repl_hooks)
+            append!(Base.repl_hooks, saved_repl)
+        end
+        
+        # Contract: no corruption, and callback was executed at least once
+        errors[] == 0 && callback_calls[] > 0
+    end
+    
+    # Test aggressive concurrent modifications
+    @test begin
+        saved_hooks = copy(Base.postoutput_hooks)
+        errors = Threads.Atomic{Int}(0)
+        n_tasks = min(100, Threads.nthreads() * 20)
+        
+        try
+            gate = Threads.Event()
+            
+            tasks = [Threads.@spawn begin
+                wait(gate)
+                
+                # Rapid operations without yielding to maximize contention
+                for op in 1:20
+                    try
+                        if op % 2 == 0
+                            Base.postoutput(() -> nothing)
+                        else
+                            Base._postoutput()
+                        end
+                    catch e
+                        if isa(e, InterruptException)
+                            rethrow()
+                        else
+                            Threads.atomic_add!(errors, 1)
+                            break
+                        end
+                    end
+                end
+            end for i in 1:n_tasks]
+            
+            notify(gate)
+            for t in tasks
+                try
+                    fetch(t)
+                catch
+                    Threads.atomic_add!(errors, 1)
+                end
+            end
+        finally
+            # Restore original hooks
+            empty!(Base.postoutput_hooks)
+            append!(Base.postoutput_hooks, saved_hooks)
+        end
+        
+        # Should have no corruption errors with proper locking
+        errors[] == 0
+    end
+end
+end

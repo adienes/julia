@@ -1433,9 +1433,10 @@ end
 function run_package_callbacks(modkey::PkgId)
     run_extension_callbacks(modkey)
     assert_havelock(require_lock)
+    callbacks = @lock _package_callbacks_lock copy(package_callbacks)
     unlock(require_lock)
     try
-        for callback in package_callbacks
+        for callback in callbacks
             invokelatest(callback, modkey)
         end
     catch
@@ -2228,10 +2229,12 @@ end
 # Callbacks take the form (mod::Base.PkgId) -> nothing.
 # WARNING: This is an experimental feature and might change later, without deprecation.
 const package_callbacks = Any[]
+const _package_callbacks_lock = ReentrantLock()
 # to notify downstream consumers that a file has been included into a particular module
 # Callbacks take the form (mod::Module, filename::String) -> nothing
 # WARNING: This is an experimental feature and might change later, without deprecation.
 const include_callbacks = Any[]
+const _include_callbacks_lock = ReentrantLock()
 
 # used to optionally track dependencies when requiring a module:
 const _concrete_dependencies = Pair{PkgId,UInt128}[] # these dependency versions are "set in stone", because they are explicitly loaded, and the process should try to avoid invalidating them
@@ -2915,7 +2918,8 @@ Base.include # defined in Base.jl
 function _include(mapexpr::Function, mod::Module, _path::AbstractString)
     @noinline # Workaround for module availability in _simplify_include_frames
     path, prev = _include_dependency(mod, _path)
-    for callback in include_callbacks # to preserve order, must come before eval in include_string
+    callbacks = @lock _include_callbacks_lock copy(include_callbacks)
+    for callback in callbacks # to preserve order, must come before eval in include_string
         invokelatest(callback, mod, path)
     end
     code = read(path, String)
