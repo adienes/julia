@@ -108,12 +108,10 @@ end
                                reduce_mask::NTuple{N,Bool}, k::Int,
                                firsts::NTuple{N,Int}, strides::NTuple{N,Int}) where {N}
     acc = 1
-    @inbounds for d in 1:N
-        idd = if d <= k
-            firsts[d]
-        else
-            reduce_mask[d] ? r.I[d] : o.I[d]
-        end
+    # Hoist the offset computation for first k dims (they're always at firsts)
+    # No contribution since (firsts[d] - firsts[d]) * strides[d] = 0
+    @inbounds for d in (k+1):N
+        idd = reduce_mask[d] ? r.I[d] : o.I[d]
         acc += (idd - firsts[d]) * strides[d]
     end
     return acc
@@ -126,12 +124,10 @@ end
                                        firsts::NTuple{N,Int},
                                        strides::NTuple{N,Int}) where {N}
     acc = 1
-    @inbounds for d in 1:N
-        idd = if d <= k
-            firsts[d]
-        else
-            reduce_mask[d] ? rem_counters[d] : outer_counters[d]
-        end
+    # Hoist the offset computation for first k dims (they're always at firsts)
+    # No contribution since (firsts[d] - firsts[d]) * strides[d] = 0
+    @inbounds for d in (k+1):N
+        idd = reduce_mask[d] ? rem_counters[d] : outer_counters[d]
         acc += (idd - firsts[d]) * strides[d]
     end
     return acc
@@ -139,6 +135,30 @@ end
 
 # Fast path check (reuses your trait)
 @inline _fast_linear(A) = has_fast_linear_indexing(A)
+
+# Helper to compute linearization contribution for given dimensions and mask
+@inline function _compute_linear_contribution(idx::CartesianIndex{N}, mask::NTuple{N,Bool},
+                                            firsts::NTuple{N,Int}, strides::NTuple{N,Int}) where {N}
+    acc = 1
+    @inbounds for d in 1:N
+        if mask[d]
+            acc += (idx.I[d] - firsts[d]) * strides[d]
+        end
+    end
+    return acc
+end
+
+# Efficient helper to compute outer vs inner contributions separately
+@inline function _compute_outer_inner_contributions(o::CartesianIndex{N}, i::CartesianIndex{N},
+                                                   is_inner_dim::NTuple{N,Bool},
+                                                   firsts::NTuple{N,Int}, strides::NTuple{N,Int}) where {N}
+    acc = 1
+    @inbounds for d in 1:N
+        idd = is_inner_dim[d] ? i.I[d] : o.I[d]
+        acc += (idd - firsts[d]) * strides[d]
+    end
+    return acc
+end
 
 @inline _contiguous_prefix(mask::NTuple{N,Bool}) where {N} = begin
     k = 0
@@ -453,7 +473,7 @@ function mapreducedim_naive(f::F, op::OP, A, init, is_inner_dim, inner, outer, s
         linear_range = i0:(i0+lsiz-1)
         for (idx, i) in enumerate(outer)
             off = lsiz*(idx-1)
-            v = mapreduce_pairwise(f, op, A, init, 
+            v = mapreduce_pairwise(f, op, A, init,
                                  (first(linear_range)+off):(last(linear_range)+off))
             mapreduce_set!(sink, R, i, v)
         end
@@ -517,8 +537,23 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
         it0 = iterate(discontiguous_inner)
         @assert it0 !== nothing
         r0, st0 = it0
+
+        # Pre-compute r0 contribution for dimensions > k (hoisted)
+        r0_contrib = 1
+        @inbounds for d in (k+1):N
+            if is_inner_dim[d]
+                r0_contrib += (r0.I[d] - firsts[d]) * strides[d]
+            end
+        end
+
         for o in outer
-            base = _lin_base_for(o, r0, is_inner_dim, k, firsts, strides)
+            # Compute outer contribution and combine with hoisted r0 contribution
+            base = r0_contrib
+            @inbounds for d in (k+1):N
+                if !is_inner_dim[d]
+                    base += (o.I[d] - firsts[d]) * strides[d]
+                end
+            end
             v = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
             mapreduce_set!(sink, R, o, v)
         end
@@ -551,9 +586,23 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                 local_it = it
 
                 # Process a tile of remainder indices
+                # Pre-compute outer contribution for this o (hoisted)
+                outer_base = 1
+                @inbounds for d in (k+1):N
+                    if !is_inner_dim[d]
+                        outer_base += (o.I[d] - firsts[d]) * strides[d]
+                    end
+                end
+
                 while local_it !== nothing && chunk_count < plan.tile_B
                     dci, st = local_it
-                    base = _lin_base_for(o, dci, is_inner_dim, k, firsts, strides)
+                    # Combine with inner contribution
+                    base = outer_base
+                    @inbounds for d in (k+1):N
+                        if is_inner_dim[d]
+                            base += (dci.I[d] - firsts[d]) * strides[d]
+                        end
+                    end
                     v = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
                     vtile = vtile === nothing ? v : op(vtile, v)
                     chunk_count += 1
@@ -621,8 +670,22 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
         it = rem_iter
         while it !== nothing
             dci, st = it
+            # Pre-compute inner contribution for this dci (hoisted)
+            inner_base = 1
+            @inbounds for d in (k+1):N
+                if is_inner_dim[d]
+                    inner_base += (dci.I[d] - firsts[d]) * strides[d]
+                end
+            end
+
             for o in outer
-                base = _lin_base_for(o, dci, is_inner_dim, k, firsts, strides)
+                # Combine with outer contribution
+                base = inner_base
+                @inbounds for d in (k+1):N
+                    if !is_inner_dim[d]
+                        base += (o.I[d] - firsts[d]) * strides[d]
+                    end
+                end
                 val = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
                 r_val = @inbounds R[o]
                 @inbounds R[o] = op(r_val, val)
@@ -675,12 +738,22 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
         firsts  = _axes_first(A)
         lens    = _axes_len(A)
         strides = _lin_strides_from_lengths(lens)
+
+        # Pre-compute i1 inner contribution
+        i1_contrib = 1
+        @inbounds for d in 1:N
+            if is_inner_dim[d]
+                i1_contrib += (i1.I[d] - firsts[d]) * strides[d]
+            end
+        end
+
         for o in outer
-            # Build per-dim coordinate tuple for this (o, i1) in a linear way without constructing CI
-            acc = 1
+            # Build per-dim coordinate tuple for this (o, i1) using hoisted computation
+            acc = i1_contrib
             @inbounds for d in 1:N
-                idd = is_inner_dim[d] ? i1.I[d] : o.I[d]
-                acc += (idd - firsts[d]) * strides[d]
+                if !is_inner_dim[d]
+                    acc += (o.I[d] - firsts[d]) * strides[d]
+                end
             end
             v = _mapreduce_start(f, op, A, init, A[acc])
             mapreduce_set!(sink, R, o, v)
@@ -704,18 +777,28 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
         if _fast_linear(A)
             # Optimized path: process directly without buffering
             firsts = _row_firsts; strides = _row_strides
+
             while it !== nothing
                 for o in outer
                     vtile = nothing
                     chunk_count = 0
                     local_it = it
 
+                    # Compute outer contribution once per o (no allocation)
+                    outer_acc = 1
+                    @inbounds for d in 1:N
+                        if !is_inner_dim[d]
+                            outer_acc += (o.I[d] - firsts[d]) * strides[d]
+                        end
+                    end
+
                     while local_it !== nothing && chunk_count < B
                         i, st = local_it
-                        acc = 1
+                        acc = outer_acc
                         @inbounds for d in 1:N
-                            idd = is_inner_dim[d] ? i.I[d] : o.I[d]
-                            acc += (idd - firsts[d]) * strides[d]
+                            if is_inner_dim[d]
+                                acc += (i.I[d] - firsts[d]) * strides[d]
+                            end
                         end
                         v = f(A[acc])
                         vtile = vtile === nothing ? v : op(vtile, v)
@@ -774,13 +857,25 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
     # Non-commutative path: strict left-to-right recurrence (preserve order).
     if _fast_linear(A)
         firsts = _row_firsts; strides = _row_strides
+
         for i in Iterators.drop(inner, 1)
-            for o in outer
-                acc = 1
-                @inbounds for d in 1:N
-                    idd = is_inner_dim[d] ? i.I[d] : o.I[d]
-                    acc += (idd - firsts[d]) * strides[d]
+            # Pre-compute inner index contribution once per i
+            inner_acc = 1
+            @inbounds for d in 1:N
+                if is_inner_dim[d]
+                    inner_acc += (i.I[d] - firsts[d]) * strides[d]
                 end
+            end
+
+            for o in outer
+                # Compute outer contribution (no allocation)
+                outer_acc = 1
+                @inbounds for d in 1:N
+                    if !is_inner_dim[d]
+                        outer_acc += (o.I[d] - firsts[d]) * strides[d]
+                    end
+                end
+                acc = outer_acc + inner_acc - 1  # -1 because both start at 1
                 a_val = @inbounds A[acc]
                 r_val = @inbounds R[o]
                 @inbounds R[o] = op(r_val, f(a_val))
@@ -821,20 +916,27 @@ function _mapreducedim_streaming(f::F, op::OP, A::AbstractArray{T,N}, init, dims
         output_shape = size(R)
 
         # Always use the general approach that works for any dimensionality
-        # Precompute strides for efficient indexing
+        # Precompute strides for efficient indexing (hoisted outside processing loops)
         input_strides = _lin_strides_from_lengths(shape)
         output_strides = _lin_strides_from_lengths(output_shape)
 
         # Find the largest contiguous block we can process at once
         # This is the product of the first k dimensions that are all reduced
         contiguous_block = 1
+        first_non_reduced_dim = N + 1  # Track first non-reduced dimension
         for d in 1:N
             if is_reduced[d]
                 contiguous_block *= shape[d]
             else
+                first_non_reduced_dim = d
                 break
             end
         end
+
+        # Pre-compute stride products for non-reduced dimensions (hoisted computation)
+        output_stride_multipliers = ntuple(d ->
+            d < first_non_reduced_dim ? 0 :
+            (is_reduced[d] ? 0 : output_strides[d]), Val(N))
 
         # Process the array in memory order
         if contiguous_block > 1
@@ -860,13 +962,11 @@ function _mapreducedim_streaming(f::F, op::OP, A::AbstractArray{T,N}, init, dims
                     end
                 end
 
-                # Compute output index based on remaining dimensions
+                # Compute output index based on remaining dimensions using hoisted multipliers
                 for d in dim_idx:N
                     coord = (remaining % shape[d]) + 1
                     remaining ÷= shape[d]
-                    if !is_reduced[d]
-                        out_idx += (coord - 1) * output_strides[d]
-                    end
+                    out_idx += (coord - 1) * output_stride_multipliers[d]
                 end
 
                 # Process the entire contiguous block and accumulate to single output position
@@ -880,15 +980,13 @@ function _mapreducedim_streaming(f::F, op::OP, A::AbstractArray{T,N}, init, dims
             @inbounds for lin_idx in 1:length(A)
                 val = f(A[lin_idx])
 
-                # Map to output index
+                # Map to output index using hoisted multipliers
                 remaining = lin_idx - 1
                 out_idx = 1
                 for d in 1:N
                     coord = (remaining % shape[d]) + 1
                     remaining ÷= shape[d]
-                    if !is_reduced[d]
-                        out_idx += (coord - 1) * output_strides[d]
-                    end
+                    out_idx += (coord - 1) * output_stride_multipliers[d]
                 end
 
                 R[out_idx] = op(R[out_idx], val)
