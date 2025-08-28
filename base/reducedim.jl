@@ -68,6 +68,61 @@ end
                                  (), _trailing(o, r, reduce_mask, Val(k)))
 end
 
+
+# Helper for computing contiguous length based on inner pack size
+@inline function _compute_contig_len(k::Int, contiguous_inner, is_contiguous_inner, outer)
+    k == 0 && return 0
+    k == 1 && return length(contiguous_inner)
+    return length(mergeindices(is_contiguous_inner, contiguous_inner, first(outer)))
+end
+
+# Initialize result array with first reduction slice
+@inline function _seed_result!(sink, R, f, op, A, init, is_inner_dim, contiguous_inner, outer)
+    for o in outer
+        v = mapreduce_pairwise(f, op, A, init, mergeindices(is_inner_dim, contiguous_inner, o))
+        mapreduce_set!(sink, R, o, v)
+    end
+    return R
+end
+
+# Process a tile of remainder indices for commutative operations (colmajor version with kernel sweep)
+@inline function _process_commutative_tile!(R, tile_buf, tlen, f, op, A, init, contig_inds,
+                                           outer, is_inner_dim, k)
+    for o in outer
+        # Start with first element to avoid neutral element issues
+        dci1 = @inbounds tile_buf[1]
+        vtile = _lane_comm_sweep(f, op, A, init, contig_inds, o, dci1,
+                                is_inner_dim, Val(k))
+        for j in 2:tlen
+            dci = @inbounds tile_buf[j]
+            vtile = op(vtile, _lane_comm_sweep(f, op, A, init, contig_inds, o, dci,
+                                              is_inner_dim, Val(k)))
+        end
+        r_val = @inbounds R[o]
+        @inbounds R[o] = op(r_val, vtile)
+    end
+end
+
+# Process a tile of indices for row-major commutative operations (direct indexing)
+@inline function _process_rowmajor_tile!(R, tile_buf, tlen, f, op, A, outer, is_inner_dim)
+    for o in outer
+        # Start with first element to avoid neutral element issues
+        tb1 = @inbounds tile_buf[1]
+        idx = mergeindices(is_inner_dim, tb1, o)
+        a_val = @inbounds A[idx]
+        vtile = f(a_val)
+        # Accumulate the rest
+        for j in 2:tlen
+            tbj = @inbounds tile_buf[j]
+            idx = mergeindices(is_inner_dim, tbj, o)
+            a_val = @inbounds A[idx]
+            vtile = op(vtile, f(a_val))
+        end
+        r_val = @inbounds R[o]
+        @inbounds R[o] = op(r_val, vtile)
+    end
+end
+
 # for reductions that expand 0 dims to 1
 reduced_index(i::OneTo{T}) where {T} = OneTo(one(T))
 reduced_index(i::Union{Slice, IdentityUnitRange}) = oftype(i, first(i):first(i))
@@ -311,11 +366,8 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
     discontiguous_inner = mergeindices(is_contiguous_inner, first(inner), inner)  # varying only over the non-contiguous remainder
 
     # Decide early: if the remainder fan-out is large, one whole-inner sweep is faster.
-    # contig_len is how many indices the contiguous pack spans (e.g. size(A,1) for k=1).
     k = plan.inner_pack
-    contig_len = k == 0 ? 0 :
-                 (k == 1 ? length(contiguous_inner) :
-                           length(mergeindices(is_contiguous_inner, contiguous_inner, first(outer))))
+    contig_len = _compute_contig_len(k, contiguous_inner, is_contiguous_inner, outer)
     if enforce_pairwise && _use_pairwise_reduction(plan, contig_len, length(discontiguous_inner))
         return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
     end
@@ -323,10 +375,7 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
     # Seed the result with the first remainder slice (so we always combine into a real value)
     v0 = _mapreduce_start(f, op, A, init)
     R = mapreduce_allocate(sink, v0, axes(outer))
-    for o in outer
-        v = mapreduce_pairwise(f, op, A, init, mergeindices(is_inner_dim, contiguous_inner, o))
-        mapreduce_set!(sink, R, o, v)
-    end
+    _seed_result!(sink, R, f, op, A, init, is_inner_dim, contiguous_inner, outer)
 
     # No remainder → done
     rem_total = length(discontiguous_inner)
@@ -359,21 +408,9 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
             end
             tlen == 0 && break  # no more work
 
-            # For each outer position, fold the B-lane tile, then combine once into R[o].
-            # This avoids touching R[o] tlen times and lets the compiler keep a single
-            # accumulator live in registers per outer element.
-            for o in outer
-                # Start with first element to avoid neutral element issues
-                dci1 = @inbounds tile_buf[1]
-                vtile = _lane_comm_sweep(f, op, A, init, contig_inds, o, dci1,
-                                        is_inner_dim, Val(k))
-                for j in 2:tlen
-                    dci = @inbounds tile_buf[j]
-                    vtile = op(vtile, _lane_comm_sweep(f, op, A, init, contig_inds, o, dci,
-                                                       is_inner_dim, Val(k)))
-                end
-                @inbounds R[o] = op(R[o], vtile)
-            end
+            # Process this tile for all outer positions
+            _process_commutative_tile!(R, tile_buf, tlen, f, op, A, init, contig_inds,
+                                      outer, is_inner_dim, k)
 
             # If the last gather reached the end, we are done.
             it === nothing && break
@@ -388,7 +425,8 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
         for o in outer
             i = mergeindices(is_inner_dim, dci, o)
             val = mapreduce_pairwise(f, op, A, init, mergeindices(is_contiguous_inner, contiguous_inner, i))
-            @inbounds R[o] = op(R[o], val)
+            r_val = @inbounds R[o]
+            @inbounds R[o] = op(r_val, val)
         end
     end
     return R
@@ -441,22 +479,8 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
             end
             tlen == 0 && break  # exhausted
 
-            # Fold the tile per outer coordinate, then combine once
-            for o in outer
-                # Start with first element to avoid neutral element issues
-                tb1 = @inbounds tile_buf[1]
-                idx = mergeindices(is_inner_dim, tb1, o)
-                a_val = @inbounds A[idx]
-                vtile = f(a_val)
-                # Accumulate the rest
-                for j in 2:tlen
-                    tbj = @inbounds tile_buf[j]
-                    idx = mergeindices(is_inner_dim, tbj, o)
-                    a_val = @inbounds A[idx]
-                    vtile = op(vtile, f(a_val))
-                end
-                @inbounds R[o] = op(R[o], vtile)
-            end
+            # Process this tile for all outer positions
+            _process_rowmajor_tile!(R, tile_buf, tlen, f, op, A, outer, is_inner_dim)
 
             it === nothing && break
         end
@@ -470,7 +494,8 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
             iA = mergeindices(is_inner_dim, i, o)
             a_val = @inbounds A[iA]
             val = f(a_val)
-            @inbounds R[o] = op(R[o], val)
+            r_val = @inbounds R[o]
+            @inbounds R[o] = op(r_val, val)
         end
     end
     return R
