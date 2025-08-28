@@ -305,7 +305,7 @@ julia> mapreduce(isodd, |, a, dims=1)
  1  1  1  1
 ```
 """
-mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted; init=_InitialValue(), dims=(:)) where {F,G} = 
+mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted; init=_InitialValue(), dims=(:)) where {F,G} =
     mapreducedim(f, op, A, init, dims, Base._MRAllocSink(A))
 mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted, As::AbstractArrayOrBroadcasted...; init=_InitialValue(), dims=(:)) where {F,G} =
     reduce(op, map(f, A, As...); init, dims)
@@ -504,7 +504,7 @@ function mapreduce_pairwise(f::F, op::G, A::AbstractArrayOrBroadcasted, init) wh
 
     inds = eachindex(A)
     blocksize = pairwise_blocksize(f, op)
-    
+
     if n <= blocksize
         # Choose kernel based on commutativity
         if is_commutative_op(op, eltype(A))
@@ -1442,3 +1442,10 @@ is_commutative_op(op, ::Type) = is_commutative_op(op)
 is_commutative_op(::typeof(*)) = false  # Conservative default for *
 is_commutative_op(::typeof(Base.mul_prod)) = false  # Conservative default for mul_prod
 is_commutative_op(::Any) = false
+
+# Tuning parameter for blocking remainder lanes in dimensional reductions
+# Returns the number of remainder "lanes" to process together in a tile
+# to improve cache locality and reduce loop overhead
+reduce_tile_size(f, op, ::Type{T}) where {T} = (sizeof(T) ≤ 4 ? 16 : 8)
+reduce_tile_size(::typeof(abs2), ::typeof(Base.add_sum), ::Type{T}) where {T} =
+    (sizeof(T) ≤ 4 ? 32 : 16)

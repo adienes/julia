@@ -2,6 +2,40 @@
 
 ## Functions to compute the reduced shape
 
+# --- Reduction planning (array-generic) ---------------------------------------
+
+struct ReductionPlan{N}
+    reduce_mask :: NTuple{N,Bool}   # dims to reduce
+    keep_mask   :: NTuple{N,Bool}   # !reduce_mask
+    sizes       :: NTuple{N,Int}
+    inner_pack  :: Int              # largest k such that dims 1:k are reduced & contiguous
+    inner_bs    :: Int              # pairwise blocksize for inner pack sweeps
+    tile_B      :: Int              # lanes to batch across discontiguous remainder dims
+end
+
+@inline _contiguous_prefix(mask::NTuple{N,Bool}) where {N} = begin
+    k = 0
+    @inbounds for d in 1:N
+        if mask[d] && d == k + 1
+            k += 1
+        else
+            break
+        end
+    end
+    k
+end
+
+@inline function _mkplan(f, op, A::AbstractArray, is_inner_dim::NTuple{N,Bool}) where {N}
+    ReductionPlan{N}(
+        is_inner_dim,
+        ntuple(d->!is_inner_dim[d], N),
+        ntuple(d->size(A,d), N),
+        _contiguous_prefix(is_inner_dim),
+        Base.pairwise_blocksize(f, op),
+        Base.reduce_tile_size(f, op, eltype(A)),
+    )
+end
+
 # for reductions that expand 0 dims to 1
 reduced_index(i::OneTo{T}) where {T} = OneTo(one(T))
 reduced_index(i::Union{Slice, IdentityUnitRange}) = oftype(i, first(i):first(i))
@@ -111,7 +145,7 @@ mapreduce_finish(::_MRAllocSink, R) = R
 
 # _MRInPlaceSink already defined earlier for type dispatch
 
-_MRInPlaceSink(A, op; update::Bool=false) = 
+_MRInPlaceSink(A, op; update::Bool=false) =
     _MRInPlaceSink{typeof(A), typeof(op), Val(update)}(A, op)
 
 mapreduce_allocate(s::_MRInPlaceSink, e, axs) = s.A
@@ -152,7 +186,7 @@ function mapreducedim(f::F, op::OP, A, init, dims, sink=_MRAllocSink(A)) where {
         # Use streaming kernel for better performance when dim 1 is kept
         return _mapreducedim_stream_firstdim(f, op, A, init, dims, sink)
     end
-    
+
     if sink isa _MRInPlaceSink
         # We can ignore dims and just trust the output array's axes. Note that the
         # other branch here optimizes for the case where the input array _also_ has
@@ -212,7 +246,7 @@ function mapreducedim_naive(f::F, op::OP, A, init, is_inner_dim, inner, outer, s
     lsiz = linear_size(A, is_inner_dim)
     v0 = _mapreduce_start(f, op, A, init)
     R = mapreduce_allocate(sink, v0, axes(outer))
-    
+
     if lsiz > 0
         i0 = first(LinearIndices(A))
         linear_range = i0:(i0+lsiz-1)
@@ -234,18 +268,23 @@ end
 Column-major reduction kernel for cases where the inner dimension is included
 but not fully contiguous. Processes contiguous parts efficiently.
 """
-function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink, enforce_pairwise=true) where {F, OP}
-    is_contiguous_inner = keep_first_trues(is_inner_dim)
-    contiguous_inner = mergeindices(is_contiguous_inner, inner, first(inner))
-    discontiguous_inner = mergeindices(is_contiguous_inner, first(inner), inner)
+mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink, enforce_pairwise=true) where {F,OP} =
+    mapreducedim_colmajor(f, op, A, init, is_inner_dim, inner, outer, sink, _mkplan(f, op, A, is_inner_dim), enforce_pairwise)
 
-    # Check if we should fall back to naive for long discontiguous parts
-    bs = Base.pairwise_blocksize(f, op)
-    if enforce_pairwise && length(discontiguous_inner) > max(bs, Base.MIN_BLOCK)
+function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink,
+                               plan::ReductionPlan{N}, enforce_pairwise=true) where {F,OP,N}
+    # Split the inner (reduced) block into its contiguous prefix and the discontiguous "remainder"
+    is_contiguous_inner = keep_first_trues(is_inner_dim)
+    contiguous_inner    = mergeindices(is_contiguous_inner, inner, first(inner))  # varying only over the contiguous prefix
+    discontiguous_inner = mergeindices(is_contiguous_inner, first(inner), inner)  # varying only over the non-contiguous remainder
+
+    # Guard: for very long remainders, the naive (pairwise) kernel is better than
+    # bouncing through many tiny mapreduce kernels from here.
+    if enforce_pairwise && length(discontiguous_inner) > max(plan.inner_bs, Base.MIN_BLOCK)
         return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
     end
 
-    # Initialize with the first contiguous reduction using sink API
+    # Seed the result with the first remainder slice (so we always combine into a real value)
     v0 = _mapreduce_start(f, op, A, init)
     R = mapreduce_allocate(sink, v0, axes(outer))
     for o in outer
@@ -253,31 +292,73 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
         mapreduce_set!(sink, R, o, v)
     end
 
-    # Handle short discontiguous remainder with optimized kernel if commutative
-    remaining_count = length(discontiguous_inner) - 1
-    if remaining_count > 0 && remaining_count <= 8 && is_commutative_op(op)
-        # Use unrolled commutative kernel across columns for short remainders
-        for dci in Iterators.drop(discontiguous_inner, 1)
-            # Process all outer indices together for better vectorization
+    # No remainder → done
+    rem_total = length(discontiguous_inner)
+    rem_total <= 1 && return R
+
+    # If op is commutative we can process remainder "lanes" in small tiles, which greatly
+    # reduces loop overhead and improves cache behavior on cases like dims=(1,2,4).
+    if is_commutative_op(op)
+        # Use the tile size from the plan
+        B = plan.tile_B
+
+        # Advance the remainder iterator past the first element (already folded in R)
+        it = iterate(discontiguous_inner)
+        @assert it !== nothing
+        _, st = it
+        it = iterate(discontiguous_inner, st)  # now at the second element (or nothing)
+
+        # Small reusable buffer to hold one tile of remainder indices (avoid re-iterating)
+        # NOTE: using Vector here avoids building tuples with closures; it's a single allocation
+        # per call and re-used for all tiles.
+        tile_buf = Vector{CartesianIndex{N}}(undef, B)
+
+        while true
+            # Gather up to B remainder indices into the tile buffer
+            tlen = 0
+            while tlen < B
+                it === nothing && break
+                dci, st = it
+                tlen += 1
+                tile_buf[tlen] = dci
+                it = iterate(discontiguous_inner, st)
+            end
+            tlen == 0 && break  # no more work
+
+            # For each outer position, fold the B-lane tile, then combine once into R[o].
+            # This avoids touching R[o] tlen times and lets the compiler keep a single
+            # accumulator live in registers per outer element.
             @inbounds for o in outer
-                # Precompute the merged index only once per inner iteration
-                i = mergeindices(is_inner_dim, dci, o)
-                i_contig = mergeindices(is_contiguous_inner, contiguous_inner, i)
-                val = mapreduce_pairwise(f, op, A, init, i_contig)
-                R[o] = op(R[o], val)
+                # Start with the first element of the tile to avoid neutral element issues
+                dci = tile_buf[1]
+                i   = mergeindices(is_inner_dim, dci, o)
+                vtile = mapreduce_pairwise(f, op, A, init,
+                                         mergeindices(is_contiguous_inner, contiguous_inner, i))
+                # Accumulate the rest of the tile
+                @inbounds for j in 2:tlen
+                    dci = tile_buf[j]
+                    i   = mergeindices(is_inner_dim, dci, o)
+                    vtile = op(vtile, mapreduce_pairwise(f, op, A, init,
+                                                         mergeindices(is_contiguous_inner, contiguous_inner, i)))
+                end
+                R[o] = op(R[o], vtile)
             end
+
+            # If the last gather reached the end, we are done.
+            it === nothing && break
         end
-    else
-        # Standard processing for longer remainders
-        for dci in Iterators.drop(discontiguous_inner, 1)
-            for o in outer
-                i = mergeindices(is_inner_dim, dci, o)
-                i_contig = mergeindices(is_contiguous_inner, contiguous_inner, i)
-                R[o] = op(R[o], mapreduce_pairwise(f, op, A, init, i_contig))
-            end
-        end
+        return R
     end
 
+    # Non-commutative path: strict left-to-right across remainder lanes.
+    # Keep the straightforward order to preserve semantics; we still benefit
+    # from avoiding inner branching and from the single seed above.
+    for dci in Iterators.drop(discontiguous_inner, 1)
+        @inbounds for o in outer
+            i = mergeindices(is_inner_dim, dci, o)
+            R[o] = op(R[o], mapreduce_pairwise(f, op, A, init, mergeindices(is_contiguous_inner, contiguous_inner, i)))
+        end
+    end
     return R
 end
 
@@ -287,31 +368,74 @@ end
 Row-major reduction kernel for fully discontiguous cases.
 Uses @inbounds but avoids @simd for non-vectorizable scalar recurrences.
 """
-function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink, enforce_pairwise=true) where {F, OP}
-    # Row-major is essentially a foldl, not cache-optimal for pairwise reassociation
-    bs = Base.pairwise_blocksize(f, op)
-    if enforce_pairwise && length(inner) > max(bs, Base.MIN_BLOCK)
+mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink, enforce_pairwise=true) where {F,OP} =
+    mapreducedim_rowmajor(f, op, A, init, is_inner_dim, inner, outer, sink, _mkplan(f, op, A, is_inner_dim), enforce_pairwise)
+
+function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink,
+                               plan::ReductionPlan{N}, enforce_pairwise=true) where {F,OP,N}
+    # Row-major is essentially a left-to-right fold over a discontiguous set of dims.
+    # Keep the guard to punt very long cases back to the naive pairwise kernel.
+    if enforce_pairwise && length(inner) > max(plan.inner_bs, Base.MIN_BLOCK)
         return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
     end
 
-    # Initialize with first element from each outer iteration using sink API
+    # Initialize with the very first inner index so that R[o] is always a real value
+    it0 = iterate(inner)
+    @assert it0 !== nothing
+    i1, st = it0
     v0 = _mapreduce_start(f, op, A, init)
     R = mapreduce_allocate(sink, v0, axes(outer))
     for o in outer
-        v = _mapreduce_start(f, op, A, init, A[mergeindices(is_inner_dim, first(inner), o)])
+        v = _mapreduce_start(f, op, A, init, A[mergeindices(is_inner_dim, i1, o)])
         mapreduce_set!(sink, R, o, v)
     end
 
-    # Process remaining inner indices
-    # Note: @simd on scalar recurrence doesn't vectorize but can help scheduler
+    # If op is commutative we can block the remaining inner indices into small tiles,
+    # accumulating per-outer partials in registers before touching R[o] once per tile.
+    if is_commutative_op(op)
+        # Use the tile size from the plan
+        B = plan.tile_B
+        tile_buf = Vector{CartesianIndex{N}}(undef, B)
+
+        it = iterate(inner, st)  # start from the second inner index
+        while true
+            # Gather up to B inner indices
+            tlen = 0
+            while tlen < B
+                it === nothing && break
+                i, st = it
+                tlen += 1
+                tile_buf[tlen] = i
+                it = iterate(inner, st)
+            end
+            tlen == 0 && break  # exhausted
+
+            # Fold the tile per outer coordinate, then combine once
+            @inbounds  for o in outer
+                # Start with first element to avoid neutral element issues
+                idx = mergeindices(is_inner_dim, tile_buf[1], o)
+                vtile = f(A[idx])
+                # Accumulate the rest
+                @inbounds for j in 2:tlen
+                    idx = mergeindices(is_inner_dim, tile_buf[j], o)
+                    vtile = op(vtile, f(A[idx]))
+                end
+                R[o] = op(R[o], vtile)
+            end
+
+            it === nothing && break
+        end
+        return R
+    end
+
+    # Non-commutative path: strict left-to-right recurrence (preserve order).
+    # Note: @simd on scalar recurrence doesn't vectorize, but can help scheduling.
     for i in Iterators.drop(inner, 1)
         @inbounds for o in outer
             iA = mergeindices(is_inner_dim, i, o)
-            v = op(R[o], f(A[iA]))
-            R[o] = v
+            R[o] = op(R[o], f(A[iA]))
         end
     end
-
     return R
 end
 
