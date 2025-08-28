@@ -1118,31 +1118,66 @@ function mapreduce_kernel_commutative(f::F, op::G, A, init, inds::AbstractArray)
     if isconcretetype(T) && isbitstype(T)
         # Use specialized implementation for small types
         if sizeof(T) <= 4 && n >= 32
-            return _mapreduce_kernel_commutative_small(f, op, A, init, inds)
+            return _mapreduce_kernel_16x(f, op, A, init, inds, (), ())
         end
     end
-    return _mapreduce_kernel_commutative(f, op, A, init, inds)
+    return _mapreduce_kernel_8x(f, op, A, init, inds, (), ())
 end
 
-# Specialized implementation for small types (<=32 bits) with 16x unrolling
-function _mapreduce_kernel_commutative_small(f, op, A, init, inds, leading=(), trailing=())
+function _mapreduce_kernel_8x(f, op, A, init, inds, leading, trailing)
     i1, iN = firstindex(inds), lastindex(inds)
     n = length(inds)
-    # Use 16x unrolling for better SIMD utilization with small types
+
+    # Initial unrolled values
+    @nexprs 8 N->a_N = @inbounds A[leading..., inds[i1+(N-1)], trailing...]
+    @nexprs 8 N->v_N = _mapreduce_start(f, op, A, init, a_N)
+
+    # Main unrolled loop
+    for batch in 1:(n>>3)-1
+        i = i1 + batch*8
+        @nexprs 8 N->a_N = @inbounds A[leading..., inds[i+(N-1)], trailing...]
+        @nexprs 8 N->fa_N = f(a_N)
+        @nexprs 8 N->v_N = op(v_N, fa_N)
+    end
+
+    # Tree reduction for 8 values
+    v = op(op(op(v_1, v_2), op(v_3, v_4)), op(op(v_5, v_6), op(v_7, v_8)))
+
+    # Handle remainder
+    i = i1 + (n>>3)*8 - 1
+    i == iN && return v
+    for i in i+1:iN
+        ai = @inbounds A[leading..., inds[i], trailing...]
+        v = op(v, f(ai))
+    end
+    return v
+end
+
+# 16x unrolled kernel implementation for small types
+function _mapreduce_kernel_16x(f, op, A, init, inds, leading, trailing)
+    i1, iN = firstindex(inds), lastindex(inds)
+    n = length(inds)
+
+    # Initial unrolled values
     @nexprs 16 N->a_N = @inbounds A[leading..., inds[i1+(N-1)], trailing...]
     @nexprs 16 N->v_N = _mapreduce_start(f, op, A, init, a_N)
+
+    # Main unrolled loop
     for batch in 1:(n>>4)-1
         i = i1 + batch*16
         @nexprs 16 N->a_N = @inbounds A[leading..., inds[i+(N-1)], trailing...]
         @nexprs 16 N->fa_N = f(a_N)
         @nexprs 16 N->v_N = op(v_N, fa_N)
     end
-    # Tree reduction for better parallelism
+
+    # Tree reduction for 16 values
     v8_1 = op(op(v_1, v_2), op(v_3, v_4))
     v8_2 = op(op(v_5, v_6), op(v_7, v_8))
     v8_3 = op(op(v_9, v_10), op(v_11, v_12))
     v8_4 = op(op(v_13, v_14), op(v_15, v_16))
     v = op(op(v8_1, v8_2), op(v8_3, v8_4))
+
+    # Handle remainder
     i = i1 + (n>>4)*16 - 1
     i == iN && return v
     for i in i+1:iN
@@ -1152,28 +1187,7 @@ function _mapreduce_kernel_commutative_small(f, op, A, init, inds, leading=(), t
     return v
 end
 
-# This special internal method must have at least 8 indices and allows passing
-# optional scalar leading and trailing dimensions
-function _mapreduce_kernel_commutative(f, op, A, init, inds, leading=(), trailing=())
-    i1, iN = firstindex(inds), lastindex(inds)
-    n = length(inds)
-    @nexprs 8 N->a_N = @inbounds A[leading..., inds[i1+(N-1)], trailing...]
-    @nexprs 8 N->v_N = _mapreduce_start(f, op, A, init, a_N)
-    for batch in 1:(n>>3)-1
-        i = i1 + batch*8
-        @nexprs 8 N->a_N = @inbounds A[leading..., inds[i+(N-1)], trailing...]
-        @nexprs 8 N->fa_N = f(a_N)
-        @nexprs 8 N->v_N = op(v_N, fa_N)
-    end
-    v = op(op(op(v_1, v_2), op(v_3, v_4)), op(op(v_5, v_6), op(v_7, v_8)))
-    i = i1 + (n>>3)*8 - 1
-    i == iN && return v
-    for i in i+1:iN
-        ai = @inbounds A[leading..., inds[i], trailing...]
-        v = op(v, f(ai))
-    end
-    return v
-end
+
 
 function mapreduce_kernel_commutative(f::F, op::G, A, init, inds::CartesianIndices{N}) where {N,F,G}
     N == 0 && return _mapreduce_start(f, op, A, init, A[inds[]])
@@ -1185,9 +1199,9 @@ function mapreduce_kernel_commutative(f::F, op::G, A, init, inds::CartesianIndic
         i = only(is)
         outer = CartesianIndices(tail(tail(inds.indices)))
         o1, s = iterate(outer)
-        v = _mapreduce_kernel_commutative(f, op, A, init, js, (i,), o1.I)
+        v = _mapreduce_kernel_8x(f, op, A, init, js, (i,), o1.I)
         for o in Iterators.rest(outer, s)
-            v = op(v, _mapreduce_kernel_commutative(f, op, A, init, js, (i,), o.I))
+            v = op(v, _mapreduce_kernel_8x(f, op, A, init, js, (i,), o.I))
         end
         return v
     elseif length(is) < 8 # TODO: tune this number
@@ -1196,9 +1210,9 @@ function mapreduce_kernel_commutative(f::F, op::G, A, init, inds::CartesianIndic
     else
         outer = CartesianIndices(tail(inds.indices))
         o1, s = iterate(outer)
-        v = _mapreduce_kernel_commutative(f, op, A, init, is, (), o1.I)
+        v = _mapreduce_kernel_8x(f, op, A, init, is, (), o1.I)
         for o in Iterators.rest(outer, s)
-            v = op(v, _mapreduce_kernel_commutative(f, op, A, init, is, (), o.I))
+            v = op(v, _mapreduce_kernel_8x(f, op, A, init, is, (), o.I))
         end
         return v
     end

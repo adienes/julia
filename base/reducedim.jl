@@ -29,30 +29,20 @@ end
 
 # --- Linear-index helpers (array-generic, no pointer math) --------------------
 # We use column-major linearization with offsets from axes' first indices.
-# This is valid for any AbstractArray's linear indexing order.
 
 @inline _axes_first(A) = ntuple(d->first(axes(A,d)), ndims(A))
 @inline _axes_len(A)   = ntuple(d->length(axes(A,d)), ndims(A))
 
-# Build linear strides s where s[1]=1, s[d]=s[d-1]*len[d-1]
-function _lin_strides_from_lengths(len::NTuple{N,Int}) where {N}
-    v = Vector{Int}(undef, N)
-    v[1] = 1
-    @inbounds for d in 2:N
-        v[d] = v[d-1] * len[d-1]
-    end
-    return Tuple(v)
+# Build linear strides s where s[1]=1, s[d]=s[d-1]*len[d-1] using compile-time recursion
+@inline _lin_strides_from_lengths(::Tuple{}) = ()
+@inline _lin_strides_from_lengths(len::Tuple{Int}) = (1,)
+@inline function _lin_strides_from_lengths(len::NTuple{N,Int}) where {N}
+    (1, _lin_strides_tail(first(len), tail(len))...)
 end
 
-# Compute linear index (1-based) from a full coordinate tuple in A
-@inline function _lin_index_from_tuple(idx::NTuple{N,Int},
-                                       firsts::NTuple{N,Int},
-                                       strides::NTuple{N,Int}) where {N}
-    acc = 1
-    @inbounds for d in 1:N
-        acc += (idx[d] - firsts[d]) * strides[d]
-    end
-    return acc
+@inline _lin_strides_tail(prev::Int, ::Tuple{}) = ()
+@inline function _lin_strides_tail(prev::Int, len::Tuple)
+    (prev, _lin_strides_tail(prev * first(len), Base.tail(len))...)
 end
 
 # Compute the *base* linear index for (outer=o, remainder=r) with the first k dims fixed
@@ -112,17 +102,10 @@ end
 @inline function _lane_comm_sweep(f, op, A, init, contig_inds, o::CartesianIndex{N},
                                  r::CartesianIndex{N}, reduce_mask::NTuple{N,Bool},
                                  ::Val{k}) where {N,k}
-    _mapreduce_kernel_commutative(f, op, A, init, contig_inds,
-                                 (), _trailing(o, r, reduce_mask, Val(k)))
+    _mapreduce_kernel_8x(f, op, A, init, contig_inds,
+                       (), _trailing(o, r, reduce_mask, Val(k)))
 end
 
-
-# Helper for computing contiguous length based on inner pack size
-@inline function _compute_contig_len(k::Int, contiguous_inner, is_contiguous_inner, outer)
-    k == 0 && return 0
-    k == 1 && return length(contiguous_inner)
-    return length(mergeindices(is_contiguous_inner, contiguous_inner, first(outer)))
-end
 
 # Initialize result array with first reduction slice
 @inline function _seed_result!(sink, R, f, op, A, init, is_inner_dim, contiguous_inner, outer)
@@ -133,7 +116,7 @@ end
     return R
 end
 
-# Process a tile of remainder indices for commutative operations (colmajor version with kernel sweep)
+# Process a tile of remainder indices for commutative operations
 @inline function _process_commutative_tile!(R, tile_buf, tlen, f, op, A, init, contig_inds,
                                            outer, is_inner_dim, k)
     for o in outer
@@ -278,31 +261,20 @@ mapreduce_allocate(s::_MRAllocSink, e, axs) =
 @inline @propagate_inbounds mapreduce_accum!(::_MRAllocSink, R, I, v) = (R[I] = v)
 mapreduce_finish(::_MRAllocSink, R) = R
 
-# _MRInPlaceSink already defined earlier for type dispatch
-
+# Simplified in-place sink implementation
 _MRInPlaceSink(A, op; update::Bool=false) =
     _MRInPlaceSink{typeof(A), typeof(op), Val(update)}(A, op)
 
 mapreduce_allocate(s::_MRInPlaceSink, e, axs) = s.A
 
-@inline @propagate_inbounds function mapreduce_set!(s::_MRInPlaceSink{<:Any,<:Any,Val{false}()}, R, I, v)
-    R[I] = v
-end
-@inline @propagate_inbounds function mapreduce_set!(s::_MRInPlaceSink{<:Any,<:Any,Val{true}()}, R, I, v)
-    R[I] = s.op(R[I], v)
+@inline @propagate_inbounds function mapreduce_set!(s::_MRInPlaceSink{<:Any,<:Any,Val{update}}, R, I, v) where {update}
+    R[I] = update ? s.op(R[I], v) : v
 end
 @inline @propagate_inbounds function mapreduce_accum!(s::_MRInPlaceSink, R, I, v)
     R[I] = s.op(R[I], v)
 end
 mapreduce_finish(::_MRInPlaceSink, R) = R
 
-# Helper functions for sink operations with proper inbounds propagation
-@inline @propagate_inbounds function _sink_set!(sink::_MRSink, R, I, v)
-    mapreduce_set!(sink, R, I, v)
-end
-@inline @propagate_inbounds function _sink_accum!(sink::_MRSink, R, I, v)
-    mapreduce_accum!(sink, R, I, v)
-end
 
 # When performing dimensional reductions over arrays with singleton dimensions, we have
 # a choice as to whether that singleton dimenion should be a part of the reduction or not;
@@ -426,7 +398,8 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
 
     # Decide early: if the remainder fan-out is large, one whole-inner sweep is faster.
     k = plan.inner_pack
-    contig_len = _compute_contig_len(k, contiguous_inner, is_contiguous_inner, outer)
+    contig_len = k == 0 ? 0 : (k == 1 ? length(contiguous_inner) :
+                              length(mergeindices(is_contiguous_inner, contiguous_inner, first(outer))))
     if enforce_pairwise && _use_pairwise_reduction(plan, contig_len, length(discontiguous_inner))
         return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
     end
@@ -692,12 +665,12 @@ function _mapreducedim_streaming(f::F, op::OP, A, init, dims, sink) where {F,OP}
     # General case: iterate in memory order
     if has_fast_linear_indexing(A) && has_fast_linear_indexing(R)
         output_shape = size(R)
-        
+
         # Always use the general approach that works for any dimensionality
         # Precompute strides for efficient indexing
         input_strides = _lin_strides_from_lengths(shape)
         output_strides = _lin_strides_from_lengths(output_shape)
-        
+
         # Find the largest contiguous block we can process at once
         # This is the product of the first k dimensions that are all reduced
         contiguous_block = 1
@@ -708,22 +681,22 @@ function _mapreducedim_streaming(f::F, op::OP, A, init, dims, sink) where {F,OP}
                 break
             end
         end
-        
+
         # Process the array in memory order
         if contiguous_block > 1
             # We can process contiguous blocks efficiently
             n_blocks = length(A) ÷ contiguous_block
-            
+
             # Iterate through all blocks
             @inbounds for block_idx in 0:(n_blocks-1)
                 # Compute the starting linear index for this block
                 base_idx = block_idx * contiguous_block + 1
-                
+
                 # Convert block index to coordinates in the non-reduced dimensions
                 remaining = block_idx
                 out_idx = 1
                 dim_idx = 1
-                
+
                 # Skip the contiguous reduced dimensions at the start
                 for d in 1:nd
                     if is_reduced[d]
@@ -732,7 +705,7 @@ function _mapreducedim_streaming(f::F, op::OP, A, init, dims, sink) where {F,OP}
                         break
                     end
                 end
-                
+
                 # Compute output index based on remaining dimensions
                 for d in dim_idx:nd
                     coord = (remaining % shape[d]) + 1
@@ -741,7 +714,7 @@ function _mapreducedim_streaming(f::F, op::OP, A, init, dims, sink) where {F,OP}
                         out_idx += (coord - 1) * output_strides[d]
                     end
                 end
-                
+
                 # Process the entire contiguous block and accumulate to single output position
                 for offset in 0:(contiguous_block-1)
                     val = f(A[base_idx + offset])
@@ -783,13 +756,13 @@ end
 function _should_use_streaming(is_inner_dim::NTuple{N,Bool}, shape::NTuple{N,Int}) where N
     # Use streaming when memory access pattern would be significantly better
     # than the standard algorithm's pattern
-    
+
     # The streaming kernel requires dimension 1 to be reduced for efficiency
     # because it processes contiguous blocks
     if !is_inner_dim[1]
         return false
     end
-    
+
     # Count contiguous reduced dimensions from the start
     contiguous_reduced = 0
     for d in 1:N
@@ -799,39 +772,39 @@ function _should_use_streaming(is_inner_dim::NTuple{N,Bool}, shape::NTuple{N,Int
             break
         end
     end
-    
+
     # If all reduced dimensions are contiguous, standard algorithm is already optimal
     total_reduced = sum(is_inner_dim)
     if contiguous_reduced == total_reduced
         return false
     end
-    
+
     # Calculate the memory access pattern characteristics
     # The key insight: streaming is better when we have scattered reductions
     # that would cause the standard algorithm to jump around in memory
-    
+
     # Size of contiguous chunks we can process at once
     contiguous_chunk_size = prod(shape[1:contiguous_reduced])
-    
+
     # Number of output elements
     output_size = prod(shape[d] for d in 1:N if !is_inner_dim[d])
-    
+
     # Number of separated reduction positions per output element
     # (how many times standard algorithm jumps for each output)
     total_reduced_size = prod(shape[d] for d in 1:N if is_inner_dim[d])
     jumps_per_output = total_reduced_size ÷ contiguous_chunk_size
-    
+
     # Streaming is beneficial when:
     # 1. Standard algorithm would make many jumps (jumps_per_output * output_size)
     # 2. Those jumps are larger than the contiguous chunks
     # 3. The ratio of sequential access (streaming) vs random access (standard) is favorable
-    
+
     # Compare memory access patterns:
     # Standard: output_size * jumps_per_output non-sequential accesses
     # Streaming: prod(shape) / contiguous_chunk_size sequential accesses
     standard_nonsequential_accesses = output_size * jumps_per_output
     streaming_sequential_accesses = prod(shape) ÷ contiguous_chunk_size
-    
+
     # Use streaming if it provides better memory access pattern
     # Sequential access is generally much faster than random access
     # Even with equal number of accesses, streaming wins due to cache locality
@@ -852,7 +825,7 @@ function _mapreducedim_stream_firstdim(f::F, op::OP, A, init, dims, sink) where 
         out_axes = ntuple(d -> d==1 ? axsA[1] : reduced_index(axsA[d]), nd)
         R = mapreduce_allocate(sink, v, out_axes)
         for I in CartesianIndices(axes(R))
-            @inbounds _sink_set!(sink, R, I, v)
+            @inbounds mapreduce_set!(sink, R, I, v)
         end
         return mapreduce_finish(sink, R)
     end
@@ -894,7 +867,7 @@ function _mapreducedim_stream_firstdim(f::F, op::OP, A, init, dims, sink) where 
             I = @inbounds LR[i]
             ai = @inbounds Acol[i]
             val = _mapreduce_start(f, op, A, init, ai)
-            @inbounds _sink_set!(sink, R, I, val)
+            @inbounds mapreduce_set!(sink, R, I, val)
         end
     end
 
@@ -922,7 +895,7 @@ function _mapreducedim_stream_firstdim(f::F, op::OP, A, init, dims, sink) where 
                 I = @inbounds LR[i]
                 ai = @inbounds Acol[i]
                 val = f(ai)
-                @inbounds _sink_accum!(sink, R, I, val)
+                @inbounds mapreduce_accum!(sink, R, I, val)
             end
         end
     end
