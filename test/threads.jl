@@ -585,3 +585,159 @@ let once = OncePerTask{Int}(() -> error("expected"))
     @test_throws ErrorException("expected") once()
     @test_throws ErrorException("expected") once()
 end
+
+# Test thread safety of callback hooks
+@testset "Thread-safe callback hooks" begin
+    # Test concurrent postoutput_hooks operations
+    @test begin
+        errors = Threads.Atomic{Int}(0)
+        n_tasks = min(100, Threads.nthreads() * 20)
+        barrier = Threads.Atomic{Int}(0)
+        
+        tasks = [Threads.@spawn begin
+            # Synchronize all tasks to start simultaneously
+            Threads.atomic_add!(barrier, 1)
+            while barrier[] < n_tasks
+                yield()
+            end
+            
+            # Race to add and execute callbacks
+            for op in 1:20
+                try
+                    if op % 2 == 0
+                        Base.postoutput(() -> nothing)
+                    else
+                        Base._postoutput()
+                    end
+                catch e
+                    if isa(e, BoundsError) || isa(e, UndefRefError)
+                        Threads.atomic_add!(errors, 1)
+                        break  # Stop on first error
+                    end
+                end
+            end
+        end for i in 1:n_tasks]
+        
+        # Wait for all tasks
+        foreach(wait, tasks)
+        
+        # Should have no corruption errors with proper locking
+        errors[] == 0
+    end
+    
+    # Test concurrent repl_hooks operations
+    @test begin
+        errors = Threads.Atomic{Int}(0)
+        n_tasks = min(100, Threads.nthreads() * 20)
+        barrier = Threads.Atomic{Int}(0)
+        
+        tasks = [Threads.@spawn begin
+            # Synchronize start
+            Threads.atomic_add!(barrier, 1)
+            while barrier[] < n_tasks
+                yield()
+            end
+            
+            # Race between adding and executing callbacks
+            for op in 1:20
+                try
+                    if op % 2 == 0
+                        Base.atreplinit(x -> nothing)
+                    else
+                        Base.__atreplinit(nothing)
+                    end
+                catch e
+                    if isa(e, BoundsError) || isa(e, UndefRefError)
+                        Threads.atomic_add!(errors, 1)
+                        break
+                    end
+                end
+            end
+        end for i in 1:n_tasks]
+        
+        foreach(wait, tasks)
+        
+        # Should have no corruption errors with proper locking
+        errors[] == 0
+    end
+    
+    # Test mixed concurrent operations
+    @test begin
+        errors = Threads.Atomic{Int}(0)
+        n_tasks = min(100, Threads.nthreads() * 20)
+        barrier = Threads.Atomic{Int}(0)
+        
+        tasks = [Threads.@spawn begin
+            # Synchronize all tasks
+            Threads.atomic_add!(barrier, 1)
+            while barrier[] < n_tasks
+                yield()
+            end
+            
+            # Mix different callback operations
+            for op in 1:30
+                try
+                    if op % 4 == 0
+                        Base.postoutput(() -> nothing)
+                    elseif op % 4 == 1
+                        Base._postoutput()
+                    elseif op % 4 == 2
+                        Base.atreplinit(x -> nothing)
+                    else
+                        Base.__atreplinit(nothing)
+                    end
+                catch e
+                    if isa(e, BoundsError) || isa(e, UndefRefError)
+                        Threads.atomic_add!(errors, 1)
+                        break
+                    end
+                end
+            end
+        end for i in 1:n_tasks]
+        
+        foreach(wait, tasks)
+        
+        # Should have no corruption errors with proper locking
+        errors[] == 0
+    end
+    
+    # Test aggressive concurrent modifications
+    @test begin
+        errors = Threads.Atomic{Int}(0)
+        
+        # Use many tasks to increase chance of race
+        n_tasks = min(100, Threads.nthreads() * 20)
+        barrier = Threads.Atomic{Int}(0)
+        
+        tasks = [Threads.@spawn begin
+            # Synchronize all tasks to start simultaneously
+            Threads.atomic_add!(barrier, 1)
+            while barrier[] < n_tasks
+                yield()
+            end
+            
+            # Now all tasks race - rapid operations without yielding
+            for op in 1:20
+                try
+                    if op % 2 == 0
+                        Base.postoutput(() -> nothing)
+                    else
+                        Base._postoutput()
+                    end
+                catch e
+                    if isa(e, BoundsError) || isa(e, UndefRefError)
+                        Threads.atomic_add!(errors, 1)
+                        break  # Stop on first error
+                    end
+                end
+            end
+        end for i in 1:n_tasks]
+        
+        # Wait for all tasks
+        foreach(wait, tasks)
+        
+        # Should have no corruption errors with proper locking
+        # On nightly without fixes, this often produces errors
+        errors[] == 0
+    end
+end

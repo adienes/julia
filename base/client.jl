@@ -373,6 +373,7 @@ function load_julia_startup()
 end
 
 const repl_hooks = []
+const _repl_hooks_lock = ReentrantLock()
 
 """
     atreplinit(f)
@@ -382,10 +383,11 @@ interactive sessions; this is useful to customize the interface. The argument of
 REPL object. This function should be called from within the `.julia/config/startup.jl`
 initialization file.
 """
-atreplinit(f::Function) = (pushfirst!(repl_hooks, f); nothing)
+atreplinit(f::Function) = @lock _repl_hooks_lock (pushfirst!(repl_hooks, f); nothing)
 
 function __atreplinit(repl)
-    for f in repl_hooks
+    hooks = @lock _repl_hooks_lock copy(repl_hooks)
+    for f in hooks
         try
             f(repl)
         catch err
@@ -557,7 +559,7 @@ function _start()
     empty!(ARGS)
     append!(ARGS, Core.ARGS)
     # clear any postoutput hooks that were saved in the sysimage
-    empty!(Base.postoutput_hooks)
+    @lock Base._postoutput_hooks_lock empty!(Base.postoutput_hooks)
     local ret = 0
     try
         repl_was_requested = exec_options(JLOptions())

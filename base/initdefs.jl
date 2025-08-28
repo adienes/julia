@@ -199,6 +199,7 @@ const ACTIVE_PROJECT = Ref{Union{String,Nothing}}(nothing) # Modify this only vi
 # Each should be a thunk, i.e., `f()`. To determine the current active project,
 # the thunk can query `Base.active_project()`.
 const active_project_callbacks = []
+const _active_project_callbacks_lock = ReentrantLock()
 
 function current_project(dir::AbstractString)
     # look for project file in current dir and parents
@@ -362,7 +363,8 @@ Set the active `Project.toml` file to `projfile`. See also [`Base.active_project
 """
 function set_active_project(projfile::Union{AbstractString,Nothing})
     ACTIVE_PROJECT[] = projfile
-    for f in active_project_callbacks
+    callbacks = @lock _active_project_callbacks_lock copy(active_project_callbacks)
+    for f in callbacks
         try
             Base.invokelatest(f)
         catch
@@ -475,12 +477,17 @@ end
 ## like atexit but runs after any requested output.
 ## any hooks saved in the sysimage are cleared in Base._start
 const postoutput_hooks = Callable[]
+const _postoutput_hooks_lock = ReentrantLock()
 
-postoutput(f::Function) = (pushfirst!(postoutput_hooks, f); nothing)
+postoutput(f::Function) = @lock _postoutput_hooks_lock (pushfirst!(postoutput_hooks, f); nothing)
 
 function _postoutput()
-    while !isempty(postoutput_hooks)
-        f = popfirst!(postoutput_hooks)
+    while true
+        local f
+        @lock _postoutput_hooks_lock begin
+            isempty(postoutput_hooks) && return
+            f = popfirst!(postoutput_hooks)
+        end
         try
             f()
         catch ex
