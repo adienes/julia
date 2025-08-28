@@ -452,7 +452,9 @@ function mapreducedim_naive(f::F, op::OP, A, init, is_inner_dim, inner, outer, s
         i0 = first(LinearIndices(A))
         linear_range = i0:(i0+lsiz-1)
         for (idx, i) in enumerate(outer)
-            v = mapreduce_pairwise(f, op, A, init, linear_range .+ (lsiz*(idx-1)))
+            off = lsiz*(idx-1)
+            v = mapreduce_pairwise(f, op, A, init, 
+                                 (first(linear_range)+off):(last(linear_range)+off))
             mapreduce_set!(sink, R, i, v)
         end
     else
@@ -964,10 +966,10 @@ function _should_use_streaming(is_inner_dim::NTuple{N,Bool}, shape::NTuple{N,Int
     streaming_sequential_accesses = prod(shape) ÷ contiguous_chunk_size
 
     # Use streaming if it provides better memory access pattern
-    # Sequential access is generally much faster than random access
-    # Even with equal number of accesses, streaming wins due to cache locality
-    # Only require streaming to be no worse than standard
-    return streaming_sequential_accesses <= standard_nonsequential_accesses
+    # Bias towards non-streaming. Cheap ops (like identity/+)
+    # need a *big* advantage to offset index math overhead.
+    bias = 8  # tuned constant: 4–16 is reasonable
+    return streaming_sequential_accesses * bias < standard_nonsequential_accesses
 end
 
 # Streaming kernel for "keep dim 1" reductions using sink API
@@ -1030,10 +1032,10 @@ function _mapreducedim_stream_firstdim(f::F, op::OP, A::AbstractArray{T,N}, init
 
     # ---- Accumulate the rest of the columns -----------------------------------
     if N == ndims(R)
-        fixedR = ntuple(d -> d==1 ? Colon() : first(out_axes_R[d]), nd)
+        fixedR = ntuple(d -> d==1 ? Colon() : first(out_axes_R[d]), Val(N))
         Rrow = @view R[fixedR...]
         for c in Iterators.drop(cols, 1)
-            colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c[d] : first(axsA[d])), nd)
+            colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c[d] : first(axsA[d])), Val(N))
             Acol = @view A[colAidx...]
             for i in eachindex(Rrow, Acol)
                 # Only array accesses are @inbounds, not user functions
@@ -1046,7 +1048,7 @@ function _mapreducedim_stream_firstdim(f::F, op::OP, A::AbstractArray{T,N}, init
     else
         LR = LinearIndices(R)
         for c in Iterators.drop(cols, 1)
-            colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c[d] : first(axsA[d])), nd)
+            colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c[d] : first(axsA[d])), Val(N))
             Acol = @view A[colAidx...]
             for i in eachindex(Acol)
                 I = @inbounds LR[i]
