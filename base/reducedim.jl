@@ -543,7 +543,6 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
         block_len = prod(lens[1:k])
         # Use r = first(discontiguous_inner) and compute base linear once per o
         it0 = iterate(discontiguous_inner)
-        @assert it0 !== nothing
         r0, st0 = it0
 
         # Pre-compute r0 contribution for dimensions > k (hoisted)
@@ -737,7 +736,6 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
 
     # Initialize with the very first inner index so that R[o] is always a real value
     it0 = iterate(inner)
-    @assert it0 !== nothing
     i1, st = it0
     v0 = _mapreduce_start(f, op, A, init)
     R = mapreduce_allocate(sink, v0, axes(outer))
@@ -1090,8 +1088,6 @@ end
 # Streaming kernel for "keep dim 1" reductions using sink API
 # Works correctly with OffsetArrays and custom axes
 function _mapreducedim_stream_firstdim(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink) where {F,OP,T,N}
-    @assert !(1 in dims) && N > 1
-
     axsA = ntuple(d->axes(A,d), Val(N))
 
     if isempty(A)
