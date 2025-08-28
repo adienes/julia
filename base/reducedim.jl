@@ -342,10 +342,18 @@ _MRInPlaceSink(A, op; update::Bool=false) =
 mapreduce_allocate(s::_MRInPlaceSink, e, axs) = s.A
 
 @inline @propagate_inbounds function mapreduce_set!(s::_MRInPlaceSink{<:Any,<:Any,Val{update}}, R, I, v) where {update}
-    R[I] = update ? s.op(R[I], v) : v
+    if update
+        r_val = R[I]
+        result = s.op(r_val, v)
+        R[I] = result
+    else
+        R[I] = v
+    end
 end
 @inline @propagate_inbounds function mapreduce_accum!(s::_MRInPlaceSink, R, I, v)
-    R[I] = s.op(R[I], v)
+    r_val = R[I]
+    result = s.op(r_val, v)
+    R[I] = result
 end
 mapreduce_finish(::_MRInPlaceSink, R) = R
 
@@ -611,7 +619,8 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
 
                 if vtile !== nothing
                     r_val = @inbounds R[o]
-                    @inbounds R[o] = op(r_val, vtile)
+                    result = op(r_val, vtile)
+                    @inbounds R[o] = result
                 end
             end
 
@@ -647,7 +656,8 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
 
                 if vtile !== nothing
                     r_val = @inbounds R[o]
-                    @inbounds R[o] = op(r_val, vtile)
+                    result = op(r_val, vtile)
+                    @inbounds R[o] = result
                 end
             end
 
@@ -688,7 +698,8 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                 end
                 val = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
                 r_val = @inbounds R[o]
-                @inbounds R[o] = op(r_val, val)
+                result = op(r_val, val)
+                @inbounds R[o] = result
             end
             it = iterate(discontiguous_inner, st)
         end
@@ -699,7 +710,8 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                 i = mergeindices(is_inner_dim, dci, o)
                 val = mapreduce_pairwise(f, op, A, init, mergeindices(is_contiguous_inner, contiguous_inner, i))
                 r_val = @inbounds R[o]
-                @inbounds R[o] = op(r_val, val)
+                result = op(r_val, val)
+                @inbounds R[o] = result
             end
         end
     end
@@ -800,7 +812,8 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                                 acc += (i.I[d] - firsts[d]) * strides[d]
                             end
                         end
-                        v = f(A[acc])
+                        a_val = @inbounds A[acc]
+                        v = f(a_val)
                         vtile = vtile === nothing ? v : op(vtile, v)
                         chunk_count += 1
                         local_it = iterate(inner, st)
@@ -808,7 +821,8 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
 
                     if vtile !== nothing
                         r_val = @inbounds R[o]
-                        @inbounds R[o] = op(r_val, vtile)
+                        result = op(r_val, vtile)
+                        @inbounds R[o] = result
                     end
                 end
 
@@ -839,7 +853,8 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
 
                     if vtile !== nothing
                         r_val = @inbounds R[o]
-                        @inbounds R[o] = op(r_val, vtile)
+                        result = op(r_val, vtile)
+                        @inbounds R[o] = result
                     end
                 end
 
@@ -878,7 +893,8 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                 acc = outer_acc + inner_acc - 1  # -1 because both start at 1
                 a_val = @inbounds A[acc]
                 r_val = @inbounds R[o]
-                @inbounds R[o] = op(r_val, f(a_val))
+                result = op(r_val, f(a_val))
+                @inbounds R[o] = result
             end
         end
     else
@@ -888,7 +904,8 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                 a_val = @inbounds A[iA]
                 val = f(a_val)
                 r_val = @inbounds R[o]
-                @inbounds R[o] = op(r_val, val)
+                result = op(r_val, val)
+                @inbounds R[o] = result
             end
         end
     end
@@ -1882,7 +1899,8 @@ function findminmax!(f, op, Rval, Rind, A::AbstractArray{T,N}) where {T,N}
             @inbounds tmpRi = Rind[i1,IR]
             for i in axes(A,1)
                 k, kss = y::Tuple
-                tmpAv = f(@inbounds(A[i,IA]))
+                tmpAv_raw = @inbounds A[i,IA]
+                tmpAv = f(tmpAv_raw)
                 if tmpRi == zi || op(tmpRv, tmpAv)
                     tmpRv = tmpAv
                     tmpRi = k
@@ -1897,7 +1915,8 @@ function findminmax!(f, op, Rval, Rind, A::AbstractArray{T,N}) where {T,N}
             IR = Broadcast.newindex(IA, keep, Idefault)
             for i in axes(A, 1)
                 k, kss = y::Tuple
-                tmpAv = f(@inbounds(A[i,IA]))
+                tmpAv_raw = @inbounds A[i,IA]
+                tmpAv = f(tmpAv_raw)
                 @inbounds tmpRv = Rval[i,IR]
                 @inbounds tmpRi = Rind[i,IR]
                 if tmpRi == zi || op(tmpRv, tmpAv)
