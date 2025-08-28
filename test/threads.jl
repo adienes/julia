@@ -766,7 +766,7 @@ else
             end
             
             # Execute remaining callbacks to finalize count (bounded)
-            max_runs = 5 * (length(Base.postoutput_hooks) + 1)
+            local max_runs = 5 * (length(Base.postoutput_hooks) + 1)
             for _ in 1:max_runs
                 isempty(Base.postoutput_hooks) && break
                 Base._postoutput()
