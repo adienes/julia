@@ -513,33 +513,6 @@ function mapreducedim_colmajor_optimized(f::F, op::OP, A::AbstractArray{T,N}, in
     return mapreducedim_colmajor(f, op, A, init, is_inner_dim, inner, outer, sink, plan, true)
 end
 
-# Mutable iteration state for high-dimensional arrays  
-# Using a Vector for truly mutable state
-mutable struct MutableCartesianIndex{N}
-    I::Vector{Int}
-    MutableCartesianIndex{N}() where N = new(Vector{Int}(undef, N))
-    MutableCartesianIndex{N}(t::NTuple{N,Int}) where N = new(collect(t))
-end
-
-@inline Base.getindex(m::MutableCartesianIndex, i::Int) = m.I[i]
-
-# Increment mutable index in-place, returns true if done
-@inline function increment!(idx::MutableCartesianIndex{N}, shape::NTuple{N,Int}, mask::NTuple{N,Bool}) where N
-    carry = true
-    @inbounds for d in 1:N
-        if mask[d] && carry
-            val = idx.I[d] + 1
-            if val <= shape[d]
-                idx.I[d] = val
-                carry = false
-            else
-                idx.I[d] = 1
-            end
-        end
-    end
-    return carry  # true means we're done
-end
-
 # Optimized colmajor reduction using mutable iteration state with block processing
 function _mapreducedim_colmajor_mutable(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink,
                                        plan::ReductionPlan{N}, enforce_pairwise=true) where {F,OP,N}
