@@ -706,7 +706,7 @@ function mapreduce_kernel(f::F, op::G, itr, init, S::Union{HasLength, HasShape},
     v = _mapreduce_start(f, op, itr, init, a1)
     for _ in 2:n
         it = iterate(itr, s)
-        it === nothing && return v, s # This will only happen if an iterator lied about its length
+        # it === nothing && return v, s # This will only happen if an iterator lied about its length
         a, s = it
         v = op(v, f(a))
     end

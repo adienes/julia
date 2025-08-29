@@ -513,55 +513,8 @@ function mapreducedim_colmajor_optimized(f::F, op::OP, A::AbstractArray{T,N}, in
     return mapreducedim_colmajor(f, op, A, init, is_inner_dim, inner, outer, sink, plan, true)
 end
 
-# Optimized colmajor reduction using mutable iteration state with block processing
-function _mapreducedim_colmajor_mutable(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink,
-                                       plan::ReductionPlan{N}, enforce_pairwise=true) where {F,OP,N}
-    # For now, just delegate to original implementation
-    # The mutable iteration approach needs more careful design to handle all edge cases
-    return mapreducedim_colmajor_original(f, op, A, init, is_inner_dim, inner, outer, sink, plan, enforce_pairwise)
-end
-
-# Rename original function for fallback
-function mapreducedim_colmajor_original(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink,
-                                       plan::ReductionPlan{N}, enforce_pairwise=true) where {F,OP,N}
-    # Original implementation continues below...
-    # Split the inner (reduced) block into its contiguous prefix and the discontiguous "remainder"
-    is_contiguous_inner = keep_first_trues(is_inner_dim)
-    contiguous_inner    = mergeindices(is_contiguous_inner, inner, first(inner))
-    discontiguous_inner = mergeindices(is_contiguous_inner, first(inner), inner)
-    
-    # Continue with rest of original implementation...
-    firsts  = _axes_first(A)
-    lens    = _axes_len(A)
-    strides = _lin_strides_from_lengths(lens)
-    
-    k = plan.inner_pack
-    contig_len = k == 0 ? 0 : (k == 1 ? length(contiguous_inner) :
-                              length(mergeindices(is_contiguous_inner, contiguous_inner, first(outer))))
-    if enforce_pairwise && _use_pairwise_reduction(plan, contig_len, length(discontiguous_inner))
-        return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
-    end
-    
-    v0 = _mapreduce_start(f, op, A, init)
-    R = mapreduce_allocate(sink, v0, axes(outer))
-    
-    # Continue with original implementation from here
-    # The rest is the same as the full function below
-    # (Duplicated to avoid refactoring the entire existing function)
-end
-
 function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink,
-                               plan::ReductionPlan{N}, enforce_pairwise=true) where {F,OP,N}
-    # For now, always use original implementation
-    # The high-dimensional optimization needs more work
-    return mapreducedim_colmajor_original(f, op, A, init, is_inner_dim, inner, outer, sink, plan, enforce_pairwise)
-end
-
-# Now move the original implementation into mapreducedim_colmajor_original
-function mapreducedim_colmajor_original(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink,
                                        plan::ReductionPlan{N}, enforce_pairwise=true) where {F,OP,N}
-    
-    # Original implementation for lower dimensions
     # Split the inner (reduced) block into its contiguous prefix and the discontiguous "remainder"
     is_contiguous_inner = keep_first_trues(is_inner_dim)
     contiguous_inner    = mergeindices(is_contiguous_inner, inner, first(inner))  # varying only over the contiguous prefix
