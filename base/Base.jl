@@ -53,9 +53,6 @@ sizeof(s::String) = Core.sizeof(s)  # needed by gensym as called from simdloop
 include("simdloop.jl")
 using .SimdLoop
 
-# map-reduce operators
-include("reduce.jl")
-
 ## core structures
 include("reshapedarray.jl")
 include("reinterpretarray.jl")
@@ -115,6 +112,9 @@ using .StackTraces
 include("show.jl")
 include("arrayshow.jl")
 include("methodshow.jl")
+
+# map-reduce operators
+include("reduce.jl")
 
 # multidimensional arrays
 include("multidimensional.jl")

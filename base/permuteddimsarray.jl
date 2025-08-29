@@ -344,11 +344,11 @@ end
 end
 
 using Base: CommutativeOps
-function Base.mapreducedim(f, op::CommutativeOps, A::PermutedDimsArray, init, dims::Colon)
-    Base.mapreducedim(f, op, parent(A), init, dims)
+function Base.mapreducedim(f, op::CommutativeOps, A::PermutedDimsArray, init, dims::Colon, sink=Base._MRAllocSink(A))
+    Base.mapreducedim(f, op, parent(A), init, dims, sink)
 end
-function Base.mapreducedim(f::typeof(identity), op::Union{typeof(Base.mul_prod),typeof(*)}, A::PermutedDimsArray{<:Union{Real,Complex}}, init, dims::Colon)
-    Base.mapreducedim(f, op, parent(A), init, dims)
+function Base.mapreducedim(f::typeof(identity), op::Union{typeof(Base.mul_prod),typeof(*)}, A::PermutedDimsArray{<:Union{Real,Complex}}, init, dims::Colon, sink=Base._MRAllocSink(A))
+    Base.mapreducedim(f, op, parent(A), init, dims, sink)
 end
 
 function Base.mapreduce!(f, op::CommutativeOps, B::AbstractArray{T,N}, A::PermutedDimsArray{S,N,perm,iperm}; init=Base._InitialValue()) where {T,S,N,perm,iperm}
