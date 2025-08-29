@@ -392,22 +392,14 @@ function mapreducedim(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink=_MRA
     # Use optimized counter-based implementation for fast-linear arrays
     if has_fast_linear_indexing(A) && !isa(sink, _MRInPlaceSink)
         is_inner_dim = compute_inner_dims(ntuple(d->d in dims, Val(N)), size(A))
-
-        # Choose the appropriate optimized kernel
-        if is_inner_dim == keep_first_trues(is_inner_dim) || _mapreduce_might_widen(f, op, A, init, sink)
-            # Fully contiguous case - use naive
-            outer = CartesianIndices(reduced_indices(A, dims))
-            inner = CartesianIndices(select_outer_dimensions(A, is_inner_dim))
-            return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
-        elseif is_inner_dim[1]
-            # Use optimized colmajor with counters
-            return mapreducedim_colmajor_optimized(f, op, A, init, is_inner_dim, dims, sink)
-        else
-            # Row major case - also needs optimization but for now use original
-            outer = CartesianIndices(reduced_indices(A, dims))
-            inner = CartesianIndices(select_outer_dimensions(A, is_inner_dim))
-            return mapreducedim_rowmajor(f, op, A, init, is_inner_dim, inner, outer, sink)
-        end
+        outer = CartesianIndices(reduced_indices(A, dims))
+        inner = CartesianIndices(select_outer_dimensions(A, is_inner_dim))
+        
+        # FIXME: There's a compilation hang when using tiling with non-contiguous
+        # reduced dimensions (e.g., dims=(1,3) on 5D arrays). The issue appears
+        # to be in the complex type inference of the tiling iterators.
+        # For now, always use the naive algorithm which is correct but slower.
+        return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
     end
 
     if sink isa _MRInPlaceSink
@@ -506,7 +498,7 @@ mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink, e
 function mapreducedim_colmajor_optimized(f::F, op::OP, A::AbstractArray{T,N}, init,
                                         is_inner_dim::NTuple{N,Bool}, dims,
                                         sink) where {F,OP,T,N}
-    
+
     inner = CartesianIndices(select_outer_dimensions(A, is_inner_dim))
     outer = CartesianIndices(reduced_indices(A, dims))
     plan = _mkplan(f, op, A, is_inner_dim)
@@ -537,6 +529,10 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
     v0 = _mapreduce_start(f, op, A, init)
     R = mapreduce_allocate(sink, v0, axes(outer))
 
+    # Initialize the flag for tracking which iterator we're using
+    local used_dropped::Bool
+    local dropped_iter
+    
     if _fast_linear(A) && k > 0
         # Linear block for the contiguous inner pack
         block_len = prod(lens[1:k])
@@ -567,13 +563,17 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
         rem_iter = iterate(discontiguous_inner, st0)
         rem_total = length(discontiguous_inner)
         rem_total <= 1 && return mapreduce_finish(sink, R)
+        used_dropped = false
     else
         # Fallback: original index-based seeding
         _seed_result!(sink, R, f, op, A, init, is_inner_dim, contiguous_inner, outer)
-        rem_iter = iterate(Iterators.drop(discontiguous_inner, 1))
+        # Create the dropped iterator that we'll use for tiling
+        dropped_iter = Iterators.drop(discontiguous_inner, 1)
+        rem_iter = iterate(dropped_iter)
         # No remainder → done
         rem_total = length(discontiguous_inner)
         rem_total <= 1 && return mapreduce_finish(sink, R)
+        used_dropped = true
     end
 
     # If op is commutative we can process remainder "lanes" in small tiles, which greatly
@@ -581,17 +581,38 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
     if is_commutative_op(op) && _fast_linear(A) && k > 0
         # Optimized path: process remainder without allocating buffers
         block_len = prod(lens[1:k])
-        it = rem_iter
+        
+        # Determine which iterator to use based on the path taken above
+        if used_dropped
+            # We're using the dropped iterator from the fallback path
+            work_iter = dropped_iter
+            it = rem_iter
+        else
+            # We're continuing from st0 in the fast path
+            work_iter = discontiguous_inner
+            it = rem_iter
+        end
+        
+        # Pre-allocate buffer for tile indices (reused across iterations)
+        tile_buffer = Vector{CartesianIndex{N}}(undef, plan.tile_B)
 
         # Process in chunks without materializing indices
         while it !== nothing
-            # Process up to tile_B elements at once
+            # Collect up to tile_B remainder indices to process
+            chunk_count = 0
+            local_it = it
+            
+            while local_it !== nothing && chunk_count < plan.tile_B
+                dci, st = local_it
+                chunk_count += 1
+                @inbounds tile_buffer[chunk_count] = dci
+                local_it = iterate(work_iter, st)
+            end
+            
+            # Process this tile for all outer indices
             for o in outer
                 vtile = nothing
-                chunk_count = 0
-                local_it = it
-
-                # Process a tile of remainder indices
+                
                 # Pre-compute outer contribution for this o (hoisted)
                 outer_base = 1
                 @inbounds for d in (k+1):N
@@ -599,9 +620,10 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                         outer_base += (o.I[d] - firsts[d]) * strides[d]
                     end
                 end
-
-                while local_it !== nothing && chunk_count < plan.tile_B
-                    dci, st = local_it
+                
+                # Process all indices in this tile
+                for i in 1:chunk_count
+                    dci = @inbounds tile_buffer[i]
                     # Combine with inner contribution
                     base = outer_base
                     @inbounds for d in (k+1):N
@@ -611,8 +633,6 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                     end
                     v = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
                     vtile = vtile === nothing ? v : op(vtile, v)
-                    chunk_count += 1
-                    local_it = iterate(discontiguous_inner, st)
                 end
 
                 if vtile !== nothing
@@ -622,34 +642,47 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                 end
             end
 
-            # Advance iterator by the chunk we just processed
-            for _ in 1:min(plan.tile_B, length(discontiguous_inner))
-                it === nothing && break
-                _, st = it
-                it = iterate(discontiguous_inner, st)
-            end
+            # Continue from where we left off
+            it = local_it
         end
         return mapreduce_finish(sink, R)
     elseif is_commutative_op(op)
         # Fallback for non-fast-linear arrays
         B = plan.tile_B
         contig_inds = (k <= 1 ? axes(A,1) : CartesianIndices(ntuple(d->axes(A,d), k)))
+        
+        # Determine which iterator to use
+        if used_dropped
+            work_iter = dropped_iter
+        else
+            work_iter = discontiguous_inner
+        end
+        
+        # Pre-allocate buffer for tile indices
+        tile_buffer = Vector{CartesianIndex{N}}(undef, B)
 
         it = rem_iter
         while it !== nothing
-            # Process directly without buffering
+            # Collect up to B iterations
+            chunk_count = 0
+            local_it = it
+            
+            while local_it !== nothing && chunk_count < B
+                dci, st = local_it
+                chunk_count += 1
+                @inbounds tile_buffer[chunk_count] = dci
+                local_it = iterate(work_iter, st)
+            end
+            
+            # Process this chunk for all outer indices
             for o in outer
                 vtile = nothing
-                chunk_count = 0
-                local_it = it
 
-                while local_it !== nothing && chunk_count < B
-                    dci, st = local_it
+                for i in 1:chunk_count
+                    dci = @inbounds tile_buffer[i]
                     v = _lane_comm_sweep(f, op, A, init, contig_inds, o, dci,
                                        is_inner_dim, Val(k))
                     vtile = vtile === nothing ? v : op(vtile, v)
-                    chunk_count += 1
-                    local_it = iterate(discontiguous_inner, st)
                 end
 
                 if vtile !== nothing
@@ -659,12 +692,8 @@ function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                 end
             end
 
-            # Advance iterator
-            for _ in 1:min(B, length(discontiguous_inner))
-                it === nothing && break
-                _, st = it
-                it = iterate(discontiguous_inner, st)
-            end
+            # Advance to next chunk
+            it = local_it
         end
         return mapreduce_finish(sink, R)
     end
@@ -786,12 +815,25 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
         if _fast_linear(A)
             # Optimized path: process directly without buffering
             firsts = _row_firsts; strides = _row_strides
+            
+            # Pre-allocate buffer for tile indices
+            tile_buffer = Vector{CartesianIndex{N}}(undef, B)
 
             while it !== nothing
+                # Collect up to B iterations
+                chunk_count = 0
+                local_it = it
+                
+                while local_it !== nothing && chunk_count < B
+                    i, st = local_it
+                    chunk_count += 1
+                    @inbounds tile_buffer[chunk_count] = i
+                    local_it = iterate(inner, st)
+                end
+                
+                # Process this chunk for all outer indices
                 for o in outer
                     vtile = nothing
-                    chunk_count = 0
-                    local_it = it
 
                     # Compute outer contribution once per o (no allocation)
                     outer_acc = 1
@@ -801,8 +843,8 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                         end
                     end
 
-                    while local_it !== nothing && chunk_count < B
-                        i, st = local_it
+                    for idx in 1:chunk_count
+                        i = @inbounds tile_buffer[idx]
                         acc = outer_acc
                         @inbounds for d in 1:N
                             if is_inner_dim[d]
@@ -812,8 +854,6 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                         a_val = @inbounds A[acc]
                         v = f(a_val)
                         vtile = vtile === nothing ? v : op(vtile, v)
-                        chunk_count += 1
-                        local_it = iterate(inner, st)
                     end
 
                     if vtile !== nothing
@@ -823,29 +863,36 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                     end
                 end
 
-                # Advance iterator
-                for _ in 1:min(B, length(inner))
-                    it === nothing && break
-                    _, st = it
-                    it = iterate(inner, st)
-                end
+                # Advance to next chunk
+                it = local_it
             end
         else
             # Fallback for non-fast-linear arrays
+            # Pre-allocate buffer for tile indices
+            tile_buffer = Vector{CartesianIndex{N}}(undef, B)
+            
             while it !== nothing
+                # Collect up to B iterations
+                chunk_count = 0
+                local_it = it
+                
+                while local_it !== nothing && chunk_count < B
+                    i, st = local_it
+                    chunk_count += 1
+                    @inbounds tile_buffer[chunk_count] = i
+                    local_it = iterate(inner, st)
+                end
+                
+                # Process this chunk for all outer indices
                 for o in outer
                     vtile = nothing
-                    chunk_count = 0
-                    local_it = it
 
-                    while local_it !== nothing && chunk_count < B
-                        i, st = local_it
+                    for idx in 1:chunk_count
+                        i = @inbounds tile_buffer[idx]
                         idx = mergeindices(is_inner_dim, i, o)
                         a_val = @inbounds A[idx]
                         v = f(a_val)
                         vtile = vtile === nothing ? v : op(vtile, v)
-                        chunk_count += 1
-                        local_it = iterate(inner, st)
                     end
 
                     if vtile !== nothing
@@ -855,12 +902,8 @@ function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer
                     end
                 end
 
-                # Advance iterator
-                for _ in 1:min(B, length(inner))
-                    it === nothing && break
-                    _, st = it
-                    it = iterate(inner, st)
-                end
+                # Advance to next chunk
+                it = local_it
             end
         end
         return mapreduce_finish(sink, R)
