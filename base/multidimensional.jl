@@ -1157,11 +1157,11 @@ end
 function _mapreduce_kernel_16x(f, op, A, init, inds, leading, trailing)
     i1, iN = firstindex(inds), lastindex(inds)
     n = length(inds)
-    
+
     # Check if we can use virtual padding for small arrays
     T = eltype(A)
     use_padding = Base.has_identity(op, T) && n < 16
-    
+
     if use_padding
         # Use virtual padding - initialize extra lanes with identity
         identity_val = Base.identity_element(op, T)
@@ -1177,7 +1177,7 @@ function _mapreduce_kernel_16x(f, op, A, init, inds, leading, trailing)
         # Standard initialization
         @nexprs 16 N->a_N = @inbounds A[leading..., inds[i1+(N-1)], trailing...]
         @nexprs 16 N->v_N = _mapreduce_start(f, op, A, init, a_N)
-        
+
         # Main unrolled loop
         for batch in 1:(n>>4)-1
             i = i1 + batch*16
@@ -1186,14 +1186,14 @@ function _mapreduce_kernel_16x(f, op, A, init, inds, leading, trailing)
             @nexprs 16 N->v_N = op(v_N, fa_N)
         end
     end
-    
+
     # Tree reduction for 16 values (works with padding since identity is neutral)
     v8_1 = op(op(v_1, v_2), op(v_3, v_4))
     v8_2 = op(op(v_5, v_6), op(v_7, v_8))
     v8_3 = op(op(v_9, v_10), op(v_11, v_12))
     v8_4 = op(op(v_13, v_14), op(v_15, v_16))
     v = op(op(v8_1, v8_2), op(v8_3, v8_4))
-    
+
     if !use_padding
         # Handle remainder only if not using padding
         i = i1 + (n>>4)*16 - 1
@@ -1203,7 +1203,7 @@ function _mapreduce_kernel_16x(f, op, A, init, inds, leading, trailing)
             v = op(v, f(ai))
         end
     end
-    
+
     return v
 end
 

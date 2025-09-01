@@ -55,61 +55,6 @@ end
     (prev, _lin_strides_tail(prev * first(len), Base.tail(len))...)
 end
 
-# Integer-based counter system for block iteration without CartesianIndex
-# This avoids allocations by working directly with integers and precomputed strides
-
-"""
-    BlockIterator{N}
-
-Iterator state for traversing blocks without creating CartesianIndex objects.
-Uses integer counters and carry logic for multi-dimensional iteration.
-"""
-struct BlockIterator{N}
-    dims::NTuple{N,Int}      # Dimension sizes
-    strides::NTuple{N,Int}   # Strides for linear indexing
-    firsts::NTuple{N,Int}    # First indices for offset arrays
-    mask::UInt64             # Bitmask for which dims to iterate
-end
-
-@inline function _make_block_iterator(sizes::NTuple{N,Int}, firsts::NTuple{N,Int},
-                                      strides::NTuple{N,Int}, mask::UInt64) where N
-    BlockIterator{N}(sizes, strides, firsts, mask)
-end
-
-# Compute linear index from counters without creating CartesianIndex
-@inline function _linear_index_from_counters(counters::NTuple{N,Int},
-                                            firsts::NTuple{N,Int},
-                                            strides::NTuple{N,Int}) where N
-    idx = 1
-    @inbounds for d in 1:N
-        idx += (counters[d] - firsts[d]) * strides[d]
-    end
-    return idx
-end
-
-# Increment counters with carry logic, returns new counters and done flag
-@inline function _increment_counters(counters::NTuple{N,Int}, sizes::NTuple{N,Int},
-                                    mask::UInt64) where N
-    # Create mutable copy for updating
-    new_counters = Base.setindex(counters, counters[1], 1)  # Start with copy
-
-    carry = true
-    @inbounds for d in 1:N
-        if (mask >> (d-1)) & 0x1 == 0x1  # This dimension is being iterated
-            if carry
-                val = counters[d] + 1
-                if val <= sizes[d]
-                    new_counters = Base.setindex(new_counters, val, d)
-                    carry = false
-                else
-                    new_counters = Base.setindex(new_counters, 1, d)  # Reset to 1
-                end
-            end
-        end
-    end
-
-    return new_counters, carry  # carry=true means we're done
-end
 
 # Compute the *base* linear index for (outer=o, remainder=r) with the first k dims fixed
 # to their axis starts; dims>k take from r if reduced, else from o.
@@ -126,48 +71,8 @@ end
     return acc
 end
 
-# New version that works with integer counters instead of CartesianIndex
-@inline function _lin_base_for_counters(outer_counters::NTuple{N,Int},
-                                       rem_counters::NTuple{N,Int},
-                                       reduce_mask::NTuple{N,Bool}, k::Int,
-                                       firsts::NTuple{N,Int},
-                                       strides::NTuple{N,Int}) where {N}
-    acc = 1
-    # Hoist the offset computation for first k dims (they're always at firsts)
-    # No contribution since (firsts[d] - firsts[d]) * strides[d] = 0
-    @inbounds for d in (k+1):N
-        idd = reduce_mask[d] ? rem_counters[d] : outer_counters[d]
-        acc += (idd - firsts[d]) * strides[d]
-    end
-    return acc
-end
-
 # Fast path check (reuses your trait)
 @inline _fast_linear(A) = has_fast_linear_indexing(A)
-
-# Helper to compute linearization contribution for given dimensions and mask
-@inline function _compute_linear_contribution(idx::CartesianIndex{N}, mask::NTuple{N,Bool},
-                                            firsts::NTuple{N,Int}, strides::NTuple{N,Int}) where {N}
-    acc = 1
-    @inbounds for d in 1:N
-        if mask[d]
-            acc += (idx.I[d] - firsts[d]) * strides[d]
-        end
-    end
-    return acc
-end
-
-# Efficient helper to compute outer vs inner contributions separately
-@inline function _compute_outer_inner_contributions(o::CartesianIndex{N}, i::CartesianIndex{N},
-                                                   is_inner_dim::NTuple{N,Bool},
-                                                   firsts::NTuple{N,Int}, strides::NTuple{N,Int}) where {N}
-    acc = 1
-    @inbounds for d in 1:N
-        idd = is_inner_dim[d] ? i.I[d] : o.I[d]
-        acc += (idd - firsts[d]) * strides[d]
-    end
-    return acc
-end
 
 @inline _contiguous_prefix(mask::NTuple{N,Bool}) where {N} = begin
     k = 0
@@ -219,22 +124,22 @@ end
 @inline function _should_use_streaming_plan(mask::NTuple{N,Bool}, sizes::NTuple{N,Int}, k::Int) where N
     # Only consider streaming if first dimension is reduced
     mask[1] || return false
-    
+
     # Calculate the contiguous block length
     block_len = k == 0 ? 0 : prod(sizes[1:k])
     block_len > 0 || return false
-    
+
     # Calculate costs
     output_size = prod(ifelse(mask[d], 1, sizes[d]) for d in 1:N)
     total_reduced = prod(ifelse(mask[d], sizes[d], 1) for d in 1:N)
-    
+
     # Standard path cost: output_size * (total_reduced/block_len) non-sequential hits
     standard_cost = output_size * (total_reduced ÷ block_len)
-    
+
     # Streaming cost: length(A)/block_len sequential runs
     total_size = prod(sizes)
     streaming_cost = total_size ÷ block_len
-    
+
     # Use bias factor of 8 to prefer standard unless streaming is clearly better
     return streaming_cost * 8 < standard_cost
 end
@@ -244,24 +149,24 @@ function plan_mapreducedim(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink
     mask = ntuple(d -> d in dims, Val(N))
     sizes = ntuple(d -> size(A,d), Val(N))
     k = _contiguous_prefix(mask)  # inner_prefix
-    
+
     # Compute traits
     fl = has_fast_linear_indexing(A)
     com = is_commutative_op(op, T)
     wid = _mapreduce_might_widen(f, op, A, init, sink)
-    
+
     # Compute heuristics
     U = _pick_unroll(mask, T, com)
     B = _pick_tile_B(f, op, T)
     bs = Base.pairwise_blocksize(f, op)
-    
+
     # Compute strides and firsts if fast linear
     str = fl ? _lin_strides_from_lengths(sizes) : ntuple(_ -> 0, Val(N))
     fst = fl ? _axes_first(A) : ntuple(_ -> 0, Val(N))
-    
+
     # Check if streaming is beneficial
     s_ok = _should_use_streaming_plan(mask, sizes, k)
-    
+
     MRPlan(mask, map(!, mask), sizes, k, bs, B, U, fl, com, wid, s_ok, str, fst, T)
 end
 
@@ -275,15 +180,6 @@ end
         reduce_mask[d] ? r.I[d] : o.I[d]
     end
 end
-
-# One-lane contiguous-pack sweep using the specialized commutative kernel
-@inline function _lane_comm_sweep(f, op, A, init, contig_inds, o::CartesianIndex{N},
-                                 r::CartesianIndex{N}, reduce_mask::NTuple{N,Bool},
-                                 ::Val{k}) where {N,k}
-    _mapreduce_kernel_8x(f, op, A, init, contig_inds,
-                       (), _trailing(o, r, reduce_mask, Val(k)))
-end
-
 
 # Initialize result array with first reduction slice
 @inline function _seed_result!(sink, R, f, op, A, init, is_inner_dim, contiguous_inner, outer)
@@ -450,25 +346,25 @@ end
 
 # One dispatcher for everything - clean, decision-based architecture
 function mapreducedim(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink=_MRAllocSink(A)) where {F, OP, T, N}
-    
+
     # Build the plan once with all decisions
     P = plan_mapreducedim(f, op, A, init, dims, sink)
-    
+
     # 1) Must use naive pairwise for small arrays?
     if length(A) ≤ P.blocksize
         return reduce_whole_inner(f, op, A, init, dims, sink, P)
     end
-    
+
     # 2) Widening or "inner is fully contiguous" → naïve blocked
     if P.widening || P.inner_prefix == count(P.reduce_mask)
         return reduce_naive_blocked(f, op, A, init, dims, sink, P)
     end
-    
+
     # 3) Streaming in memory order if it wins
     if P.stream_ok
         return reduce_streaming(f, op, A, init, dims, sink, P)
     end
-    
+
     # 4) Otherwise: col-major or row-major kernel by whether dim1 is reduced
     if P.reduce_mask[1]
         return reduce_colmajor(f, op, A, init, dims, sink, P)
@@ -482,50 +378,59 @@ function reduce_whole_inner(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sin
     # For small arrays, just use mapreduce_pairwise over the appropriate indices
     outer = CartesianIndices(reduced_indices(A, dims))
     inner = CartesianIndices(select_outer_dimensions(A, P.reduce_mask))
-    
-    v0 = _mapreduce_start(f, op, A, init)
+
+    # Need to get an initial value for allocation
+    # For empty case, this will be handled by mapreduce_pairwise
+    if !isempty(outer) && !isempty(inner)
+        # Get a sample value for allocation
+        first_inds = mergeindices(P.reduce_mask, inner, first(outer))
+        v0 = mapreduce_pairwise(f, op, A, init, first_inds)
+    else
+        # Empty array - use standard approach
+        v0 = _mapreduce_start(f, op, A, init)
+    end
     R = mapreduce_allocate(sink, v0, axes(outer))
-    
+
     for o in outer
         inds = mergeindices(P.reduce_mask, inner, o)
         v = mapreduce_pairwise(f, op, A, init, inds)
         mapreduce_set!(sink, R, o, v)
     end
-    
+
     return mapreduce_finish(sink, R)
 end
 
 # Kernel 5.b: Naïve blocked when inner is fully contiguous or widening is likely
 function reduce_naive_blocked(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, P::MRPlan{N,T}) where {F,OP,T,N}
     outer = CartesianIndices(reduced_indices(A, dims))
-    
+
     # When inner is fully contiguous, use linear ranges
     if P.inner_prefix > 0 && P.fast_linear
         block_len = prod(P.sizes[1:P.inner_prefix])
         i0 = first(LinearIndices(A))
-        
+
         v0 = _mapreduce_start(f, op, A, init)
         R = mapreduce_allocate(sink, v0, axes(outer))
-        
+
         for (idx, o) in enumerate(outer)
             off = block_len * (idx - 1)
             v = mapreduce_pairwise(f, op, A, init, (i0 + off):(i0 + off + block_len - 1))
             mapreduce_set!(sink, R, o, v)
         end
-        
+
         return mapreduce_finish(sink, R)
     else
         # Fallback: use CartesianIndices
         inner = CartesianIndices(select_outer_dimensions(A, P.reduce_mask))
-        
+
         v0 = _mapreduce_start(f, op, A, init)
         R = mapreduce_allocate(sink, v0, axes(outer))
-        
+
         for o in outer
             v = mapreduce_pairwise(f, op, A, init, mergeindices(P.reduce_mask, inner, o))
             mapreduce_set!(sink, R, o, v)
         end
-        
+
         return mapreduce_finish(sink, R)
     end
 end
@@ -534,20 +439,20 @@ end
 function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, P::MRPlan{N,T}) where {F,OP,T,N}
     outer = CartesianIndices(reduced_indices(A, dims))
     inner = CartesianIndices(select_outer_dimensions(A, P.reduce_mask))
-    
+
     # Split into contiguous prefix and discontiguous remainder
     is_contiguous_inner = keep_first_trues(P.reduce_mask)
     contiguous_inner = mergeindices(is_contiguous_inner, inner, first(inner))
     discontiguous_inner = mergeindices(is_contiguous_inner, first(inner), inner)
-    
+
     v0 = _mapreduce_start(f, op, A, init)
     R = mapreduce_allocate(sink, v0, axes(outer))
-    
+
     # Seed R with first remainder slice
     if P.fast_linear && P.inner_prefix > 0
         block_len = prod(P.sizes[1:P.inner_prefix])
         r0 = first(discontiguous_inner)
-        
+
         # Pre-compute r0 contribution for dimensions > k (hoisted)
         r0_contrib = 1
         @inbounds for d in (P.inner_prefix+1):N
@@ -555,7 +460,7 @@ function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
                 r0_contrib += (r0.I[d] - P.firsts[d]) * P.strides[d]
             end
         end
-        
+
         for o in outer
             # Compute outer contribution and combine with hoisted r0 contribution
             base = r0_contrib
@@ -567,12 +472,12 @@ function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
             v = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
             mapreduce_set!(sink, R, o, v)
         end
-        
+
         # Process remainder lanes
         if P.commutative && length(discontiguous_inner) > 1
             # Commutative: tile the remainder processing
             tile_buffer = Vector{CartesianIndex{N}}(undef, P.tile_B)
-            
+
             for dci in Iterators.drop(discontiguous_inner, 1)
                 # Process in tiles - simplified version for now
                 for o in outer
@@ -583,7 +488,7 @@ function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
                             inner_base += (dci.I[d] - P.firsts[d]) * P.strides[d]
                         end
                     end
-                    
+
                     # Combine with outer contribution
                     base = inner_base
                     @inbounds for d in (P.inner_prefix+1):N
@@ -591,7 +496,7 @@ function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
                             base += (o.I[d] - P.firsts[d]) * P.strides[d]
                         end
                     end
-                    
+
                     val = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
                     mapreduce_accum!(sink, R, o, val)
                 end
@@ -607,14 +512,14 @@ function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
                             inner_base += (dci.I[d] - P.firsts[d]) * P.strides[d]
                         end
                     end
-                    
+
                     base = inner_base
                     @inbounds for d in (P.inner_prefix+1):N
                         if !P.reduce_mask[d]
                             base += (o.I[d] - P.firsts[d]) * P.strides[d]
                         end
                     end
-                    
+
                     val = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
                     r_val = @inbounds R[o]
                     result = op(r_val, val)
@@ -628,7 +533,7 @@ function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
             v = mapreduce_pairwise(f, op, A, init, mergeindices(is_contiguous_inner, contiguous_inner, o))
             mapreduce_set!(sink, R, o, v)
         end
-        
+
         for dci in Iterators.drop(discontiguous_inner, 1)
             for o in outer
                 i = mergeindices(P.reduce_mask, dci, o)
@@ -639,7 +544,7 @@ function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
             end
         end
     end
-    
+
     return mapreduce_finish(sink, R)
 end
 
@@ -647,12 +552,12 @@ end
 function reduce_rowmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, P::MRPlan{N,T}) where {F,OP,T,N}
     outer = CartesianIndices(reduced_indices(A, dims))
     inner = CartesianIndices(select_outer_dimensions(A, P.reduce_mask))
-    
+
     # Initialize with first inner index
     i1 = first(inner)
     v0 = _mapreduce_start(f, op, A, init)
     R = mapreduce_allocate(sink, v0, axes(outer))
-    
+
     if P.fast_linear
         # Pre-compute i1 inner contribution
         i1_contrib = 1
@@ -661,7 +566,7 @@ function reduce_rowmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
                 i1_contrib += (i1.I[d] - P.firsts[d]) * P.strides[d]
             end
         end
-        
+
         for o in outer
             # Build linear index for (o, i1)
             acc = i1_contrib
@@ -670,15 +575,16 @@ function reduce_rowmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
                     acc += (o.I[d] - P.firsts[d]) * P.strides[d]
                 end
             end
-            v = _mapreduce_start(f, op, A, init, A[acc])
+            a_val = @inbounds A[acc]
+            v = _mapreduce_start(f, op, A, init, f(a_val))
             mapreduce_set!(sink, R, o, v)
         end
-        
+
         # Process remaining inner indices
         if P.commutative
             # Commutative: tile the processing
             tile_buffer = Vector{CartesianIndex{N}}(undef, P.tile_B)
-            
+
             for i in Iterators.drop(inner, 1)
                 # Simplified tiling for now
                 for o in outer
@@ -689,14 +595,14 @@ function reduce_rowmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
                             inner_acc += (i.I[d] - P.firsts[d]) * P.strides[d]
                         end
                     end
-                    
+
                     outer_acc = 1
                     @inbounds for d in 1:N
                         if !P.reduce_mask[d]
                             outer_acc += (o.I[d] - P.firsts[d]) * P.strides[d]
                         end
                     end
-                    
+
                     acc = outer_acc + inner_acc - 1
                     a_val = @inbounds A[acc]
                     v = f(a_val)
@@ -713,7 +619,7 @@ function reduce_rowmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
                         inner_acc += (i.I[d] - P.firsts[d]) * P.strides[d]
                     end
                 end
-                
+
                 for o in outer
                     outer_acc = 1
                     @inbounds for d in 1:N
@@ -732,10 +638,12 @@ function reduce_rowmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
     else
         # Fallback for non-fast-linear arrays
         for o in outer
-            v = _mapreduce_start(f, op, A, init, A[mergeindices(P.reduce_mask, i1, o)])
+            idx = mergeindices(P.reduce_mask, i1, o)
+            a_val = @inbounds A[idx]
+            v = _mapreduce_start(f, op, A, init, f(a_val))
             mapreduce_set!(sink, R, o, v)
         end
-        
+
         for i in Iterators.drop(inner, 1)
             for o in outer
                 iA = mergeindices(P.reduce_mask, i, o)
@@ -747,444 +655,7 @@ function reduce_rowmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
             end
         end
     end
-    
-    return mapreduce_finish(sink, R)
-end
-function mapreducedim_colmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink,
-                                       plan::MRPlan{N,T}, enforce_pairwise=true) where {F,OP,N,T}
-    # Split the inner (reduced) block into its contiguous prefix and the discontiguous "remainder"
-    is_contiguous_inner = keep_first_trues(is_inner_dim)
-    contiguous_inner    = mergeindices(is_contiguous_inner, inner, first(inner))  # varying only over the contiguous prefix
-    discontiguous_inner = mergeindices(is_contiguous_inner, first(inner), inner)  # varying only over the non-contiguous remainder
 
-    # Precompute linearization bits (outside hot loops)
-    firsts  = _axes_first(A)
-    lens    = _axes_len(A)
-    strides = _lin_strides_from_lengths(lens)
-
-    # Decide early: if the remainder fan-out is large, one whole-inner sweep is faster.
-    k = plan.inner_pack
-    contig_len = k == 0 ? 0 : (k == 1 ? length(contiguous_inner) :
-                              length(mergeindices(is_contiguous_inner, contiguous_inner, first(outer))))
-    if enforce_pairwise && _use_pairwise_reduction(plan, contig_len, length(discontiguous_inner))
-        return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
-    end
-
-    # Seed R with the first remainder slice (combine inner-pack at fixed outer)
-    v0 = _mapreduce_start(f, op, A, init)
-    R = mapreduce_allocate(sink, v0, axes(outer))
-
-    # Initialize the flag for tracking which iterator we're using
-    local used_dropped::Bool
-    local dropped_iter
-    
-    if _fast_linear(A) && k > 0
-        # Linear block for the contiguous inner pack
-        block_len = prod(lens[1:k])
-        # Use r = first(discontiguous_inner) and compute base linear once per o
-        it0 = iterate(discontiguous_inner)
-        r0, st0 = it0
-
-        # Pre-compute r0 contribution for dimensions > k (hoisted)
-        r0_contrib = 1
-        @inbounds for d in (k+1):N
-            if is_inner_dim[d]
-                r0_contrib += (r0.I[d] - firsts[d]) * strides[d]
-            end
-        end
-
-        for o in outer
-            # Compute outer contribution and combine with hoisted r0 contribution
-            base = r0_contrib
-            @inbounds for d in (k+1):N
-                if !is_inner_dim[d]
-                    base += (o.I[d] - firsts[d]) * strides[d]
-                end
-            end
-            v = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
-            mapreduce_set!(sink, R, o, v)
-        end
-        # Continue with remainder lanes starting from st0
-        rem_iter = iterate(discontiguous_inner, st0)
-        rem_total = length(discontiguous_inner)
-        rem_total <= 1 && return mapreduce_finish(sink, R)
-        used_dropped = false
-    else
-        # Fallback: original index-based seeding
-        _seed_result!(sink, R, f, op, A, init, is_inner_dim, contiguous_inner, outer)
-        # Create the dropped iterator that we'll use for tiling
-        dropped_iter = Iterators.drop(discontiguous_inner, 1)
-        rem_iter = iterate(dropped_iter)
-        # No remainder → done
-        rem_total = length(discontiguous_inner)
-        rem_total <= 1 && return mapreduce_finish(sink, R)
-        used_dropped = true
-    end
-
-    # If op is commutative we can process remainder "lanes" in small tiles, which greatly
-    # reduces loop overhead and improves cache behavior on cases like dims=(1,2,4).
-    if is_commutative_op(op) && _fast_linear(A) && k > 0
-        # Optimized path: process remainder without allocating buffers
-        block_len = prod(lens[1:k])
-        
-        # Determine which iterator to use based on the path taken above
-        if used_dropped
-            # We're using the dropped iterator from the fallback path
-            work_iter = dropped_iter
-            it = rem_iter
-        else
-            # We're continuing from st0 in the fast path
-            work_iter = discontiguous_inner
-            it = rem_iter
-        end
-        
-        # Pre-allocate buffer for tile indices (reused across iterations)
-        tile_buffer = Vector{CartesianIndex{N}}(undef, plan.tile_B)
-
-        # Process in chunks without materializing indices
-        while it !== nothing
-            # Collect up to tile_B remainder indices to process
-            chunk_count = 0
-            local_it = it
-            
-            while local_it !== nothing && chunk_count < plan.tile_B
-                dci, st = local_it
-                chunk_count += 1
-                @inbounds tile_buffer[chunk_count] = dci
-                local_it = iterate(work_iter, st)
-            end
-            
-            # Process this tile for all outer indices
-            for o in outer
-                vtile = nothing
-                
-                # Pre-compute outer contribution for this o (hoisted)
-                outer_base = 1
-                @inbounds for d in (k+1):N
-                    if !is_inner_dim[d]
-                        outer_base += (o.I[d] - firsts[d]) * strides[d]
-                    end
-                end
-                
-                # Process all indices in this tile
-                for i in 1:chunk_count
-                    dci = @inbounds tile_buffer[i]
-                    # Combine with inner contribution
-                    base = outer_base
-                    @inbounds for d in (k+1):N
-                        if is_inner_dim[d]
-                            base += (dci.I[d] - firsts[d]) * strides[d]
-                        end
-                    end
-                    v = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
-                    vtile = vtile === nothing ? v : op(vtile, v)
-                end
-
-                if vtile !== nothing
-                    r_val = @inbounds R[o]
-                    result = op(r_val, vtile)
-                    @inbounds R[o] = result
-                end
-            end
-
-            # Continue from where we left off
-            it = local_it
-        end
-        return mapreduce_finish(sink, R)
-    elseif is_commutative_op(op)
-        # Fallback for non-fast-linear arrays
-        B = plan.tile_B
-        contig_inds = (k <= 1 ? axes(A,1) : CartesianIndices(ntuple(d->axes(A,d), k)))
-        
-        # Determine which iterator to use
-        if used_dropped
-            work_iter = dropped_iter
-        else
-            work_iter = discontiguous_inner
-        end
-        
-        # Pre-allocate buffer for tile indices
-        tile_buffer = Vector{CartesianIndex{N}}(undef, B)
-
-        it = rem_iter
-        while it !== nothing
-            # Collect up to B iterations
-            chunk_count = 0
-            local_it = it
-            
-            while local_it !== nothing && chunk_count < B
-                dci, st = local_it
-                chunk_count += 1
-                @inbounds tile_buffer[chunk_count] = dci
-                local_it = iterate(work_iter, st)
-            end
-            
-            # Process this chunk for all outer indices
-            for o in outer
-                vtile = nothing
-
-                for i in 1:chunk_count
-                    dci = @inbounds tile_buffer[i]
-                    v = _lane_comm_sweep(f, op, A, init, contig_inds, o, dci,
-                                       is_inner_dim, Val(k))
-                    vtile = vtile === nothing ? v : op(vtile, v)
-                end
-
-                if vtile !== nothing
-                    r_val = @inbounds R[o]
-                    result = op(r_val, vtile)
-                    @inbounds R[o] = result
-                end
-            end
-
-            # Advance to next chunk
-            it = local_it
-        end
-        return mapreduce_finish(sink, R)
-    end
-
-    # Non-commutative path: strict left-to-right across remainder lanes.
-    # Keep the straightforward order to preserve semantics; we still benefit
-    # from avoiding inner branching and from the single seed above.
-    if _fast_linear(A) && k > 0
-        # Use linear indexing for non-commutative path
-        block_len = prod(lens[1:k])
-        it = rem_iter
-        while it !== nothing
-            dci, st = it
-            # Pre-compute inner contribution for this dci (hoisted)
-            inner_base = 1
-            @inbounds for d in (k+1):N
-                if is_inner_dim[d]
-                    inner_base += (dci.I[d] - firsts[d]) * strides[d]
-                end
-            end
-
-            for o in outer
-                # Combine with outer contribution
-                base = inner_base
-                @inbounds for d in (k+1):N
-                    if !is_inner_dim[d]
-                        base += (o.I[d] - firsts[d]) * strides[d]
-                    end
-                end
-                val = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
-                r_val = @inbounds R[o]
-                result = op(r_val, val)
-                @inbounds R[o] = result
-            end
-            it = iterate(discontiguous_inner, st)
-        end
-    else
-        # Fallback: original index-based approach
-        for dci in Iterators.drop(discontiguous_inner, 1)
-            for o in outer
-                i = mergeindices(is_inner_dim, dci, o)
-                val = mapreduce_pairwise(f, op, A, init, mergeindices(is_contiguous_inner, contiguous_inner, i))
-                r_val = @inbounds R[o]
-                result = op(r_val, val)
-                @inbounds R[o] = result
-            end
-        end
-    end
-    return mapreduce_finish(sink, R)
-end
-
-function mapreducedim_rowmajor(f::F, op::OP, A, init, is_inner_dim, inner, outer, sink,
-                               plan::MRPlan{N,T}, enforce_pairwise=true) where {F,OP,N,T}
-    # Row-major is essentially a left-to-right fold over a discontiguous set of dims.
-    # Stronger guard: if the inner set is long, prefer the naive whole-inner sweep.
-    if enforce_pairwise && _use_pairwise_reduction(plan, 1, length(inner))
-        return mapreducedim_naive(f, op, A, init, is_inner_dim, inner, outer, sink)
-    end
-
-    # Initialize with the very first inner index so that R[o] is always a real value
-    it0 = iterate(inner)
-    i1, st = it0
-    v0 = _mapreduce_start(f, op, A, init)
-    R = mapreduce_allocate(sink, v0, axes(outer))
-
-    # Precompute linearization data for fast-linear arrays (used in all branches below)
-    _row_firsts = nothing
-    _row_strides = nothing
-    if _fast_linear(A)
-        # Precompute linearization once
-        firsts  = _axes_first(A)
-        lens    = _axes_len(A)
-        strides = _lin_strides_from_lengths(lens)
-
-        # Pre-compute i1 inner contribution
-        i1_contrib = 1
-        @inbounds for d in 1:N
-            if is_inner_dim[d]
-                i1_contrib += (i1.I[d] - firsts[d]) * strides[d]
-            end
-        end
-
-        for o in outer
-            # Build per-dim coordinate tuple for this (o, i1) using hoisted computation
-            acc = i1_contrib
-            @inbounds for d in 1:N
-                if !is_inner_dim[d]
-                    acc += (o.I[d] - firsts[d]) * strides[d]
-                end
-            end
-            v = _mapreduce_start(f, op, A, init, A[acc])
-            mapreduce_set!(sink, R, o, v)
-        end
-        # Store for reuse in the commutative/non-commutative loops
-        _row_firsts = firsts; _row_strides = strides
-    else
-        for o in outer
-            v = _mapreduce_start(f, op, A, init, A[mergeindices(is_inner_dim, i1, o)])
-            mapreduce_set!(sink, R, o, v)
-        end
-    end
-
-    # If op is commutative we can block the remaining inner indices into small tiles,
-    # accumulating per-outer partials in registers before touching R[o] once per tile.
-    if is_commutative_op(op)
-        B = plan.tile_B
-
-        it = iterate(inner, st)  # start from the second inner index
-
-        if _fast_linear(A)
-            # Optimized path: process directly without buffering
-            firsts = _row_firsts; strides = _row_strides
-            
-            # Pre-allocate buffer for tile indices
-            tile_buffer = Vector{CartesianIndex{N}}(undef, B)
-
-            while it !== nothing
-                # Collect up to B iterations
-                chunk_count = 0
-                local_it = it
-                
-                while local_it !== nothing && chunk_count < B
-                    i, st = local_it
-                    chunk_count += 1
-                    @inbounds tile_buffer[chunk_count] = i
-                    local_it = iterate(inner, st)
-                end
-                
-                # Process this chunk for all outer indices
-                for o in outer
-                    vtile = nothing
-
-                    # Compute outer contribution once per o (no allocation)
-                    outer_acc = 1
-                    @inbounds for d in 1:N
-                        if !is_inner_dim[d]
-                            outer_acc += (o.I[d] - firsts[d]) * strides[d]
-                        end
-                    end
-
-                    for idx in 1:chunk_count
-                        i = @inbounds tile_buffer[idx]
-                        acc = outer_acc
-                        @inbounds for d in 1:N
-                            if is_inner_dim[d]
-                                acc += (i.I[d] - firsts[d]) * strides[d]
-                            end
-                        end
-                        a_val = @inbounds A[acc]
-                        v = f(a_val)
-                        vtile = vtile === nothing ? v : op(vtile, v)
-                    end
-
-                    if vtile !== nothing
-                        r_val = @inbounds R[o]
-                        result = op(r_val, vtile)
-                        @inbounds R[o] = result
-                    end
-                end
-
-                # Advance to next chunk
-                it = local_it
-            end
-        else
-            # Fallback for non-fast-linear arrays
-            # Pre-allocate buffer for tile indices
-            tile_buffer = Vector{CartesianIndex{N}}(undef, B)
-            
-            while it !== nothing
-                # Collect up to B iterations
-                chunk_count = 0
-                local_it = it
-                
-                while local_it !== nothing && chunk_count < B
-                    i, st = local_it
-                    chunk_count += 1
-                    @inbounds tile_buffer[chunk_count] = i
-                    local_it = iterate(inner, st)
-                end
-                
-                # Process this chunk for all outer indices
-                for o in outer
-                    vtile = nothing
-
-                    for idx in 1:chunk_count
-                        i = @inbounds tile_buffer[idx]
-                        idx = mergeindices(is_inner_dim, i, o)
-                        a_val = @inbounds A[idx]
-                        v = f(a_val)
-                        vtile = vtile === nothing ? v : op(vtile, v)
-                    end
-
-                    if vtile !== nothing
-                        r_val = @inbounds R[o]
-                        result = op(r_val, vtile)
-                        @inbounds R[o] = result
-                    end
-                end
-
-                # Advance to next chunk
-                it = local_it
-            end
-        end
-        return mapreduce_finish(sink, R)
-    end
-
-    # Non-commutative path: strict left-to-right recurrence (preserve order).
-    if _fast_linear(A)
-        firsts = _row_firsts; strides = _row_strides
-
-        for i in Iterators.drop(inner, 1)
-            # Pre-compute inner index contribution once per i
-            inner_acc = 1
-            @inbounds for d in 1:N
-                if is_inner_dim[d]
-                    inner_acc += (i.I[d] - firsts[d]) * strides[d]
-                end
-            end
-
-            for o in outer
-                # Compute outer contribution (no allocation)
-                outer_acc = 1
-                @inbounds for d in 1:N
-                    if !is_inner_dim[d]
-                        outer_acc += (o.I[d] - firsts[d]) * strides[d]
-                    end
-                end
-                acc = outer_acc + inner_acc - 1  # -1 because both start at 1
-                a_val = @inbounds A[acc]
-                r_val = @inbounds R[o]
-                result = op(r_val, f(a_val))
-                @inbounds R[o] = result
-            end
-        end
-    else
-        for i in Iterators.drop(inner, 1)
-            for o in outer
-                iA = mergeindices(is_inner_dim, i, o)
-                a_val = @inbounds A[iA]
-                val = f(a_val)
-                r_val = @inbounds R[o]
-                result = op(r_val, val)
-                @inbounds R[o] = result
-            end
-        end
-    end
     return mapreduce_finish(sink, R)
 end
 
@@ -1194,17 +665,17 @@ function reduce_streaming(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink,
     output_axes = reduced_indices(A, dims)
     v0 = _mapreduce_start(f, op, A, init)
     R = mapreduce_allocate(sink, v0, output_axes)
-    
+
     # Initialize output elements
     for I in CartesianIndices(R)
         mapreduce_set!(sink, R, I, v0)
     end
-    
+
     # Process in memory order
     if P.fast_linear && has_fast_linear_indexing(R)
         output_shape = size(R)
         output_strides = _lin_strides_from_lengths(output_shape)
-        
+
         # Find the largest contiguous block we can process at once
         contiguous_block = 1
         first_non_reduced_dim = N + 1
@@ -1216,27 +687,27 @@ function reduce_streaming(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink,
                 break
             end
         end
-        
+
         # Pre-compute stride products for non-reduced dimensions
         output_stride_multipliers = ntuple(d ->
             d < first_non_reduced_dim ? 0 :
             (P.reduce_mask[d] ? 0 : output_strides[d]), Val(N))
-        
+
         # Process the array in memory order
         if contiguous_block > 1
             # We can process contiguous blocks efficiently
             n_blocks = length(A) ÷ contiguous_block
-            
+
             # Iterate through all blocks
             @inbounds for block_idx in 0:(n_blocks-1)
                 # Compute the starting linear index for this block
                 base_idx = block_idx * contiguous_block + 1
-                
+
                 # Convert block index to coordinates in the non-reduced dimensions
                 remaining = block_idx
                 out_idx = 1
                 dim_idx = 1
-                
+
                 # Skip the contiguous reduced dimensions at the start
                 for d in 1:N
                     if P.reduce_mask[d]
@@ -1245,14 +716,14 @@ function reduce_streaming(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink,
                         break
                     end
                 end
-                
+
                 # Compute output index based on remaining dimensions using hoisted multipliers
                 for d in dim_idx:N
                     coord = (remaining % P.sizes[d]) + 1
                     remaining ÷= P.sizes[d]
                     out_idx += (coord - 1) * output_stride_multipliers[d]
                 end
-                
+
                 # Process the entire contiguous block and accumulate to single output position
                 for offset in 0:(contiguous_block-1)
                     val = f(A[base_idx + offset])
@@ -1263,7 +734,7 @@ function reduce_streaming(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink,
             # No contiguous blocks to exploit, process element by element
             @inbounds for lin_idx in 1:length(A)
                 val = f(A[lin_idx])
-                
+
                 # Map to output index using hoisted multipliers
                 remaining = lin_idx - 1
                 out_idx = 1
@@ -1272,7 +743,7 @@ function reduce_streaming(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink,
                     remaining ÷= P.sizes[d]
                     out_idx += (coord - 1) * output_stride_multipliers[d]
                 end
-                
+
                 R[out_idx] = op(R[out_idx], val)
             end
         end
@@ -1288,159 +759,7 @@ function reduce_streaming(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink,
     return mapreduce_finish(sink, R)
 end
 
-# Helper to compute product of selected dimensions at compile time
-@inline _prod_dims(shape::Tuple{}, mask::Tuple{}) = 1
-@inline function _prod_dims(shape::Tuple, mask::Tuple)
-    first(mask) ? first(shape) * _prod_dims(tail(shape), tail(mask)) : _prod_dims(tail(shape), tail(mask))
-end
 
-# Heuristic to decide if streaming would be more efficient
-function _should_use_streaming(is_inner_dim::NTuple{N,Bool}, shape::NTuple{N,Int}) where N
-    # Use streaming when memory access pattern would be significantly better
-    # than the standard algorithm's pattern
-
-    # The streaming kernel requires dimension 1 to be reduced for efficiency
-    # because it processes contiguous blocks
-    if !is_inner_dim[1]
-        return false
-    end
-
-    # Count contiguous reduced dimensions from the start
-    contiguous_reduced = 0
-    for d in 1:N
-        if is_inner_dim[d]
-            contiguous_reduced += 1
-        else
-            break
-        end
-    end
-
-    # If all reduced dimensions are contiguous, standard algorithm is already optimal
-    total_reduced = sum(is_inner_dim)
-    if contiguous_reduced == total_reduced
-        return false
-    end
-
-    # Calculate the memory access pattern characteristics
-    # The key insight: streaming is better when we have scattered reductions
-    # that would cause the standard algorithm to jump around in memory
-
-    # Size of contiguous chunks we can process at once
-    contiguous_chunk_size = prod(shape[1:contiguous_reduced])
-
-    # Number of output elements - compute at compile time
-    output_size = _prod_dims(shape, map(!, is_inner_dim))
-
-    # Number of separated reduction positions per output element
-    # (how many times standard algorithm jumps for each output)
-    total_reduced_size = _prod_dims(shape, is_inner_dim)
-    jumps_per_output = total_reduced_size ÷ contiguous_chunk_size
-
-    # Streaming is beneficial when:
-    # 1. Standard algorithm would make many jumps (jumps_per_output * output_size)
-    # 2. Those jumps are larger than the contiguous chunks
-    # 3. The ratio of sequential access (streaming) vs random access (standard) is favorable
-
-    # Compare memory access patterns:
-    # Standard: output_size * jumps_per_output non-sequential accesses
-    # Streaming: prod(shape) / contiguous_chunk_size sequential accesses
-    standard_nonsequential_accesses = output_size * jumps_per_output
-    streaming_sequential_accesses = prod(shape) ÷ contiguous_chunk_size
-
-    # Use streaming if it provides better memory access pattern
-    # Bias towards non-streaming. Cheap ops (like identity/+)
-    # need a *big* advantage to offset index math overhead.
-    bias = 8  # tuned constant: 4–16 is reasonable
-    return streaming_sequential_accesses * bias < standard_nonsequential_accesses
-end
-
-# Streaming kernel for "keep dim 1" reductions using sink API
-# Works correctly with OffsetArrays and custom axes
-function _mapreducedim_stream_firstdim(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink) where {F,OP,T,N}
-    axsA = ntuple(d->axes(A,d), Val(N))
-
-    if isempty(A)
-        v = _mapreduce_start(f, op, A, init)
-        out_axes = ntuple(d -> d==1 ? axsA[1] : reduced_index(axsA[d]), Val(N))
-        R = mapreduce_allocate(sink, v, out_axes)
-        for I in CartesianIndices(axes(R))
-            @inbounds mapreduce_set!(sink, R, I, v)
-        end
-        return mapreduce_finish(sink, R)
-    end
-
-    # Seed output with the first "column"
-    v_seed = _mapreduce_start(f, op, A, init, first(A))
-    out_axes = ntuple(d -> d==1 ? axsA[1] : reduced_index(axsA[d]), Val(N))
-    R = mapreduce_allocate(sink, v_seed, out_axes)
-    out_axes_R = axes(R)
-
-    # Columns are all reduced dims varying, others fixed to their first index
-    cols_axes = ntuple(d -> d==1 ? reduced_index(axsA[1]) :
-                           (d in dims ? axsA[d] : reduced_index(axsA[d])), Val(N))
-    cols = CartesianIndices(cols_axes)
-
-    # ---- Seed pass with the first column c0 (no double op!) -------------------
-    c0 = first(cols)
-    if N == ndims(R)
-        # Build a 1-D view along dim-1 once; other dims fixed at their first in R
-        # (Tuple is created once, not per element)
-        fixed = ntuple(d -> d==1 ? Colon() : first(out_axes_R[d]), Val(N))
-        Rrow = @view R[fixed...]
-        # Also build a 1-D view of A's first column
-        colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c0[d] : first(axsA[d])), Val(N))
-        Acol = @view A[colAidx...]
-        for i in eachindex(Rrow, Acol)
-            # Only the array accesses are @inbounds, not f or op
-            ai = @inbounds Acol[i]
-            val = _mapreduce_start(f, op, A, init, ai)
-            @inbounds Rrow[i] = val
-        end
-    else
-        # Fallback: R has fewer dims. Use LinearIndices once.
-        LR = LinearIndices(R)
-        colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c0[d] : first(axsA[d])), Val(N))
-        Acol = @view A[colAidx...]
-        # map linear index i -> LR[i]
-        for i in eachindex(Acol)
-            I = @inbounds LR[i]
-            ai = @inbounds Acol[i]
-            val = _mapreduce_start(f, op, A, init, ai)
-            @inbounds mapreduce_set!(sink, R, I, val)
-        end
-    end
-
-    # ---- Accumulate the rest of the columns -----------------------------------
-    if N == ndims(R)
-        fixedR = ntuple(d -> d==1 ? Colon() : first(out_axes_R[d]), Val(N))
-        Rrow = @view R[fixedR...]
-        for c in Iterators.drop(cols, 1)
-            colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c[d] : first(axsA[d])), Val(N))
-            Acol = @view A[colAidx...]
-            for i in eachindex(Rrow, Acol)
-                # Only array accesses are @inbounds, not user functions
-                ai = @inbounds Acol[i]
-                ri = @inbounds Rrow[i]
-                val = op(ri, f(ai))
-                @inbounds Rrow[i] = val
-            end
-        end
-    else
-        LR = LinearIndices(R)
-        for c in Iterators.drop(cols, 1)
-            colAidx = ntuple(d -> d==1 ? Colon() : (d in dims ? c[d] : first(axsA[d])), Val(N))
-            Acol = @view A[colAidx...]
-            for i in eachindex(Acol)
-                I = @inbounds LR[i]
-                ai = @inbounds Acol[i]
-                val = f(ai)
-                @inbounds mapreduce_accum!(sink, R, I, val)
-            end
-        end
-    end
-
-    return mapreduce_finish(sink, R)
-end
 
 
 """
