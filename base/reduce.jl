@@ -305,11 +305,23 @@ julia> mapreduce(isodd, |, a, dims=1)
  1  1  1  1
 ```
 """
-mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted; init=_InitialValue(), dims=(:)) where {F,G} =
-    mapreducedim(f, op, A, init, dims, Base._MRAllocSink(A))
+function mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted; init=_InitialValue(), dims=(:)) where {F,G}
+    if dims === (:) || dims isa Colon
+        # Reduce over all dimensions - use pairwise directly
+        return mapreduce_pairwise(f, op, A, init)
+    else
+        # Dimensional reduction - will be handled by reducedim.jl when it's loaded
+        # For now during bootstrap, just use the simple approach
+        if isdefined(Base, :mapreducedim)
+            return mapreducedim(f, op, A, init, dims, Base._MRAllocSink(A))
+        else
+            # Fallback during bootstrap
+            return mapreduce_pairwise(f, op, A, init)
+        end
+    end
+end
 mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted, As::AbstractArrayOrBroadcasted...; init=_InitialValue(), dims=(:)) where {F,G} =
     reduce(op, map(f, A, As...); init, dims)
-mapreducedim(f::F, op::G, A, init, ::Colon, sink=_MRAllocSink(A)) where {F,G} = mapreduce_pairwise(f, op, A, init)
 
 # Simple pairwise reduction blocksize
 const MIN_BLOCK = 10  # Minimum block size for all reductions
