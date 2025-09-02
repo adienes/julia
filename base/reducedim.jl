@@ -169,6 +169,43 @@ end
 # Helper for ceiling division
 @inline ceildiv(a::Int, b::Int) = (a + b - 1) ÷ b
 
+# Helper: Compute product of first n elements of a tuple without allocation
+@inline function _prod_first_n(sizes::NTuple{N,Int}, n::Int) where N
+    p = 1
+    @inbounds for i in 1:min(n, N)
+        p *= sizes[i]
+    end
+    return p
+end
+
+# Helper: Compute linear index contribution for dimensions matching a mask
+# This extracts the common pattern of computing index offsets for fast linear indexing
+@inline function _compute_index_contribution(idx::CartesianIndex{N}, mask::NTuple{N,Bool},
+                                            firsts::NTuple{N,Int}, strides::NTuple{N,Int},
+                                            start_dim::Int, end_dim::Int) where N
+    contrib = 0
+    @inbounds for d in start_dim:end_dim
+        if mask[d]
+            contrib += (idx.I[d] - firsts[d]) * strides[d]
+        end
+    end
+    return contrib
+end
+
+# Specialized version for computing index contribution from dimension k+1 to N
+# This is the most common pattern in reduction kernels
+@inline function _compute_index_contribution_after_k(idx::CartesianIndex{N}, mask::NTuple{N,Bool},
+                                                    firsts::NTuple{N,Int}, strides::NTuple{N,Int},
+                                                    k::Int) where N
+    contrib = 0
+    @inbounds for d in (k+1):N
+        if mask[d]
+            contrib += (idx.I[d] - firsts[d]) * strides[d]
+        end
+    end
+    return contrib
+end
+
 # Check if streaming kernel should be used based on cost analysis
 @inline function _should_use_streaming_plan(mask::NTuple{N,Bool}, sizes::NTuple{N,Int}, k::Int) where N
     # Only consider streaming if first dimension is reduced
@@ -176,10 +213,19 @@ end
     k == 0 && return false
 
     # Calculate the contiguous block length
-    block_len = prod(sizes[1:k])
+    block_len = _prod_first_n(sizes, k)
     total_size = prod(sizes)
-    output_size = prod(ntuple(d -> mask[d] ? 1 : sizes[d], Val(N)))
-    total_reduced = prod(ntuple(d -> mask[d] ? sizes[d] : 1, Val(N)))
+    
+    # Compute both masked products in one pass
+    output_size = 1
+    total_reduced = 1
+    @inbounds for d in 1:N
+        if mask[d]
+            total_reduced *= sizes[d]
+        else
+            output_size *= sizes[d]
+        end
+    end
 
     # Standard path cost: output_size * ceildiv(total_reduced, block_len) non-sequential hits
     standard_cost = output_size * ceildiv(total_reduced, block_len)
@@ -458,7 +504,7 @@ function reduce_naive_blocked(f::F, op::OP, A::AbstractArray{T,N}, init, dims, s
 
     # When inner is fully contiguous, use linear ranges
     if P.inner_prefix > 0 && P.fast_linear
-        block_len = prod(P.sizes[1:P.inner_prefix])
+        block_len = _prod_first_n(P.sizes, P.inner_prefix)
         i0 = first(LinearIndices(A))
 
         # Handle potential empty case
@@ -475,11 +521,8 @@ function reduce_naive_blocked(f::F, op::OP, A::AbstractArray{T,N}, init, dims, s
         R = mapreduce_allocate(sink, v0, axes(outer))
 
         for o in outer
-            base = 1
-            @inbounds for d in (P.inner_prefix+1):N
-                # NB: use A's first indices; P.firsts was built from axes(A,d)
-                base += (o.I[d] - P.firsts[d]) * P.strides[d]
-            end
+            # Use helper for computing outer index contribution
+            base = 1 + _compute_index_contribution_after_k(o, .!P.reduce_mask, P.firsts, P.strides, P.inner_prefix)
             v = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
             mapreduce_set!(sink, R, o, v)
         end
@@ -524,7 +567,7 @@ function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
     R  = mapreduce_allocate(sink, v0, axes(outer))
 
     if P.fast_linear && P.inner_prefix > 0
-        block_len = prod(P.sizes[1:P.inner_prefix])
+        block_len = _prod_first_n(P.sizes, P.inner_prefix)
 
         # seed with first remainder lane
         it = iterate(remainder)
@@ -532,20 +575,10 @@ function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
         r0, s = it
 
         # hoist r0 inner contribution
-        r0_inner = 1
-        @inbounds for d in (P.inner_prefix+1):N
-            if P.reduce_mask[d]
-                r0_inner += (r0.I[d] - P.firsts[d]) * P.strides[d]
-            end
-        end
+        r0_inner = 1 + _compute_index_contribution_after_k(r0, P.reduce_mask, P.firsts, P.strides, P.inner_prefix)
 
         for o in outer
-            outer_base = 1
-            @inbounds for d in (P.inner_prefix+1):N
-                if !P.reduce_mask[d]
-                    outer_base += (o.I[d] - P.firsts[d]) * P.strides[d]
-                end
-            end
+            outer_base = 1 + _compute_index_contribution_after_k(o, .!P.reduce_mask, P.firsts, P.strides, P.inner_prefix)
             base = outer_base + r0_inner - 1
             v = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
             mapreduce_set!(sink, R, o, v)
@@ -559,20 +592,10 @@ function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
                 for o in outer
                     have = false; acc = nothing
                     local_it = it; t = 0
-                    outer_base = 1
-                    @inbounds for d in (P.inner_prefix+1):N
-                        if !P.reduce_mask[d]
-                            outer_base += (o.I[d] - P.firsts[d]) * P.strides[d]
-                        end
-                    end
+                    outer_base = 1 + _compute_index_contribution_after_k(o, .!P.reduce_mask, P.firsts, P.strides, P.inner_prefix)
                     while local_it !== nothing && t < P.tile_B
                         ri, s2 = local_it; t += 1
-                        inner_base = 1
-                        @inbounds for d in (P.inner_prefix+1):N
-                            if P.reduce_mask[d]
-                                inner_base += (ri.I[d] - P.firsts[d]) * P.strides[d]
-                            end
-                        end
+                        inner_base = 1 + _compute_index_contribution_after_k(ri, P.reduce_mask, P.firsts, P.strides, P.inner_prefix)
                         base = outer_base + inner_base - 1
                         v = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
                         if have; acc = op(acc, v) else acc = v; have = true end
@@ -591,19 +614,9 @@ function reduce_colmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
         else
             while it !== nothing
                 ri, s = it
-                inner_base = 1
-                @inbounds for d in (P.inner_prefix+1):N
-                    if P.reduce_mask[d]
-                        inner_base += (ri.I[d] - P.firsts[d]) * P.strides[d]
-                    end
-                end
+                inner_base = 1 + _compute_index_contribution_after_k(ri, P.reduce_mask, P.firsts, P.strides, P.inner_prefix)
                 for o in outer
-                    outer_base = 1
-                    @inbounds for d in (P.inner_prefix+1):N
-                        if !P.reduce_mask[d]
-                            outer_base += (o.I[d] - P.firsts[d]) * P.strides[d]
-                        end
-                    end
+                    outer_base = 1 + _compute_index_contribution_after_k(o, .!P.reduce_mask, P.firsts, P.strides, P.inner_prefix)
                     base = outer_base + inner_base - 1
                     val  = mapreduce_pairwise(f, op, A, init, base:base+block_len-1)
                     mapreduce_accum!(sink, R, o, val)  # preserves order since op is applied in sequence
@@ -646,18 +659,8 @@ function reduce_rowmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
         # Get value from first element
         o1 = first(outer)
         if P.fast_linear
-            i1_contrib = 1
-            @inbounds for d in 1:N
-                if P.reduce_mask[d]
-                    i1_contrib += (i1.I[d] - P.firsts[d]) * P.strides[d]
-                end
-            end
-            acc = i1_contrib
-            @inbounds for d in 1:N
-                if !P.reduce_mask[d]
-                    acc += (o1.I[d] - P.firsts[d]) * P.strides[d]
-                end
-            end
+            i1_contrib = 1 + _compute_index_contribution(i1, P.reduce_mask, P.firsts, P.strides, 1, N)
+            acc = i1_contrib + _compute_index_contribution(o1, .!P.reduce_mask, P.firsts, P.strides, 1, N)
             a_val = @inbounds A[acc]
             v0 = _mapreduce_start(f, op, A, init, f(a_val))
         else
@@ -674,21 +677,11 @@ function reduce_rowmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
 
     if P.fast_linear
         # Pre-compute i1 inner contribution
-        i1_contrib = 1
-        @inbounds for d in 1:N
-            if P.reduce_mask[d]
-                i1_contrib += (i1.I[d] - P.firsts[d]) * P.strides[d]
-            end
-        end
+        i1_contrib = 1 + _compute_index_contribution(i1, P.reduce_mask, P.firsts, P.strides, 1, N)
 
         for o in outer
             # Build linear index for (o, i1)
-            acc = i1_contrib
-            @inbounds for d in 1:N
-                if !P.reduce_mask[d]
-                    acc += (o.I[d] - P.firsts[d]) * P.strides[d]
-                end
-            end
+            acc = i1_contrib + _compute_index_contribution(o, .!P.reduce_mask, P.firsts, P.strides, 1, N)
             a_val = @inbounds A[acc]
             v = _mapreduce_start(f, op, A, init, f(a_val))
             mapreduce_set!(sink, R, o, v)
@@ -703,20 +696,8 @@ function reduce_rowmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
                 # Simplified tiling for now
                 for o in outer
                     # Compute indices
-                    inner_acc = 1
-                    @inbounds for d in 1:N
-                        if P.reduce_mask[d]
-                            inner_acc += (i.I[d] - P.firsts[d]) * P.strides[d]
-                        end
-                    end
-
-                    outer_acc = 1
-                    @inbounds for d in 1:N
-                        if !P.reduce_mask[d]
-                            outer_acc += (o.I[d] - P.firsts[d]) * P.strides[d]
-                        end
-                    end
-
+                    inner_acc = 1 + _compute_index_contribution(i, P.reduce_mask, P.firsts, P.strides, 1, N)
+                    outer_acc = 1 + _compute_index_contribution(o, .!P.reduce_mask, P.firsts, P.strides, 1, N)
                     acc = outer_acc + inner_acc - 1
                     a_val = @inbounds A[acc]
                     v = f(a_val)
@@ -729,20 +710,10 @@ function reduce_rowmajor(f::F, op::OP, A::AbstractArray{T,N}, init, dims, sink, 
             while it !== nothing
                 i, s = it
                 # Pre-compute inner index contribution once per i
-                inner_acc = 1
-                @inbounds for d in 1:N
-                    if P.reduce_mask[d]
-                        inner_acc += (i.I[d] - P.firsts[d]) * P.strides[d]
-                    end
-                end
+                inner_acc = 1 + _compute_index_contribution(i, P.reduce_mask, P.firsts, P.strides, 1, N)
 
                 for o in outer
-                    outer_acc = 1
-                    @inbounds for d in 1:N
-                        if !P.reduce_mask[d]
-                            outer_acc += (o.I[d] - P.firsts[d]) * P.strides[d]
-                        end
-                    end
+                    outer_acc = 1 + _compute_index_contribution(o, .!P.reduce_mask, P.firsts, P.strides, 1, N)
                     acc = outer_acc + inner_acc - 1
                     a_val = @inbounds A[acc]
                     mapreduce_accum!(sink, R, o, f(a_val))  # Use sink consistently
