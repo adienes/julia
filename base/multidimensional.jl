@@ -1100,33 +1100,50 @@ function mapreduce_kernel(f, op, A, init, inds::CartesianIndices{N}) where {N}
     return v
 end
 
-function mapreduce_kernel_commutative(f, op, A, init, inds::AbstractArray)
-    if length(inds) < 16
+function mapreduce_kernel_commutative(f::F, op::G, A, init, inds::AbstractArray) where {F, G}
+    n = length(inds)
+    if n < 8
         i1, iN = firstindex(inds), lastindex(inds)
         v_1 = _mapreduce_start(f, op, A, init, @inbounds A[inds[i1]])
+        i1 == iN && return v_1  # Handle single element case
         for i in i1+1:iN
             a = @inbounds A[inds[i]]
             v_1 = op(v_1, f(a))
         end
         return v_1
     end
-    return _mapreduce_kernel_commutative(f, op, A, init, inds)
+
+    # For large arrays and simple operations, use more aggressive optimization
+    T = eltype(A)
+    if isconcretetype(T) && isbitstype(T)
+        # Use specialized implementation for small types
+        if sizeof(T) <= 4 && n >= 32
+            return _mapreduce_kernel_16x(f, op, A, init, inds, (), ())
+        end
+    end
+    return _mapreduce_kernel_8x(f, op, A, init, inds, (), ())
 end
 
-# This special internal method must have at least 8 indices and allows passing
-# optional scalar leading and trailing dimensions
-function _mapreduce_kernel_commutative(f, op, A, init, inds, leading=(), trailing=())
+function _mapreduce_kernel_8x(f, op, A, init, inds, leading, trailing)
     i1, iN = firstindex(inds), lastindex(inds)
     n = length(inds)
+
+    # Initial unrolled values
     @nexprs 8 N->a_N = @inbounds A[leading..., inds[i1+(N-1)], trailing...]
     @nexprs 8 N->v_N = _mapreduce_start(f, op, A, init, a_N)
+
+    # Main unrolled loop
     for batch in 1:(n>>3)-1
         i = i1 + batch*8
         @nexprs 8 N->a_N = @inbounds A[leading..., inds[i+(N-1)], trailing...]
         @nexprs 8 N->fa_N = f(a_N)
         @nexprs 8 N->v_N = op(v_N, fa_N)
     end
+
+    # Tree reduction for 8 values
     v = op(op(op(v_1, v_2), op(v_3, v_4)), op(op(v_5, v_6), op(v_7, v_8)))
+
+    # Handle remainder
     i = i1 + (n>>3)*8 - 1
     i == iN && return v
     for i in i+1:iN
@@ -1135,6 +1152,62 @@ function _mapreduce_kernel_commutative(f, op, A, init, inds, leading=(), trailin
     end
     return v
 end
+
+# 16x unrolled kernel implementation for small types with virtual padding support
+function _mapreduce_kernel_16x(f, op, A, init, inds, leading, trailing)
+    i1, iN = firstindex(inds), lastindex(inds)
+    n = length(inds)
+
+    # Check if we can use virtual padding for small arrays
+    T = eltype(A)
+    use_padding = Base.has_identity(op, T) && n < 16
+
+    if use_padding
+        # Use virtual padding - initialize extra lanes with identity
+        identity_val = Base.identity_element(op, T)
+        @nexprs 16 N->begin
+            if N <= n
+                a_N = @inbounds A[leading..., inds[i1+(N-1)], trailing...]
+                v_N = _mapreduce_start(f, op, A, init, a_N)
+            else
+                v_N = identity_val
+            end
+        end
+    else
+        # Standard initialization
+        @nexprs 16 N->a_N = @inbounds A[leading..., inds[i1+(N-1)], trailing...]
+        @nexprs 16 N->v_N = _mapreduce_start(f, op, A, init, a_N)
+
+        # Main unrolled loop
+        for batch in 1:(n>>4)-1
+            i = i1 + batch*16
+            @nexprs 16 N->a_N = @inbounds A[leading..., inds[i+(N-1)], trailing...]
+            @nexprs 16 N->fa_N = f(a_N)
+            @nexprs 16 N->v_N = op(v_N, fa_N)
+        end
+    end
+
+    # Tree reduction for 16 values (works with padding since identity is neutral)
+    v8_1 = op(op(v_1, v_2), op(v_3, v_4))
+    v8_2 = op(op(v_5, v_6), op(v_7, v_8))
+    v8_3 = op(op(v_9, v_10), op(v_11, v_12))
+    v8_4 = op(op(v_13, v_14), op(v_15, v_16))
+    v = op(op(v8_1, v8_2), op(v8_3, v8_4))
+
+    if !use_padding
+        # Handle remainder only if not using padding
+        i = i1 + (n>>4)*16 - 1
+        i == iN && return v
+        for i in i+1:iN
+            ai = @inbounds A[leading..., inds[i], trailing...]
+            v = op(v, f(ai))
+        end
+    end
+
+    return v
+end
+
+
 
 function mapreduce_kernel_commutative(f::F, op::G, A, init, inds::CartesianIndices{N}) where {N,F,G}
     N == 0 && return _mapreduce_start(f, op, A, init, A[inds[]])
@@ -1146,9 +1219,9 @@ function mapreduce_kernel_commutative(f::F, op::G, A, init, inds::CartesianIndic
         i = only(is)
         outer = CartesianIndices(tail(tail(inds.indices)))
         o1, s = iterate(outer)
-        v = _mapreduce_kernel_commutative(f, op, A, init, js, (i,), o1.I)
+        v = _mapreduce_kernel_8x(f, op, A, init, js, (i,), o1.I)
         for o in Iterators.rest(outer, s)
-            v = op(v, _mapreduce_kernel_commutative(f, op, A, init, js, (i,), o.I))
+            v = op(v, _mapreduce_kernel_8x(f, op, A, init, js, (i,), o.I))
         end
         return v
     elseif length(is) < 8 # TODO: tune this number
@@ -1157,9 +1230,9 @@ function mapreduce_kernel_commutative(f::F, op::G, A, init, inds::CartesianIndic
     else
         outer = CartesianIndices(tail(inds.indices))
         o1, s = iterate(outer)
-        v = _mapreduce_kernel_commutative(f, op, A, init, is, (), o1.I)
+        v = _mapreduce_kernel_8x(f, op, A, init, is, (), o1.I)
         for o in Iterators.rest(outer, s)
-            v = op(v, _mapreduce_kernel_commutative(f, op, A, init, is, (), o.I))
+            v = op(v, _mapreduce_kernel_8x(f, op, A, init, is, (), o.I))
         end
         return v
     end
@@ -1242,13 +1315,7 @@ function mapreduce_kernel_commutative(f, op, itr, init, ::IteratorSize, n, state
         @nexprs 8 N->begin
             it = iterate(itr, s)
             if it === nothing
-                N > 7 && (v_7 = op(v_7, f(a_7)))
-                N > 6 && (v_6 = op(v_6, f(a_6)))
-                N > 5 && (v_5 = op(v_5, f(a_5)))
-                N > 4 && (v_4 = op(v_4, f(a_4)))
-                N > 3 && (v_3 = op(v_3, f(a_3)))
-                N > 2 && (v_2 = op(v_2, f(a_2)))
-                N > 1 && (v_1 = op(v_1, f(a_1)))
+                @nexprs 7 M->((N > M) && (v_{8-M} = op(v_{8-M}, f(a_{8-M}))))
                 return Some(op(op(op(v_1, v_2), op(v_3, v_4)), op(op(v_5, v_6), op(v_7, v_8))))
             end
             a_N, s = it

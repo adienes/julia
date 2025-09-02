@@ -577,11 +577,10 @@ deprecate(Base, Symbol("#reducedim_init"))
 
 @deprecate (reducedim_initarray(A::Union{Base.AbstractBroadcasted, AbstractArray}, region, init, ::Type{T}) where {T}) fill!(mapreduce_similar(A,T,reduced_indices(A,region)), init) false
 @deprecate reducedim_initarray(A::Union{Base.AbstractBroadcasted, AbstractArray}, region, init) fill!(mapreduce_similar(A,typeof(init),reduced_indices(A,region)), init) false
-const _dep_message_reducedim_init = ", these internals have been removed. To customize the array returned by dimensional reductions, implement mapreduce_similar instead"
 deprecate(Base, :reducedim_initarray)
 deprecate(Base, Symbol("#reducedim_initarray"))
 
-@deprecate _mapreduce_dim(f, op, nt, A::Union{Base.AbstractBroadcasted, AbstractArray}, dims) mapreducedim(f, op, A, nt, dims) false
+@deprecate _mapreduce_dim(f, op, nt, A::Union{Base.AbstractBroadcasted, AbstractArray}, dims) mapreducedim(f, op, A, nt, dims, Base._MRAllocSink(A)) false
 
 @deprecate_binding mapreducedim! Base.mapreduce! false
 @deprecate_binding _mapreducedim! Base.mapreduce! false

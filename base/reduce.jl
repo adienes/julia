@@ -4,6 +4,12 @@
 
 ###### Generic (map)reduce functions ######
 
+# Minimal sink API defined here for bootstrap ordering
+# Full implementation enhanced in reducedim.jl
+struct _MRAllocSink{Proto}
+    proto::Proto
+end
+
 abstract type AbstractBroadcasted end
 const AbstractArrayOrBroadcasted = Union{AbstractArray, AbstractBroadcasted}
 
@@ -299,18 +305,44 @@ julia> mapreduce(isodd, |, a, dims=1)
  1  1  1  1
 ```
 """
-mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted; init=_InitialValue(), dims=(:)) where {F,G} = mapreducedim(f, op, A, init, dims)
+function mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted; init=_InitialValue(), dims=(:)) where {F,G}
+    if dims === (:) || dims isa Colon
+        # Reduce over all dimensions - use pairwise directly
+        return mapreduce_pairwise(f, op, A, init)
+    else
+        # Dimensional reduction - will be handled by reducedim.jl when it's loaded
+        # For now during bootstrap, just use the simple approach
+        if isdefined(Base, :mapreducedim)
+            return mapreducedim(f, op, A, init, dims, Base._MRAllocSink(A))
+        else
+            # Fallback during bootstrap
+            return mapreduce_pairwise(f, op, A, init)
+        end
+    end
+end
 mapreduce(f::F, op::G, A::AbstractArrayOrBroadcasted, As::AbstractArrayOrBroadcasted...; init=_InitialValue(), dims=(:)) where {F,G} =
     reduce(op, map(f, A, As...); init, dims)
-mapreducedim(f::F, op::G, A, init, ::Colon) where {F,G} = mapreduce_pairwise(f, op, A, init)
 
-# Note: sum_seq usually uses four or more accumulators after partial
-# unrolling, so each accumulator gets at most 256 numbers
+# Simple pairwise reduction blocksize
+const MIN_BLOCK = 10  # Minimum block size for all reductions
+
+"""
+    pairwise_blocksize(f, op) -> Int
+
+Determines the block size for pairwise reduction operations.
+"""
 pairwise_blocksize(f, op) = 1024
+
+# Compute-heavy functions benefit from smaller blocksizes
+pairwise_blocksize(::typeof(sqrt), op) = 64
+pairwise_blocksize(::typeof(sin), op) = 64
+pairwise_blocksize(::typeof(cos), op) = 64
+pairwise_blocksize(::typeof(exp), op) = 64
+pairwise_blocksize(::typeof(log), op) = 64
 
 # This combination appears to show a benefit from a larger block size
 pairwise_blocksize(::typeof(abs2), ::typeof(+)) = 4096
-
+pairwise_blocksize(::typeof(abs2), ::typeof(Base.add_sum)) = 4096
 
 # handling empty arrays
 _empty_reduce_error() = throw(ArgumentError("reducing over an empty collection is not allowed; consider supplying `init` to the reducer"))
@@ -372,9 +404,6 @@ mapreduce_empty(::typeof(abs2), op, T)     = abs2(reduce_empty(op, T))
 mapreduce_empty(f::typeof(abs),  ::typeof(max), T) = abs(zero(T))
 mapreduce_empty(f::typeof(abs2), ::typeof(max), T) = abs2(zero(T))
 
-# For backward compatibility:
-mapreduce_empty_iter(f::F, op::F2, itr, ItrEltype) where {F,F2} =
-    reduce_empty_iter(MappingRF(f, op), itr, ItrEltype)
 
 @inline reduce_empty_iter(op, itr) = reduce_empty_iter(op, itr, IteratorEltype(itr))
 @inline reduce_empty_iter(op, itr, ::HasEltype) = reduce_empty(op, eltype(itr))
@@ -480,51 +509,118 @@ All implementations dispatch to a similarly structured `mapreduce_kernel` to han
 base case that's essentially a `mapfoldl` that allows for further SIMD-like optimizations
 and reassociations.
 """
+# Implementation of pairwise reduction for arrays
 function mapreduce_pairwise(f::F, op::G, A::AbstractArrayOrBroadcasted, init) where {F, G}
     n = length(A)
     n == 0 && return _mapreduce_start(f, op, A, init)
-    n <= pairwise_blocksize(f, op) && return mapreduce_kernel(f, op, A, init, eachindex(A))
-    return mapreduce_pairwise(f, op, A, init, eachindex(A))
+
+    inds = eachindex(A)
+    blocksize = pairwise_blocksize(f, op)
+
+    if n <= blocksize
+        # Choose kernel based on commutativity
+        if is_commutative_op(op, eltype(A))
+            return mapreduce_kernel_commutative(f, op, A, init, inds)
+        else
+            return mapreduce_kernel(f, op, A, init, inds)
+        end
+    end
+    return pairwise_reduce(f, op, A, init, inds, blocksize)
+end
+
+# Recursive pairwise reduction with configurable blocksize
+function pairwise_reduce(f::F, op::G, A, init, inds, blocksize::Int) where {F,G}
+    n = length(inds)
+    if n <= max(MIN_BLOCK, blocksize)
+        # At base case, directly dispatch to kernel based on commutativity
+        # Don't call choose_kernel to avoid infinite recursion
+        if is_commutative_op(op, eltype(A))
+            return mapreduce_kernel_commutative(f, op, A, init, inds)
+        else
+            return mapreduce_kernel(f, op, A, init, inds)
+        end
+    else
+        p1, p2 = halves(inds)
+        v1 = pairwise_reduce(f, op, A, init, p1, blocksize)
+        v2 = pairwise_reduce(f, op, A, init, p2, blocksize)
+        return op(v1, v2)
+    end
+end
+
+# Method for direct indexing (used by reducedim.jl)
+function mapreduce_pairwise(f::F, op::G, A::AbstractArrayOrBroadcasted, init, inds) where {F, G}
+    n = length(inds)
+    n == 0 && return _mapreduce_start(f, op, A, init)
+
+    blocksize = pairwise_blocksize(f, op)
+
+    if n <= blocksize
+        # Choose kernel based on commutativity
+        if is_commutative_op(op, eltype(A))
+            return mapreduce_kernel_commutative(f, op, A, init, inds)
+        else
+            return mapreduce_kernel(f, op, A, init, inds)
+        end
+    end
+    return pairwise_reduce(f, op, A, init, inds, blocksize)
 end
 mapreduce_pairwise(f::F, op::G, itr, init) where {F, G} = mapreduce_pairwise(f, op, itr, init, IteratorSize(itr))
 function mapreduce_pairwise(f, op, itr, init, S::Union{HasLength, HasShape})
     n = length(itr)
     n == 0 && return _mapreduce_start(f, op, itr, init)
-    # Note that there can be a significant advantage to the for-loop lowering of mapfoldl
-    n <= pairwise_blocksize(f, op) && return mapreduce_kernel(f, op, itr, init, S, n)[1]
-    return mapreduce_pairwise(f, op, itr, init, S, n)[1]
+
+    blocksize = pairwise_blocksize(f, op)
+
+    if n <= blocksize
+        return mapfoldl_impl(f, op, init, itr)
+    end
+    return pairwise_reduce_iter(f, op, itr, init, S, n, blocksize)[1]
 end
-# There are three possible return values for partial reductions of SizeUnknown
-# No values -> return nothing
-# Some values, but ended -> return Some(value)
-# Some values, more to come -> return value, state
+# Maximum chunk size for SizeUnknown iterators to avoid pathological growth
+const MAX_CHUNK_SIZE = 1<<20  # Cap at 1M elements
+
+# Handle iterators with unknown length using progressive chunking with guards
 function mapreduce_pairwise(f::F, op::G, itr, init, S::IteratorSize) where {F, G}
-    n = pairwise_blocksize(f, op)
-    ret = mapreduce_kernel(f, op, itr, init, S, n)
+    blocksize = pairwise_blocksize(f, op)
+
+    ret = mapreduce_kernel(f, op, itr, init, S, blocksize)
+
     ret === nothing && return _mapreduce_start(f, op, itr, init)
     ret isa Some && return something(ret)
+
+    # Progressive chunking for iterators of unknown length
     v, s = ret
-    while n < prevpow(2, typemax(n))
+    n = blocksize
+
+    while n < min(MAX_CHUNK_SIZE, prevpow(2, typemax(n)))
         n <<= 1
-        ret = mapreduce_pairwise(f, op, itr, init, S, n, s)
-        ret === nothing && return v
-        ret isa Some && return op(v, something(ret))
-        v1, s = ret
-        v = op(v, v1)
+        ret = pairwise_reduce_iter_partial(f, op, itr, init, S, n, s)
+
+        if ret === nothing
+            return v
+        elseif ret isa Some
+            # Iterator exhausted, combine partial result and return
+            return op(v, something(ret))
+        else
+            v1, s = ret
+            v = op(v, v1)
+        end
     end
     return v
 end
 
-function mapreduce_pairwise(f::F, op::G, A, init, inds) where {F,G}
-    if length(inds) <= max(10, pairwise_blocksize(f, op))
-        return mapreduce_kernel(f, op, A, init, inds)
+# Pairwise reduction for iterators with known length
+function pairwise_reduce_iter(f::F, op::G, itr, init, S::Union{HasLength,HasShape}, n, blocksize, state...) where {F,G}
+    if n <= max(MIN_BLOCK, blocksize)
+        return mapreduce_kernel(f, op, itr, init, S, n, state...)
     else
-        p1, p2 = halves(inds)
-        v1 = mapreduce_pairwise(f, op, A, init, p1)
-        v2 = mapreduce_pairwise(f, op, A, init, p2)
-        return op(v1, v2)
+        ndiv2 = n >> 1
+        v1, s = pairwise_reduce_iter(f, op, itr, init, S, ndiv2, blocksize, state...)
+        v2, s = pairwise_reduce_iter(f, op, itr, init, S, n-ndiv2, blocksize, s)
+        return (op(v1, v2), s)
     end
 end
+
 function halves(inds)
     n = length(inds) >> 1
     return (inds[begin:begin+n-1], inds[begin+n:end])
@@ -537,32 +633,32 @@ _halves(::Tuple{}) = ()
 # This unconditionally re-indexes by begin:end to ensure type stability with the halving re-index
 _wholes(r) = r[begin:end], r[begin:end]
 
-function mapreduce_pairwise(f::F, op::G, itr, init, S::Union{HasLength,HasShape}, n, state...) where {F,G}
-    if n <= max(10, pairwise_blocksize(f, op))
+# Pairwise reduction for partial iteration (unknown length)
+function pairwise_reduce_iter_partial(f::F, op::G, itr, init, S::IteratorSize, n, state...) where {F,G}
+    blocksize = pairwise_blocksize(f, op)
+    if n <= max(MIN_BLOCK, blocksize)
         return mapreduce_kernel(f, op, itr, init, S, n, state...)
     else
         ndiv2 = n >> 1
-        v1, s = mapreduce_pairwise(f, op, itr, init, S, ndiv2, state...)
-        v2, s = mapreduce_pairwise(f, op, itr, init, S, n-ndiv2, s)
-        return (op(v1, v2), s)
-    end
-end
-function mapreduce_pairwise(f::F, op::G, itr, init, S::IteratorSize, n, state...) where {F,G}
-    if n <= max(10, pairwise_blocksize(f, op))
-        return mapreduce_kernel(f, op, itr, init, S, n, state...)
-    else
-        ndiv2 = n >> 1
-        ret = mapreduce_pairwise(f, op, itr, init, S, ndiv2, state...)
+        ret = pairwise_reduce_iter_partial(f, op, itr, init, S, ndiv2, state...)
         ret === nothing && return nothing
         ret isa Some && return ret
         v1, s = ret
-        ret = mapreduce_pairwise(f, op, itr, init, S, n-ndiv2, s)
+        ret = pairwise_reduce_iter_partial(f, op, itr, init, S, n-ndiv2, s)
         ret === nothing && return Some(v1)
         ret isa Some && return Some(op(v1, something(ret)))
         v2, s = ret
         return (op(v1, v2), s)
     end
 end
+
+# Removed unreachable mapreduce_kernel_unrolled with Int - called by nothing
+
+# Iterator versions will be defined in multidimensional.jl to avoid duplication
+
+# Note: Kernel dispatch is now handled inline at call sites using trait dispatch.
+# The mapreduce_kernel and mapreduce_kernel_commutative functions are called directly
+# based on compile-time operator traits, eliminating runtime strategy checks.
 
 """
     mapreduce_kernel(f, op, A, init, inds::AbstractArray) -> v
@@ -582,30 +678,59 @@ three (and a half) different mechanisms for accessing elements and structuring i
     tuple from the iterator or `nothing`
 """
 function mapreduce_kernel(f::F, op::G, A, init, inds::AbstractArray) where {F, G}
-    is_commutative_op(op) && return mapreduce_kernel_commutative(f, op, A, init, inds)
-    a1 = @inbounds A[inds[begin]]
+    is_commutative_op(op, eltype(A)) && return mapreduce_kernel_commutative(f, op, A, init, inds)
+    n = length(inds)
+    n == 0 && return _mapreduce_start(f, op, A, init)
+    i1, iEnd = firstindex(inds), lastindex(inds)
+    a1 = @inbounds A[inds[i1]]
     v = _mapreduce_start(f, op, A, init, a1)
-    length(inds) == 1 && return v
-    for i in inds[begin+1:end]
-        a = @inbounds A[i]
-        v = op(v, f(a))
+    n == 1 && return v
+
+    # Partial unrolling for non-commutative operations (4x unrolling)
+    # This provides some benefit without breaking order guarantees
+    if n >= 8
+        i = i1 + 1
+        while i + 3 <= iEnd
+            @nexprs 4 N->a_N = @inbounds A[inds[i+(N-1)]]
+            @nexprs 4 N->v = op(v, f(a_N))
+            i += 4
+        end
+        for i in i:iEnd
+            a = @inbounds A[inds[i]]
+            v = op(v, f(a))
+        end
+    else
+        for i in i1+1:iEnd
+            a = @inbounds A[inds[i]]
+            v = op(v, f(a))
+        end
     end
     return v
 end
 function mapreduce_kernel(f::F, op::G, itr, init, S::Union{HasLength, HasShape}, n, state...) where {F, G}
-    is_commutative_op(op) && return mapreduce_kernel_commutative(f, op, itr, init, S, n, state...)
+    # Check commutativity with element type if available
+    if IteratorEltype(itr) isa HasEltype
+        is_commutative_op(op, eltype(itr)) && return mapreduce_kernel_commutative(f, op, itr, init, S, n, state...)
+    else
+        is_commutative_op(op) && return mapreduce_kernel_commutative(f, op, itr, init, S, n, state...)
+    end
     a1, s = iterate(itr, state...)
     v = _mapreduce_start(f, op, itr, init, a1)
     for _ in 2:n
         it = iterate(itr, s)
-        it === nothing && return v, s # This will only happen if an iterator lied about its length
+        # it === nothing && return v, s # This will only happen if an iterator lied about its length
         a, s = it
         v = op(v, f(a))
     end
     return v, s
 end
 function mapreduce_kernel(f::F, op::G, itr, init, S::IteratorSize, n, state...) where {F, G}
-    is_commutative_op(op) && return mapreduce_kernel_commutative(f, op, itr, init, S, n, state...)
+    # Check commutativity with element type if available
+    if IteratorEltype(itr) isa HasEltype
+        is_commutative_op(op, eltype(itr)) && return mapreduce_kernel_commutative(f, op, itr, init, S, n, state...)
+    else
+        is_commutative_op(op) && return mapreduce_kernel_commutative(f, op, itr, init, S, n, state...)
+    end
     it = iterate(itr, state...)
     it === nothing && return nothing
     a1, s = it
@@ -1311,6 +1436,28 @@ for (fred, f) in ((maximum, max), (minimum, min), (sum, add_sum))
 end
 
 # Reduction kernels that explicitly encode simplistic SIMD-ish reorderings
+# Note: * and mul_prod are only commutative for numeric scalars, not matrices/quaternions
 const CommutativeOps = Union{typeof(+),typeof(Base.add_sum),typeof(min),typeof(max),typeof(Base._extrema_rf),typeof(|),typeof(&)}
 is_commutative_op(::CommutativeOps) = true
+
+# Trait for multiplication commutativity
+commutative_mul(::Type{T}) where {T} = T <: Union{Real,Complex}
+
+# Type-aware commutativity for multiplication
+is_commutative_op(::typeof(*), ::Type{T}) where {T} = commutative_mul(T)
+is_commutative_op(::typeof(Base.mul_prod), ::Type{T}) where {T} = commutative_mul(T)
+
+# Generic fallback for two-argument form
+is_commutative_op(op, ::Type) = is_commutative_op(op)
+
+# Default fallbacks
+is_commutative_op(::typeof(*)) = false  # Conservative default for *
+is_commutative_op(::typeof(Base.mul_prod)) = false  # Conservative default for mul_prod
 is_commutative_op(::Any) = false
+
+# Tuning parameter for blocking remainder lanes in dimensional reductions
+# Returns the number of remainder "lanes" to process together in a tile
+# to improve cache locality and reduce loop overhead
+reduce_tile_size(f, op, ::Type{T}) where {T} = (sizeof(T) ≤ 4 ? 16 : 8)
+reduce_tile_size(::typeof(abs2), ::typeof(Base.add_sum), ::Type{T}) where {T} =
+    (sizeof(T) ≤ 4 ? 32 : 16)
