@@ -125,7 +125,7 @@ identity_element(::typeof(|), ::Type{T}) where {T<:Integer} = zero(T)
 @inline function _mapreduce_seq_window(f, op, A, init, inds, lo::Int, hi::Int)
     @inbounds begin
         a1 = A[inds[lo]]
-        v  = _mapreduce_start(f, op, A, init, f(a1))
+        v  = _mapreduce_start(f, op, A, init, a1)
         for i in lo+1:hi
             v = op(v, f(A[inds[i]]))
         end
@@ -133,6 +133,7 @@ identity_element(::typeof(|), ::Type{T}) where {T<:Integer} = zero(T)
     return v
 end
 
+# Override the default mapreduce_pairwise to use windowed recursion (no allocations)
 function mapreduce_pairwise(f, op, A, init, inds)
     n = length(inds)
     n == 0 && return _mapreduce_start(f, op, A, init)
