@@ -135,8 +135,9 @@ end
 
 function mapreduce_pairwise(f, op, A, init, inds)
     n = length(inds)
+    n == 0 && return _mapreduce_start(f, op, A, init)
     return _mapreduce_pairwise_window(f, op, A, init, inds, firstindex(inds), lastindex(inds),
-                                      pairwise_blocksize(f, op))
+                                      Base.pairwise_blocksize(f, op))
 end
 
 function _mapreduce_pairwise_window(f, op, A, init, inds, lo::Int, hi::Int, bs::Int)
@@ -150,9 +151,6 @@ function _mapreduce_pairwise_window(f, op, A, init, inds, lo::Int, hi::Int, bs::
         return op(v1, v2)
     end
 end
-
-# Simple seq reduce used by pairwise base case (fallback for compatibility)
-mapreduce_seq(f, op, A, init, inds) = _mapreduce_seq_window(f, op, A, init, inds, firstindex(inds), lastindex(inds))
 
 # Helper: iterate remainder lanes without allocating
 @inline function _rest(iter)
