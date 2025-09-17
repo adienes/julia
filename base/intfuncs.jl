@@ -146,14 +146,26 @@ end
 gcd(a::Integer) = checked_abs(a)
 gcd(a::Rational) = checked_abs(a.num) // a.den
 lcm(a::Union{Integer,Rational}) = gcd(a)
-gcd(a::Unsigned, b::Signed) = gcd(promote(a, abs(b))...)
-gcd(a::Signed, b::Unsigned) = gcd(promote(abs(a), b)...)
 gcd(a::Real, b::Real) = gcd(promote(a,b)...)
 lcm(a::Real, b::Real) = lcm(promote(a,b)...)
 gcd(a::Real, b::Real, c::Real...) = gcd(a, gcd(b, c...))
 lcm(a::Real, b::Real, c::Real...) = lcm(a, lcm(b, c...))
 gcd(a::T, b::T) where T<:Real = throw(MethodError(gcd, (a,b)))
 lcm(a::T, b::T) where T<:Real = throw(MethodError(lcm, (a,b)))
+
+
+gcd(a::Unsigned, b::Signed) = gcd(promote(a, Base.uabs(b))...)
+gcd(a::Signed, b::Unsigned) = gcd(b, a)
+
+function gcdx(a::Signed, b::Unsigned)
+    d, u, v = gcdx(b, a)
+    (d, v, u)
+end
+
+function gcdx(a::Unsigned, b::Signed)
+    d, u, v = gcdx(promote(a, Base.uabs(b))...)
+    (d, u, flipsign(v, b))
+end
 
 gcd(abc::AbstractArray{<:Real}) = reduce(gcd, abc; init=zero(eltype(abc)))
 function lcm(abc::AbstractArray{<:Real})
@@ -228,8 +240,8 @@ Base.@assume_effects :terminates_locally function gcdx(a::Integer, b::Integer)
     s0, s1 = oneunit(T), zero(T)
     t0, t1 = s1, s0
     # The loop invariant is: s0*a0 + t0*b0 == a && s1*a0 + t1*b0 == b
-    x = a % T
-    y = b % T
+    x = T(a)
+    y = T(b)
     while y != 0
         q, r = divrem(x, y)
         x, y = y, r
@@ -292,8 +304,11 @@ function invmod(n::Integer, m::Integer)
         x += m
     end
     # The postcondition is: mod(result * n, m) == mod(T(1), m) && div(result, m) == 0
-    return mod(x, m)
+    return _bezout_to_mod(x, m)
 end
+
+_bezout_to_mod(x::Signed,   m::Integer) = mod(x, m)
+_bezout_to_mod(x::Unsigned, m::Integer) = mod(signed(x), m)
 
 """
     invmod(n::Integer, T) where {T <: Base.BitInteger}
