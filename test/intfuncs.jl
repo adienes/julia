@@ -358,24 +358,61 @@ end
 end
 
 @testset "powermod" begin
-    @test powermod(2, 3, 5) == 3
-    @test powermod(2, 3, -5) == -2
+    function _powermod_ref(x::Integer, p::Integer, m::Integer)
+        (m == 1 || m == -1) && return zero(m)
+        if p < 0
+            return _powermod_ref(invmod(x, m), -p, m)
+        elseif p == 0
+            return oftype(m, mod(1, m))
+        end
+        mb = BigInt(m)
+        xb = mod(BigInt(x), mb)
+        rb = BigInt(1)
+        pp = p
+        while true
+            if (pp & 1) != 0
+                rb = mod(rb * xb, mb)
+            end
+            pp >>= 1
+            pp == 0 && break
+            xb = mod(xb * xb, mb)
+        end
+        return oftype(m, mod(rb, mb))
+    end
 
-    @test powermod(2, 0, 5) == 1
-    @test powermod(2, 0, -5) == -4
+    Ts_signed   = (Int8, Int16, Int32, Int64, Int128)
+    Ts_unsigned = (UInt8, UInt16, UInt32, UInt64, UInt128)
+    Ts = (Ts_signed..., Ts_unsigned...)
 
-    @test powermod(2, -1, 5) == 3
-    @test powermod(2, -2, 5) == 4
-    @test powermod(2, -1, -5) == -2
-    @test powermod(2, -2, -5) == -1
+    T = UInt128
+    test_values = T[]
+    nbits = (sizeof(T) << 3)
+    append!(test_values, [-one(T), zero(T), one(T)])
+    append!(test_values, reduce(vcat, [
+        [T(1) << i, (T(1) << i) - 1, (T(1) << i) + 1]
+        for i in 1:4:nbits
+    ]))
 
-    @test powermod(2, typemin(Int128), 5) == 1
-    @test powermod(2, typemin(Int128), -5) == -4
+    function _do_test_block(N, T1, T2, T3)
+        _xt = test_values .% T1
+        _pt = test_values .% T2
+        _mt = test_values .% T3
+        for i in 1:N
+            x, p, m = rand(_xt), rand(_pt), rand(_mt)
+            if (m == 0) || (p < 0 && gcd(x, m) != 1)
+                @test_throws Exception powermod(x, p, m)
+            else
+                pm = powermod(x, p, m)
+                pmf = _powermod_ref(x, p, m)
+                @test pm == pmf
+                @test typeof(pm) == typeof(pmf)
+            end
+        end
+    end
 
-    @test powermod(2, big(3), 5) == 3
-    @test powermod(2, big(3), -5) == -2
-    @inferred  powermod(2, -2, -5)
-    @inferred  powermod(big(2), -2, UInt(5))
+    for _ in 1:2^4
+        _do_test_block(2^10, rand(Ts, 3)...)
+    end
 end
 
 @testset "nextpow/prevpow" begin
