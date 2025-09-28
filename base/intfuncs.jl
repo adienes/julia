@@ -554,7 +554,7 @@ end
 
 _powermod_mi_legal(::Integer) = false
 function _powermod_mi_legal(mm::T) where {T<:Unsigned}
-    return mm <= (typemax(T) >> (sizeof(T) << 2))
+    return Base.hastypemax(T) && (mm <= (typemax(T) >> (sizeof(T) << 2)))
 end
 
 # optimization: promote the modulus m to BigInt only once (cf. widemul in generic powermod above)
