@@ -218,9 +218,9 @@ end
     @test x*u + y*v == d
 
     for T in (Int8, Int16, Int32, Int64, Int128)
-        @test_throws OverflowError gcdx(typemin(T), typemin(T))
-        @test_throws OverflowError gcdx(typemin(T), T(0))
-        @test_throws OverflowError gcdx(T(0), typemin(T))
+        @test_throws DomainError gcdx(typemin(T), typemin(T))
+        @test_throws DomainError gcdx(typemin(T), T(0))
+        @test_throws DomainError gcdx(T(0), typemin(T))
         d, u, v = gcdx(typemin(T), T(-1))
         @test d == T(1)
         @test typemin(T) * u + T(-1) * v == T(1)
@@ -306,6 +306,12 @@ end
 
     # Verify issue described in PR 58010 is fixed
     @test invmod(UInt8(3), UInt16(50000)) === 0x411b
+
+    @test invmod(0x00000001, Int8(-128)) === Int32(-127)
+    @test invmod(0xffffffff, Int8(-38)) === Int32(-15)
+    @test invmod(Int8(-1), 0xffffffff) === 0xfffffffe
+    @test invmod(Int32(-1), typemin(Int64)) === Int64(-1)
+    @test invmod(0x3e81, Int16(-5716)) === Int16(-2407)
 
     for T in (Int8, UInt8)
         for x in typemin(T):typemax(T)
@@ -413,6 +419,13 @@ end
     for _ in 1:2^4
         _do_test_block(2^10, rand(Ts, 3)...)
     end
+    @test powermod(2, big(3), 5) == 3
+    @test powermod(2, big(3), -5) == -2
+    @inferred  powermod(2, -2, -5)
+    @inferred  powermod(big(2), -2, UInt(5))
+
+    @test powermod(-3, 0x80, 7) === 2
+    @test powermod(0x03, 0x80, 0x07) === 0x02
 end
 
 @testset "nextpow/prevpow" begin
