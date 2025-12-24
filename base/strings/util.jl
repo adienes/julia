@@ -1278,15 +1278,12 @@ function bytes2hex end
 
 function bytes2hex(itr)
     eltype(itr) === UInt8 || throw(ArgumentError("eltype of iterator not UInt8"))
-    str = Base._string_n(2*length(itr))
-    GC.@preserve str begin
-        b = Base.StringBuffer(pointer(str))
-        @inbounds for (i, x) in enumerate(itr)
-            b[2i - 1] = hex_chars[1 + x >> 4]
-            b[2i    ] = hex_chars[1 + x & 0xf]
-        end
+    b = Base.StringMemory(2*length(itr))
+    @inbounds for (i, x) in enumerate(itr)
+        b[2i - 1] = hex_chars[1 + x >> 4]
+        b[2i    ] = hex_chars[1 + x & 0xf]
     end
-    return str
+    return unsafe_takestring(b)
 end
 
 function bytes2hex(io::IO, itr)

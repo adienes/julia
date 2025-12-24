@@ -92,16 +92,13 @@ let groupings = [36:-1:25; 23:-1:20; 18:-1:15; 13:-1:10; 8:-1:1]
     global string
     function string(u::UUID)
         u = u.value
-        str = Base._string_n(36)
-        GC.@preserve str begin
-            a = Base.StringBuffer(pointer(str))
-            for i in groupings
-                @inbounds a[i] = hex_chars[1 + u & 0xf]
-                u >>= 4
-            end
-            @inbounds a[24] = a[19] = a[14] = a[9] = UInt8('-')
+        a = Base.StringMemory(36)
+        for i in groupings
+            @inbounds a[i] = hex_chars[1 + u & 0xf]
+            u >>= 4
         end
-        return str
+        @inbounds a[24] = a[19] = a[14] = a[9] = '-'
+        return unsafe_takestring(a)
     end
 end
 

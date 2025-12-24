@@ -766,17 +766,13 @@ function string(n::BigInt; base::Integer = 10, pad::Integer = 1)
     iszero(n) && pad < 1 && return ""
     nd1 = ndigits(n, base=base)
     nd  = max(nd1, pad)
-    str = Base._string_n(nd + isnegative(n))
-    GC.@preserve str begin
-        p = pointer(str)
-        MPZ.get_str!(p + nd - nd1, base, n)
-        buf = Base.StringBuffer(p)
-        @inbounds for i = (1:nd-nd1) .+ isnegative(n)
-            buf[i] = '0' % UInt8
-        end
-        isnegative(n) && (buf[1] = '-' % UInt8)
+    sv  = Base.StringMemory(nd + isnegative(n))
+    GC.@preserve sv MPZ.get_str!(pointer(sv) + nd - nd1, base, n)
+    @inbounds for i = (1:nd-nd1) .+ isnegative(n)
+        sv[i] = '0' % UInt8
     end
-    return str
+    isnegative(n) && (sv[1] = '-' % UInt8)
+    unsafe_takestring(sv)
 end
 
 function digits!(a::AbstractVector{T}, n::BigInt; base::Integer = 10) where {T<:Integer}
