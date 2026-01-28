@@ -2720,7 +2720,7 @@ end
 Scalar Replacement of Loads optimization pass.
 
 This pass optimizes the pattern `getfield(getfield(mutable_obj, :field), i)` where `:field`
-is an immutable aggregate (e.g., NTuple) stored in a mutable struct. Without this optimization,
+is an immutable Tuple (e.g., NTuple) stored in a mutable struct. Without this optimization,
 accessing such a field with a variable index causes a defensive memcpy because LLVM's SROA
 cannot scalarize stack copies indexed by runtime values.
 
@@ -2774,26 +2774,104 @@ function srol_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
         ismutabletype(field_type) && continue
         field_type <: Tuple || continue
 
+        # Must be a concrete DataType to access parameters
+        isa(field_type, DataType) || continue
+
+        # Check that tuple is homogeneous (all elements same type)
+        # Required because we use stride arithmetic: offset = (i-1) * elem_size
+        params = field_type.parameters
+        length(params) >= 1 || continue
+        first_param = params[1]
+        is_homogeneous = true
+        for j in 2:length(params)
+            if params[j] !== first_param
+                is_homogeneous = false
+                break
+            end
+        end
+        is_homogeneous || continue
+
         # Check if the outer getfield uses a variable (non-constant) index
         elem_idx_type = argextype(stmt.args[3], ir)
         isa(elem_idx_type, Const) && continue
         widenconst(elem_idx_type) <: Integer || continue
 
-        # Safety check: no mutations between inner_idx and idx
+        # CRITICAL: Only optimize if bounds checking is safe to skip.
+        # This is true when either:
+        # 1. @inbounds is used (boundscheck expression evaluates to false)
+        # 2. The compiler has proven the access can't throw (IR_FLAG_NOTHROW)
+        #
+        # Without one of these, we'd convert BoundsError into segfault/garbage read
+        boundscheck_safe = false
+
+        # Check if compiler proved this getfield can't throw (e.g., constant index)
+        if has_flag(ir[SSAValue(idx)], IR_FLAG_NOTHROW)
+            boundscheck_safe = true
+        end
+
+        # Check if @inbounds is used (boundscheck argument is false)
+        if !boundscheck_safe && length(stmt.args) >= 4
+            boundscheck_arg = stmt.args[4]
+            if isa(boundscheck_arg, SSAValue)
+                # Look up the :boundscheck expression
+                bc_stmt = ir[boundscheck_arg][:stmt]
+                if isexpr(bc_stmt, :boundscheck) && length(bc_stmt.args) >= 1
+                    # :boundscheck has false when @inbounds is used
+                    boundscheck_safe = bc_stmt.args[1] === false
+                end
+            elseif isa(boundscheck_arg, Bool)
+                boundscheck_safe = !boundscheck_arg
+            else
+                bc_type = argextype(boundscheck_arg, ir)
+                if isa(bc_type, Const)
+                    boundscheck_safe = bc_type.val === false
+                end
+            end
+        end
+
+        boundscheck_safe || continue
+
+        # Safety check: Both instructions must be in the same basic block, and there must
+        # be no potentially-mutating operations between them.
+        # This is conservative: any call or operation that could have side effects aborts.
+        # The reason: the original code takes a "snapshot" of the immutable tuple, but our
+        # optimization reads directly from the mutable struct's memory. If something could
+        # mutate the struct between the snapshot and the access, we'd read wrong data.
+
+        # First, verify both instructions are in the same basic block
+        # This ensures no control flow can intervene
+        inner_bb = block_for_inst(ir.cfg, inner_idx)
+        outer_bb = block_for_inst(ir.cfg, idx)
+        inner_bb == outer_bb || continue
+
         is_safe = true
         for check_idx in (inner_idx + 1):(idx - 1)
             check_inst = ir[SSAValue(check_idx)]
             check_stmt = check_inst[:stmt]
-            isa(check_stmt, Expr) || continue
 
-            # Check for setfield! on the same object
-            if is_known_call(check_stmt, setfield!, ir) && length(check_stmt.args) >= 2
-                setfield_obj = check_stmt.args[2]
-                if setfield_obj === obj_arg || (isa(setfield_obj, SSAValue) && isa(obj_arg, SSAValue) && setfield_obj.id == obj_arg.id)
-                    is_safe = false
-                    break
+            # Skip trivially safe statements
+            isa(check_stmt, GotoNode) && continue
+            isa(check_stmt, GotoIfNot) && continue
+            isa(check_stmt, ReturnNode) && continue
+            isa(check_stmt, Nothing) && continue
+            isa(check_stmt, GlobalRef) && continue
+            isa(check_stmt, QuoteNode) && continue
+            check_stmt isa Union{Int, Bool, Symbol} && continue
+
+            if isa(check_stmt, Expr)
+                # Allow pure getfield operations (reading other fields)
+                if is_known_call(check_stmt, getfield, ir)
+                    continue
+                end
+                # Allow effect-free operations that are marked nothrow
+                if has_flag(check_inst, IR_FLAG_EFFECT_FREE) && has_flag(check_inst, IR_FLAG_NOTHROW)
+                    continue
                 end
             end
+
+            # Any other instruction is potentially unsafe
+            is_safe = false
+            break
         end
         is_safe || continue
 
@@ -2801,7 +2879,8 @@ function srol_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
         elem_type = fieldtype(field_type, 1)
         field_offset = Int(fieldoffset(obj_typ_widened, field_idx))
         elem_size = Int(sizeof(elem_type))
-        elem_align = elem_size
+        # Use proper alignment instead of assuming alignment = size
+        elem_align = Int(Base.datatype_alignment(elem_type))
 
         transforms[idx] = (obj_arg, field_offset, elem_size, elem_align, elem_type)
     end
@@ -2815,7 +2894,20 @@ function srol_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
         if haskey(transforms, old_idx)
             (obj_arg, field_offset, elem_size, elem_align, elem_type) = transforms[old_idx]
 
+            # Rename obj_arg if it's an SSAValue from the original IR
+            # The compact's ssa_rename maps old indices to new ones
+            if isa(obj_arg, SSAValue)
+                renamed = compact.ssa_rename[obj_arg.id]
+                if isa(renamed, SSAValue)
+                    obj_arg = renamed
+                elseif isa(renamed, Int)
+                    obj_arg = SSAValue(renamed)
+                end
+                # If renamed is something else (like a constant), keep it as-is
+            end
+
             # Get the element index argument from the current statement
+            # (this is already renamed since it comes from the processed stmt)
             outer_stmt = stmt::Expr
             elem_idx_arg = outer_stmt.args[3]
 

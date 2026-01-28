@@ -2150,3 +2150,99 @@ let rf = (acc, x) -> ifelse(x > acc[1], (x,), (acc[1],))
     ir = first(only(Base.code_ircode(f_57827, (typeof(rf), Tuple{Float64}, Int64); optimize_until="CC: SROA")))
     @test ir isa Compiler.IRCode
 end
+
+# SRoL (Scalar Replacement of Loads) tests
+# ========================================
+# Test that pointerref_field optimization:
+# 1. Triggers when @inbounds is used
+# 2. Triggers when IR_FLAG_NOTHROW is set (compiler proved bounds safe)
+# 3. Preserves bounds checking otherwise
+
+mutable struct SRoLTestHolder
+    data::NTuple{4, Float64}
+end
+
+# Helper to check if IR contains pointerref_field
+function has_pointerref_field_intrinsic(@nospecialize(f), @nospecialize(argtypes))
+    ir, _ = only(Base.code_ircode(f, argtypes))
+    ir_str = sprint(show, ir)
+    return occursin("pointerref_field", ir_str)
+end
+
+# Helper to check if outer getfield has IR_FLAG_NOTHROW
+function outer_getfield_is_nothrow(@nospecialize(f), @nospecialize(argtypes))
+    ir, _ = only(Base.code_ircode(f, argtypes))
+    for i in 1:length(ir.stmts)
+        stmt = ir.stmts[i][:stmt]
+        if stmt isa Expr && Compiler.is_known_call(stmt, Core.getfield, ir)
+            # Check if this is the outer getfield (accesses a tuple, not :data field)
+            if length(stmt.args) >= 3
+                val_arg = stmt.args[2]
+                if val_arg isa Core.SSAValue
+                    inner_stmt = ir.stmts[val_arg.id][:stmt]
+                    if inner_stmt isa Expr && Compiler.is_known_call(inner_stmt, Core.getfield, ir)
+                        # This is the outer getfield - check nothrow flag
+                        return Compiler.has_flag(ir.stmts[i], Compiler.IR_FLAG_NOTHROW)
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+# @inbounds version SHOULD be optimized (has pointerref_field)
+@inline function srol_get_with_inbounds(h::SRoLTestHolder, i)
+    @inbounds h.data[i]
+end
+
+# Non-@inbounds version should NOT be optimized (preserves bounds check)
+@inline function srol_get_without_inbounds(h::SRoLTestHolder, i)
+    h.data[i]
+end
+
+let h = SRoLTestHolder((1.0, 2.0, 3.0, 4.0))
+    # Test that @inbounds version is optimized
+    @test has_pointerref_field_intrinsic(srol_get_with_inbounds, Tuple{SRoLTestHolder, Int})
+
+    # Test that non-@inbounds version preserves bounds checking
+    @test !has_pointerref_field_intrinsic(srol_get_without_inbounds, Tuple{SRoLTestHolder, Int})
+
+    # Verify that non-@inbounds is NOT marked nothrow (compiler can't prove safety)
+    # This confirms the IR_FLAG_NOTHROW path isn't incorrectly triggering
+    @test !outer_getfield_is_nothrow(srol_get_without_inbounds, Tuple{SRoLTestHolder, Int})
+
+    # Test that out-of-bounds access throws BoundsError (not segfault)
+    @test_throws BoundsError srol_get_without_inbounds(h, 100)
+
+    # Test correct values are returned
+    for i in 1:4
+        @test srol_get_with_inbounds(h, i) == Float64(i)
+        @test srol_get_without_inbounds(h, i) == Float64(i)
+    end
+end
+
+# Test: IR_FLAG_NOTHROW path (future-proofing)
+# Currently, the Julia compiler doesn't mark variable-index tuple access as nothrow
+# even after explicit bounds checks. This test documents the current behavior and
+# ensures the IR_FLAG_NOTHROW code path exists for future compiler improvements.
+@inline function srol_after_boundscheck(h::SRoLTestHolder, i)
+    # Even with explicit bounds check, compiler currently doesn't prove nothrow
+    if 1 <= i <= 4
+        h.data[i]
+    else
+        0.0
+    end
+end
+
+let h = SRoLTestHolder((1.0, 2.0, 3.0, 4.0))
+    # Currently this is NOT optimized because compiler doesn't prove nothrow
+    # If/when the compiler improves, this test may need updating
+    @test !has_pointerref_field_intrinsic(srol_after_boundscheck, Tuple{SRoLTestHolder, Int})
+
+    # But it should still return correct values
+    for i in 1:4
+        @test srol_after_boundscheck(h, i) == Float64(i)
+    end
+    @test srol_after_boundscheck(h, 100) == 0.0
+end
