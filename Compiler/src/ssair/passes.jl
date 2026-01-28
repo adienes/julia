@@ -2713,3 +2713,120 @@ function cfg_simplify!(ir::IRCode)
     compact.active_result_bb = length(bb_starts)
     return finish(compact)
 end
+
+"""
+    srol_pass!(ir::IRCode, inlining) -> newir::IRCode
+
+Scalar Replacement of Loads optimization pass.
+
+This pass optimizes the pattern `getfield(getfield(mutable_obj, :field), i)` where `:field`
+is an immutable aggregate (e.g., NTuple) stored in a mutable struct. Without this optimization,
+accessing such a field with a variable index causes a defensive memcpy because LLVM's SROA
+cannot scalarize stack copies indexed by runtime values.
+
+The pass fuses the load + index into a direct pointer read using `Core.Intrinsics.pointerref_field`,
+which generates a GEP + Load in LLVM without the intermediate copy.
+
+Placement: After inlining (to expose wrapper calls) and before SROA.
+"""
+function srol_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
+    # Store all transformation data upfront: outer_idx => (obj_arg, field_offset, elem_size, elem_align, elem_type)
+    transforms = IdDict{Int, Tuple{Any, Int, Int, Int, Any}}()
+
+    # Phase 1: Find and validate candidate patterns
+    for idx in 1:length(ir.stmts)
+        stmt = ir[SSAValue(idx)][:stmt]
+        isa(stmt, Expr) || continue
+        isexpr(stmt, :call) || continue
+        is_known_call(stmt, getfield, ir) || continue
+        length(stmt.args) >= 3 || continue
+
+        val_arg = stmt.args[2]
+        isa(val_arg, SSAValue) || continue
+
+        inner_idx = val_arg.id
+        inner_inst = ir[SSAValue(inner_idx)]
+        inner_stmt = inner_inst[:stmt]
+        isa(inner_stmt, Expr) || continue
+        is_known_call(inner_stmt, getfield, ir) || continue
+        length(inner_stmt.args) >= 3 || continue
+
+        # inner_stmt is: getfield(obj, :field)
+        obj_arg = inner_stmt.args[2]
+        field_arg = inner_stmt.args[3]
+
+        # Get the type of the object being accessed
+        obj_type = argextype(obj_arg, ir)
+        obj_typ_widened = widenconst(obj_type)
+        isa(obj_typ_widened, DataType) || continue
+        ismutabletype(obj_typ_widened) || continue
+
+        # Get the field and check if it's an immutable aggregate
+        field = try_compute_field(ir, field_arg)
+        field === nothing && continue
+        field_idx = try_compute_fieldidx(obj_typ_widened, field)
+        field_idx === nothing && continue
+
+        field_type = fieldtype(obj_typ_widened, field_idx)
+
+        # Check if the field is an immutable, inlined value type (like NTuple)
+        isbitstype(field_type) || continue
+        ismutabletype(field_type) && continue
+        field_type <: Tuple || continue
+
+        # Check if the outer getfield uses a variable (non-constant) index
+        elem_idx_type = argextype(stmt.args[3], ir)
+        isa(elem_idx_type, Const) && continue
+        widenconst(elem_idx_type) <: Integer || continue
+
+        # Safety check: no mutations between inner_idx and idx
+        is_safe = true
+        for check_idx in (inner_idx + 1):(idx - 1)
+            check_inst = ir[SSAValue(check_idx)]
+            check_stmt = check_inst[:stmt]
+            isa(check_stmt, Expr) || continue
+
+            # Check for setfield! on the same object
+            if is_known_call(check_stmt, setfield!, ir) && length(check_stmt.args) >= 2
+                setfield_obj = check_stmt.args[2]
+                if setfield_obj === obj_arg || (isa(setfield_obj, SSAValue) && isa(obj_arg, SSAValue) && setfield_obj.id == obj_arg.id)
+                    is_safe = false
+                    break
+                end
+            end
+        end
+        is_safe || continue
+
+        # Compute all transformation data upfront
+        elem_type = fieldtype(field_type, 1)
+        field_offset = Int(fieldoffset(obj_typ_widened, field_idx))
+        elem_size = Int(sizeof(elem_type))
+        elem_align = elem_size
+
+        transforms[idx] = (obj_arg, field_offset, elem_size, elem_align, elem_type)
+    end
+
+    isempty(transforms) && return ir
+
+    # Phase 2: Apply transformations using IncrementalCompact
+    compact = IncrementalCompact(ir)
+
+    for ((old_idx, idx), stmt) in compact
+        if haskey(transforms, old_idx)
+            (obj_arg, field_offset, elem_size, elem_align, elem_type) = transforms[old_idx]
+
+            # Get the element index argument from the current statement
+            outer_stmt = stmt::Expr
+            elem_idx_arg = outer_stmt.args[3]
+
+            # Create the pointerref_field intrinsic call
+            new_call = Expr(:call, Core.Intrinsics.pointerref_field,
+                           obj_arg, field_offset, elem_size, elem_idx_arg, elem_align, elem_type)
+
+            compact[SSAValue(idx)] = new_call
+            compact[SSAValue(idx)][:type] = elem_type
+        end
+    end
+
+    return finish(compact)
+end

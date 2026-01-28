@@ -360,6 +360,7 @@
     XX(jl_pchar_to_string) \
     XX(jl_pointerref) \
     XX(jl_pointerset) \
+    XX(jl_pointerref_field) \
     XX(jl_pop_handler) \
     XX(jl_pop_handler_noexcept) \
     XX(jl_preload_sysimg) \

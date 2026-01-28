@@ -1060,6 +1060,7 @@ function run_passes_ipo_safe(
     @pass "CC: INLINING"  ir = ssa_inlining_pass!(ir, sv.inlining, ci.propagate_inbounds)
     # @zone "CC: VERIFY 2" verify_ir(ir)
     @pass "CC: COMPACT_2" ir = compact!(ir)
+    @pass "CC: SROL"      ir = srol_pass!(ir, sv.inlining)
     @pass "CC: SROA"      ir = sroa_pass!(ir, sv.inlining)
     @pass "CC: ADCE"      (ir, made_changes) = adce_pass!(ir, sv.inlining)
     if made_changes
