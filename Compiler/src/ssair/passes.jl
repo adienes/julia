@@ -2917,6 +2917,13 @@ function srol_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
 
             compact[SSAValue(idx)] = new_call
             compact[SSAValue(idx)][:type] = elem_type
+            # Set appropriate flags for the intrinsic:
+            # - Not consistent: reads from mutable memory (could see different values)
+            # - Effect-free: doesn't modify external state
+            # - Nothrow: we've verified bounds are safe (@inbounds or compiler-proven)
+            # - Terminates: simple memory read
+            # - No UB: the access is within bounds (verified above)
+            compact[SSAValue(idx)][:flag] = IR_FLAG_EFFECT_FREE | IR_FLAG_NOTHROW | IR_FLAG_TERMINATES | IR_FLAG_NOUB
         end
     end
 
