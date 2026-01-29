@@ -2765,7 +2765,7 @@ function srol_pass!(ir::IRCode, ::Union{Nothing,InliningState}=nothing)
         # Check if the outer getfield uses a variable (non-constant) index
         elem_idx_type = argextype(stmt.args[3], ir)
         isa(elem_idx_type, Const) && continue
-        widenconst(elem_idx_type) <: Integer || continue
+        widenconst(elem_idx_type) === Int || continue
 
         # Walk backwards through getfield chain to find mutable root
         # This handles both direct tuples and tuples wrapped in isbits structs

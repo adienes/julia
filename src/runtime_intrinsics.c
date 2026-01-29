@@ -463,6 +463,9 @@ JL_DLLEXPORT jl_value_t *jl_pointerref_field(jl_value_t *obj, jl_value_t *field_
     JL_TYPECHK(pointerref_field, long, idx);
     JL_TYPECHK(pointerref_field, long, align);
     JL_TYPECHK(pointerref_field, datatype, elem_type);
+    // Note: The compiler pass (srol_pass!) only emits this intrinsic for isbitstype
+    // element types, so jl_new_bits is safe here. Manual calls with pointer-containing
+    // types would be unsafe but are not a supported use case.
 
     size_t field_offset = jl_unbox_long(field_offset_v);
     size_t elem_size = jl_unbox_long(elem_size_v);
