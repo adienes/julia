@@ -2729,13 +2729,13 @@ which generates a GEP + Load in LLVM without the intermediate copy.
 
 Placement: After inlining (to expose wrapper calls) and before SROA.
 """
-function srol_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
-    # Store all transformation data upfront: outer_idx => (obj_arg, field_offset, elem_size, elem_align, elem_type)
-    transforms = IdDict{Int, Tuple{Any, Int, Int, Int, Any}}()
+function srol_pass!(ir::IRCode, ::Union{Nothing,InliningState}=nothing)
+    # Transformation data: outer_idx => (obj_arg, field_offset, elem_size, elem_align, elem_type, is_noub)
+    transforms = IdDict{Int, Tuple{Any, Int, Int, Int, Any, Bool}}()
 
-    # Phase 1: Find and validate candidate patterns
     for idx in 1:length(ir.stmts)
-        stmt = ir[SSAValue(idx)][:stmt]
+        inst = ir[SSAValue(idx)]
+        stmt = inst[:stmt]
         isa(stmt, Expr) || continue
         isexpr(stmt, :call) || continue
         is_known_call(stmt, getfield, ir) || continue
@@ -2782,64 +2782,34 @@ function srol_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
         params = field_type.parameters
         length(params) >= 1 || continue
         first_param = params[1]
-        is_homogeneous = true
-        for j in 2:length(params)
-            if params[j] !== first_param
-                is_homogeneous = false
-                break
-            end
-        end
-        is_homogeneous || continue
+        all(==(first_param), params) || continue
 
         # Check if the outer getfield uses a variable (non-constant) index
         elem_idx_type = argextype(stmt.args[3], ir)
         isa(elem_idx_type, Const) && continue
         widenconst(elem_idx_type) <: Integer || continue
 
-        # CRITICAL: Only optimize if bounds checking is safe to skip.
-        # This is true when either:
-        # 1. @inbounds is used (boundscheck expression evaluates to false)
-        # 2. The compiler has proven the access can't throw (IR_FLAG_NOTHROW)
-        #
-        # Without one of these, we'd convert BoundsError into segfault/garbage read
-        boundscheck_safe = false
-
-        # Check if compiler proved this getfield can't throw (e.g., constant index)
-        if has_flag(ir[SSAValue(idx)], IR_FLAG_NOTHROW)
-            boundscheck_safe = true
-        end
-
-        # Check if @inbounds is used (boundscheck argument is false)
-        if !boundscheck_safe && length(stmt.args) >= 4
-            boundscheck_arg = stmt.args[4]
-            if isa(boundscheck_arg, SSAValue)
-                # Look up the :boundscheck expression
-                bc_stmt = ir[boundscheck_arg][:stmt]
-                if isexpr(bc_stmt, :boundscheck) && length(bc_stmt.args) >= 1
-                    # :boundscheck has false when @inbounds is used
-                    boundscheck_safe = bc_stmt.args[1] === false
-                end
-            elseif isa(boundscheck_arg, Bool)
-                boundscheck_safe = !boundscheck_arg
-            else
-                bc_type = argextype(boundscheck_arg, ir)
-                if isa(bc_type, Const)
-                    boundscheck_safe = bc_type.val === false
+        # Only optimize if bounds checking is disabled:
+        # 1. Compiler proved nothrow → set IR_FLAG_NOUB (proven safe)
+        # 2. @inbounds disables boundscheck → don't set IR_FLAG_NOUB (user assertion)
+        compiler_proven_nothrow = has_flag(inst, IR_FLAG_NOTHROW)
+        inbounds_disabled = false
+        if !compiler_proven_nothrow && length(stmt.args) >= 4
+            bc_arg = stmt.args[4]
+            if isa(bc_arg, SSAValue)
+                bc_stmt = ir[bc_arg][:stmt]
+                if isexpr(bc_stmt, :boundscheck)
+                    inbounds_disabled = !isempty(bc_stmt.args) && bc_stmt.args[1] === false
                 end
             end
         end
-
-        boundscheck_safe || continue
+        (compiler_proven_nothrow || inbounds_disabled) || continue
 
         # Safety check: Both instructions must be in the same basic block, and there must
         # be no potentially-mutating operations between them.
-        # This is conservative: any call or operation that could have side effects aborts.
-        # The reason: the original code takes a "snapshot" of the immutable tuple, but our
-        # optimization reads directly from the mutable struct's memory. If something could
-        # mutate the struct between the snapshot and the access, we'd read wrong data.
-
-        # First, verify both instructions are in the same basic block
-        # This ensures no control flow can intervene
+        # The original code takes a "snapshot" of the immutable tuple, but our optimization
+        # reads directly from the mutable struct's memory. If something could mutate the
+        # struct between the snapshot and the access, we'd read wrong data.
         inner_bb = block_for_inst(ir.cfg, inner_idx)
         outer_bb = block_for_inst(ir.cfg, idx)
         inner_bb == outer_bb || continue
@@ -2850,80 +2820,72 @@ function srol_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
             check_stmt = check_inst[:stmt]
 
             # Skip trivially safe statements
-            isa(check_stmt, GotoNode) && continue
-            isa(check_stmt, GotoIfNot) && continue
-            isa(check_stmt, ReturnNode) && continue
-            isa(check_stmt, Nothing) && continue
-            isa(check_stmt, GlobalRef) && continue
-            isa(check_stmt, QuoteNode) && continue
-            check_stmt isa Union{Int, Bool, Symbol} && continue
+            check_stmt isa Union{Nothing, GotoNode, GotoIfNot, ReturnNode,
+                                 GlobalRef, QuoteNode, Int, Bool, Symbol} && continue
 
             if isa(check_stmt, Expr)
-                # Allow pure getfield operations (reading other fields)
-                if is_known_call(check_stmt, getfield, ir)
-                    continue
-                end
-                # Allow effect-free operations that are marked nothrow
+                # Allow pure getfield operations (reading doesn't mutate)
+                is_known_call(check_stmt, getfield, ir) && continue
+                # Allow effect-free + nothrow operations (can't mutate anything)
                 if has_flag(check_inst, IR_FLAG_EFFECT_FREE) && has_flag(check_inst, IR_FLAG_NOTHROW)
                     continue
                 end
             end
 
-            # Any other instruction is potentially unsafe
             is_safe = false
             break
         end
         is_safe || continue
 
-        # Compute all transformation data upfront
+        # Compute transformation data
         elem_type = fieldtype(field_type, 1)
         field_offset = Int(fieldoffset(obj_typ_widened, field_idx))
         elem_size = Int(sizeof(elem_type))
-        # Use proper alignment instead of assuming alignment = size
         elem_align = Int(Base.datatype_alignment(elem_type))
 
-        transforms[idx] = (obj_arg, field_offset, elem_size, elem_align, elem_type)
+        # Only set NOUB if compiler proved bounds safety (not just @inbounds)
+        is_noub = compiler_proven_nothrow
+
+        transforms[idx] = (obj_arg, field_offset, elem_size, elem_align, elem_type, is_noub)
     end
 
     isempty(transforms) && return ir
 
-    # Phase 2: Apply transformations using IncrementalCompact
+    # Apply transformations using IncrementalCompact
     compact = IncrementalCompact(ir)
 
     for ((old_idx, idx), stmt) in compact
         if haskey(transforms, old_idx)
-            (obj_arg, field_offset, elem_size, elem_align, elem_type) = transforms[old_idx]
+            (obj_arg, field_offset, elem_size, elem_align, elem_type, is_noub) = transforms[old_idx]
 
-            # Rename obj_arg if it's an SSAValue from the original IR
-            # The compact's ssa_rename maps old indices to new ones
+            # Rename SSAValue arguments through compact's rename table
             if isa(obj_arg, SSAValue)
-                renamed = compact.ssa_rename[obj_arg.id]
-                if isa(renamed, SSAValue)
-                    obj_arg = renamed
-                elseif isa(renamed, Int)
-                    obj_arg = SSAValue(renamed)
+                obj_arg = compact.ssa_rename[obj_arg.id]
+                if isa(obj_arg, Refined)
+                    obj_arg = obj_arg.val
                 end
-                # If renamed is something else (like a constant), keep it as-is
             end
 
-            # Get the element index argument from the current statement
-            # (this is already renamed since it comes from the processed stmt)
+            # Get the element index from the (already renamed) statement
             outer_stmt = stmt::Expr
             elem_idx_arg = outer_stmt.args[3]
 
-            # Create the pointerref_field intrinsic call
             new_call = Expr(:call, Core.Intrinsics.pointerref_field,
                            obj_arg, field_offset, elem_size, elem_idx_arg, elem_align, elem_type)
 
             compact[SSAValue(idx)] = new_call
             compact[SSAValue(idx)][:type] = elem_type
-            # Set appropriate flags for the intrinsic:
-            # - Not consistent: reads from mutable memory (could see different values)
-            # - Effect-free: doesn't modify external state
-            # - Nothrow: we've verified bounds are safe (@inbounds or compiler-proven)
-            # - Terminates: simple memory read
-            # - No UB: the access is within bounds (verified above)
-            compact[SSAValue(idx)][:flag] = IR_FLAG_EFFECT_FREE | IR_FLAG_NOTHROW | IR_FLAG_TERMINATES | IR_FLAG_NOUB
+
+            # Set flags:
+            # - EFFECT_FREE: doesn't modify external state
+            # - NOTHROW: we've verified bounds are safe
+            # - TERMINATES: simple memory read
+            # - NOUB: only if compiler proved bounds (not just @inbounds assertion)
+            flag = IR_FLAG_EFFECT_FREE | IR_FLAG_NOTHROW | IR_FLAG_TERMINATES
+            if is_noub
+                flag |= IR_FLAG_NOUB
+            end
+            compact[SSAValue(idx)][:flag] = flag
         end
     end
 

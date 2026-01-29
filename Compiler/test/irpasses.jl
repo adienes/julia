@@ -2157,9 +2157,15 @@ end
 # 1. Triggers when @inbounds is used
 # 2. Triggers when IR_FLAG_NOTHROW is set (compiler proved bounds safe)
 # 3. Preserves bounds checking otherwise
+# 4. Sets IR_FLAG_NOUB correctly (only for compiler-proven, not @inbounds)
 
 mutable struct SRoLTestHolder
     data::NTuple{4, Float64}
+end
+
+# Heterogeneous tuple - should NOT be optimized
+mutable struct SRoLHeterogeneousHolder
+    data::Tuple{Int, Float64, Int, Float64}
 end
 
 # Helper to check if IR contains pointerref_field
@@ -2169,19 +2175,32 @@ function has_pointerref_field_intrinsic(@nospecialize(f), @nospecialize(argtypes
     return occursin("pointerref_field", ir_str)
 end
 
+# Helper to check flags on pointerref_field calls
+function get_pointerref_field_flags(@nospecialize(f), @nospecialize(argtypes))
+    ir, _ = only(Base.code_ircode(f, argtypes))
+    for i in 1:length(ir.stmts)
+        stmt = ir.stmts[i][:stmt]
+        if stmt isa Expr && stmt.head === :call && length(stmt.args) >= 1
+            callee = stmt.args[1]
+            if callee === Core.Intrinsics.pointerref_field
+                return ir.stmts[i][:flag]
+            end
+        end
+    end
+    return nothing
+end
+
 # Helper to check if outer getfield has IR_FLAG_NOTHROW
 function outer_getfield_is_nothrow(@nospecialize(f), @nospecialize(argtypes))
     ir, _ = only(Base.code_ircode(f, argtypes))
     for i in 1:length(ir.stmts)
         stmt = ir.stmts[i][:stmt]
         if stmt isa Expr && Compiler.is_known_call(stmt, Core.getfield, ir)
-            # Check if this is the outer getfield (accesses a tuple, not :data field)
             if length(stmt.args) >= 3
                 val_arg = stmt.args[2]
                 if val_arg isa Core.SSAValue
                     inner_stmt = ir.stmts[val_arg.id][:stmt]
                     if inner_stmt isa Expr && Compiler.is_known_call(inner_stmt, Core.getfield, ir)
-                        # This is the outer getfield - check nothrow flag
                         return Compiler.has_flag(ir.stmts[i], Compiler.IR_FLAG_NOTHROW)
                     end
                 end
@@ -2209,7 +2228,6 @@ let h = SRoLTestHolder((1.0, 2.0, 3.0, 4.0))
     @test !has_pointerref_field_intrinsic(srol_get_without_inbounds, Tuple{SRoLTestHolder, Int})
 
     # Verify that non-@inbounds is NOT marked nothrow (compiler can't prove safety)
-    # This confirms the IR_FLAG_NOTHROW path isn't incorrectly triggering
     @test !outer_getfield_is_nothrow(srol_get_without_inbounds, Tuple{SRoLTestHolder, Int})
 
     # Test that out-of-bounds access throws BoundsError (not segfault)
@@ -2222,12 +2240,45 @@ let h = SRoLTestHolder((1.0, 2.0, 3.0, 4.0))
     end
 end
 
+# Test: IR_FLAG_NOUB is NOT set for @inbounds (user assertion, could still be UB)
+let flags = get_pointerref_field_flags(srol_get_with_inbounds, Tuple{SRoLTestHolder, Int})
+    @test flags !== nothing
+    # Should have EFFECT_FREE, NOTHROW, TERMINATES but NOT NOUB
+    @test Compiler.has_flag(flags, Compiler.IR_FLAG_EFFECT_FREE)
+    @test Compiler.has_flag(flags, Compiler.IR_FLAG_NOTHROW)
+    @test Compiler.has_flag(flags, Compiler.IR_FLAG_TERMINATES)
+    # NOUB should NOT be set for @inbounds - the user asserted safety but it could be wrong
+    @test !Compiler.has_flag(flags, Compiler.IR_FLAG_NOUB)
+end
+
+# Test: Heterogeneous tuples should NOT be optimized (stride arithmetic won't work)
+@inline function srol_get_heterogeneous(h::SRoLHeterogeneousHolder, i)
+    @inbounds h.data[i]
+end
+
+let h = SRoLHeterogeneousHolder((1, 2.0, 3, 4.0))
+    # Should NOT be optimized - tuple elements have different types/sizes
+    @test !has_pointerref_field_intrinsic(srol_get_heterogeneous, Tuple{SRoLHeterogeneousHolder, Int})
+    # But should still return correct values
+    @test srol_get_heterogeneous(h, 1) === 1
+    @test srol_get_heterogeneous(h, 2) === 2.0
+end
+
+# Test: Multiple SROL candidates in same function
+@inline function srol_multiple_accesses(h::SRoLTestHolder, i, j)
+    @inbounds h.data[i] + h.data[j]
+end
+
+let h = SRoLTestHolder((1.0, 2.0, 3.0, 4.0))
+    @test has_pointerref_field_intrinsic(srol_multiple_accesses, Tuple{SRoLTestHolder, Int, Int})
+    @test srol_multiple_accesses(h, 1, 4) == 5.0
+end
+
 # Test: IR_FLAG_NOTHROW path (future-proofing)
 # Currently, the Julia compiler doesn't mark variable-index tuple access as nothrow
 # even after explicit bounds checks. This test documents the current behavior and
 # ensures the IR_FLAG_NOTHROW code path exists for future compiler improvements.
 @inline function srol_after_boundscheck(h::SRoLTestHolder, i)
-    # Even with explicit bounds check, compiler currently doesn't prove nothrow
     if 1 <= i <= 4
         h.data[i]
     else
@@ -2240,7 +2291,6 @@ let h = SRoLTestHolder((1.0, 2.0, 3.0, 4.0))
     # If/when the compiler improves, this test may need updating
     @test !has_pointerref_field_intrinsic(srol_after_boundscheck, Tuple{SRoLTestHolder, Int})
 
-    # But it should still return correct values
     for i in 1:4
         @test srol_after_boundscheck(h, i) == Float64(i)
     end
