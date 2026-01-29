@@ -2296,3 +2296,62 @@ let h = SRoLTestHolder((1.0, 2.0, 3.0, 4.0))
     end
     @test srol_after_boundscheck(h, 100) == 0.0
 end
+
+# The optimization should handle tuples wrapped in isbits structs
+struct SRoLSVector{N, T}
+    data::NTuple{N, T}
+end
+Base.@propagate_inbounds Base.getindex(v::SRoLSVector, i::Int) = v.data[i]
+
+mutable struct SRoLWrappedHolder
+    vec::SRoLSVector{4, Float64}
+end
+
+# Nested wrapper (two levels of isbits wrapping)
+struct SRoLInnerWrapper{N, T}
+    data::NTuple{N, T}
+end
+struct SRoLOuterWrapper{N, T}
+    inner::SRoLInnerWrapper{N, T}
+end
+Base.@propagate_inbounds Base.getindex(w::SRoLOuterWrapper, i::Int) = w.inner.data[i]
+
+mutable struct SRoLNestedHolder
+    wrapper::SRoLOuterWrapper{4, Float64}
+end
+
+@inline function srol_wrapped_inbounds(h::SRoLWrappedHolder, i)
+    @inbounds h.vec[i]
+end
+
+@inline function srol_wrapped_no_inbounds(h::SRoLWrappedHolder, i)
+    h.vec[i]
+end
+
+@inline function srol_nested_inbounds(h::SRoLNestedHolder, i)
+    @inbounds h.wrapper[i]
+end
+
+let h = SRoLWrappedHolder(SRoLSVector((1.0, 2.0, 3.0, 4.0)))
+    # Test that wrapped pattern with @inbounds is optimized
+    @test has_pointerref_field_intrinsic(srol_wrapped_inbounds, Tuple{SRoLWrappedHolder, Int})
+
+    # Test that wrapped pattern without @inbounds preserves bounds check
+    @test !has_pointerref_field_intrinsic(srol_wrapped_no_inbounds, Tuple{SRoLWrappedHolder, Int})
+
+    # Test correct values
+    for i in 1:4
+        @test srol_wrapped_inbounds(h, i) == Float64(i)
+        @test srol_wrapped_no_inbounds(h, i) == Float64(i)
+    end
+end
+
+let h = SRoLNestedHolder(SRoLOuterWrapper(SRoLInnerWrapper((1.0, 2.0, 3.0, 4.0))))
+    # Test that nested wrapped pattern with @inbounds is optimized
+    @test has_pointerref_field_intrinsic(srol_nested_inbounds, Tuple{SRoLNestedHolder, Int})
+
+    # Test correct values
+    for i in 1:4
+        @test srol_nested_inbounds(h, i) == Float64(i)
+    end
+end

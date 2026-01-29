@@ -2719,10 +2719,14 @@ end
 
 Scalar Replacement of Loads optimization pass.
 
-This pass optimizes the pattern `getfield(getfield(mutable_obj, :field), i)` where `:field`
-is an immutable Tuple (e.g., NTuple) stored in a mutable struct. Without this optimization,
-accessing such a field with a variable index causes a defensive memcpy because LLVM's SROA
-cannot scalarize stack copies indexed by runtime values.
+This pass optimizes variable-indexed access to homogeneous tuples stored in mutable structs.
+It handles both direct tuples and tuples wrapped in isbits structs (e.g., StaticArrays):
+
+  Direct:  `getfield(getfield(mutable, :tuple_field), i)`
+  Wrapped: `getfield(getfield(getfield(mutable, :wrapper), :data), i)`
+
+Without this optimization, accessing such fields with a variable index causes a defensive
+memcpy because LLVM's SROA cannot scalarize stack copies indexed by runtime values.
 
 The pass fuses the load + index into a direct pointer read using `Core.Intrinsics.pointerref_field`,
 which generates a GEP + Load in LLVM without the intermediate copy.
@@ -2741,45 +2745,19 @@ function srol_pass!(ir::IRCode, ::Union{Nothing,InliningState}=nothing)
         is_known_call(stmt, getfield, ir) || continue
         length(stmt.args) >= 3 || continue
 
-        val_arg = stmt.args[2]
-        isa(val_arg, SSAValue) || continue
+        # Outer getfield: getfield(tuple_ssa, elem_idx)
+        tuple_ssa = stmt.args[2]
+        isa(tuple_ssa, SSAValue) || continue
 
-        inner_idx = val_arg.id
-        inner_inst = ir[SSAValue(inner_idx)]
-        inner_stmt = inner_inst[:stmt]
-        isa(inner_stmt, Expr) || continue
-        is_known_call(inner_stmt, getfield, ir) || continue
-        length(inner_stmt.args) >= 3 || continue
-
-        # inner_stmt is: getfield(obj, :field)
-        obj_arg = inner_stmt.args[2]
-        field_arg = inner_stmt.args[3]
-
-        # Get the type of the object being accessed
-        obj_type = argextype(obj_arg, ir)
-        obj_typ_widened = widenconst(obj_type)
-        isa(obj_typ_widened, DataType) || continue
-        ismutabletype(obj_typ_widened) || continue
-
-        # Get the field and check if it's an immutable aggregate
-        field = try_compute_field(ir, field_arg)
-        field === nothing && continue
-        field_idx = try_compute_fieldidx(obj_typ_widened, field)
-        field_idx === nothing && continue
-
-        field_type = fieldtype(obj_typ_widened, field_idx)
-
-        # Check if the field is an immutable, inlined value type (like NTuple)
-        isbitstype(field_type) || continue
-        ismutabletype(field_type) && continue
-        field_type <: Tuple || continue
-
-        # Must be a concrete DataType to access parameters
-        isa(field_type, DataType) || continue
+        # Check that the value being indexed is a homogeneous tuple
+        tuple_type = widenconst(argextype(tuple_ssa, ir))
+        isa(tuple_type, DataType) || continue
+        tuple_type <: Tuple || continue
+        isbitstype(tuple_type) || continue
 
         # Check that tuple is homogeneous (all elements same type)
         # Required because we use stride arithmetic: offset = (i-1) * elem_size
-        params = field_type.parameters
+        params = tuple_type.parameters
         length(params) >= 1 || continue
         first_param = params[1]
         all(==(first_param), params) || continue
@@ -2788,6 +2766,57 @@ function srol_pass!(ir::IRCode, ::Union{Nothing,InliningState}=nothing)
         elem_idx_type = argextype(stmt.args[3], ir)
         isa(elem_idx_type, Const) && continue
         widenconst(elem_idx_type) <: Integer || continue
+
+        # Walk backwards through getfield chain to find mutable root
+        # This handles both direct tuples and tuples wrapped in isbits structs
+        current_ssa = tuple_ssa
+        accumulated_offset = 0
+        mutable_root_arg = nothing
+        mutable_root_idx = nothing
+
+        while true
+            current_idx = current_ssa.id
+            current_inst = ir[SSAValue(current_idx)]
+            current_stmt = current_inst[:stmt]
+
+            isa(current_stmt, Expr) || break
+            is_known_call(current_stmt, getfield, ir) || break
+            length(current_stmt.args) >= 3 || break
+
+            obj_arg = current_stmt.args[2]
+            field_arg = current_stmt.args[3]
+
+            obj_type = argextype(obj_arg, ir)
+            obj_typ_widened = widenconst(obj_type)
+            isa(obj_typ_widened, DataType) || break
+
+            field = try_compute_field(ir, field_arg)
+            field === nothing && break
+            field_idx = try_compute_fieldidx(obj_typ_widened, field)
+            field_idx === nothing && break
+
+            field_type = fieldtype(obj_typ_widened, field_idx)
+            field_offset = Int(fieldoffset(obj_typ_widened, field_idx))
+
+            # Field must be isbits and not mutable
+            isbitstype(field_type) || break
+            ismutabletype(field_type) && break
+
+            accumulated_offset += field_offset
+
+            if ismutabletype(obj_typ_widened)
+                # Found mutable root
+                mutable_root_arg = obj_arg
+                mutable_root_idx = current_idx
+                break
+            else
+                # Continue walking through isbits wrapper
+                isa(obj_arg, SSAValue) || break
+                current_ssa = obj_arg
+            end
+        end
+
+        mutable_root_arg === nothing && continue
 
         # Only optimize if bounds checking is disabled:
         # 1. Compiler proved nothrow → set IR_FLAG_NOUB (proven safe)
@@ -2810,12 +2839,12 @@ function srol_pass!(ir::IRCode, ::Union{Nothing,InliningState}=nothing)
         # The original code takes a "snapshot" of the immutable tuple, but our optimization
         # reads directly from the mutable struct's memory. If something could mutate the
         # struct between the snapshot and the access, we'd read wrong data.
-        inner_bb = block_for_inst(ir.cfg, inner_idx)
+        root_bb = block_for_inst(ir.cfg, mutable_root_idx)
         outer_bb = block_for_inst(ir.cfg, idx)
-        inner_bb == outer_bb || continue
+        root_bb == outer_bb || continue
 
         is_safe = true
-        for check_idx in (inner_idx + 1):(idx - 1)
+        for check_idx in (mutable_root_idx + 1):(idx - 1)
             check_inst = ir[SSAValue(check_idx)]
             check_stmt = check_inst[:stmt]
 
@@ -2838,15 +2867,14 @@ function srol_pass!(ir::IRCode, ::Union{Nothing,InliningState}=nothing)
         is_safe || continue
 
         # Compute transformation data
-        elem_type = fieldtype(field_type, 1)
-        field_offset = Int(fieldoffset(obj_typ_widened, field_idx))
+        elem_type = fieldtype(tuple_type, 1)
         elem_size = Int(sizeof(elem_type))
         elem_align = Int(Base.datatype_alignment(elem_type))
 
         # Only set NOUB if compiler proved bounds safety (not just @inbounds)
         is_noub = compiler_proven_nothrow
 
-        transforms[idx] = (obj_arg, field_offset, elem_size, elem_align, elem_type, is_noub)
+        transforms[idx] = (mutable_root_arg, accumulated_offset, elem_size, elem_align, elem_type, is_noub)
     end
 
     isempty(transforms) && return ir
