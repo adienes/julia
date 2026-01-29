@@ -2713,3 +2713,209 @@ function cfg_simplify!(ir::IRCode)
     compact.active_result_bb = length(bb_starts)
     return finish(compact)
 end
+
+"""
+    srol_pass!(ir::IRCode, inlining) -> newir::IRCode
+
+Scalar Replacement of Loads optimization pass.
+
+This pass optimizes variable-indexed access to homogeneous tuples stored in mutable structs.
+It handles both direct tuples and tuples wrapped in isbits structs (e.g., StaticArrays):
+
+  Direct:  `getfield(getfield(mutable, :tuple_field), i)`
+  Wrapped: `getfield(getfield(getfield(mutable, :wrapper), :data), i)`
+
+Without this optimization, accessing such fields with a variable index causes a defensive
+memcpy because LLVM's SROA cannot scalarize stack copies indexed by runtime values.
+
+The pass fuses the load + index into a direct pointer read using `Core.Intrinsics.pointerref_field`,
+which generates a GEP + Load in LLVM without the intermediate copy.
+
+Placement: After inlining (to expose wrapper calls) and before SROA.
+"""
+function srol_pass!(ir::IRCode, ::Union{Nothing,InliningState}=nothing)
+    # Transformation data: outer_idx => (obj_arg, field_offset, elem_size, elem_align, elem_type, is_noub)
+    transforms = IdDict{Int, Tuple{Any, Int, Int, Int, Any, Bool}}()
+
+    for idx in 1:length(ir.stmts)
+        inst = ir[SSAValue(idx)]
+        stmt = inst[:stmt]
+        isa(stmt, Expr) || continue
+        isexpr(stmt, :call) || continue
+        is_known_call(stmt, getfield, ir) || continue
+        length(stmt.args) >= 3 || continue
+
+        # Outer getfield: getfield(tuple_ssa, elem_idx)
+        tuple_ssa = stmt.args[2]
+        isa(tuple_ssa, SSAValue) || continue
+
+        # Check that the value being indexed is a homogeneous tuple
+        tuple_type = widenconst(argextype(tuple_ssa, ir))
+        isa(tuple_type, DataType) || continue
+        tuple_type <: Tuple || continue
+        isbitstype(tuple_type) || continue
+
+        # Check that tuple is homogeneous (all elements same type)
+        # Required because we use stride arithmetic: offset = (i-1) * elem_size
+        params = tuple_type.parameters
+        length(params) >= 1 || continue
+        first_param = params[1]
+        all(==(first_param), params) || continue
+
+        # Check if the outer getfield uses a variable (non-constant) index
+        elem_idx_type = argextype(stmt.args[3], ir)
+        isa(elem_idx_type, Const) && continue
+        widenconst(elem_idx_type) === Int || continue
+
+        # Walk backwards through getfield chain to find mutable root
+        # This handles both direct tuples and tuples wrapped in isbits structs
+        current_ssa = tuple_ssa
+        accumulated_offset = 0
+        mutable_root_arg = nothing
+        mutable_root_idx = nothing
+
+        while true
+            current_idx = current_ssa.id
+            current_inst = ir[SSAValue(current_idx)]
+            current_stmt = current_inst[:stmt]
+
+            isa(current_stmt, Expr) || break
+            is_known_call(current_stmt, getfield, ir) || break
+            length(current_stmt.args) >= 3 || break
+
+            obj_arg = current_stmt.args[2]
+            field_arg = current_stmt.args[3]
+
+            obj_type = argextype(obj_arg, ir)
+            obj_typ_widened = widenconst(obj_type)
+            isa(obj_typ_widened, DataType) || break
+
+            field = try_compute_field(ir, field_arg)
+            field === nothing && break
+            field_idx = try_compute_fieldidx(obj_typ_widened, field)
+            field_idx === nothing && break
+
+            field_type = fieldtype(obj_typ_widened, field_idx)
+            field_offset = Int(fieldoffset(obj_typ_widened, field_idx))
+
+            # Field must be isbits and not mutable
+            isbitstype(field_type) || break
+            ismutabletype(field_type) && break
+
+            accumulated_offset += field_offset
+
+            if ismutabletype(obj_typ_widened)
+                # Found mutable root
+                mutable_root_arg = obj_arg
+                mutable_root_idx = current_idx
+                break
+            else
+                # Continue walking through isbits wrapper
+                isa(obj_arg, SSAValue) || break
+                current_ssa = obj_arg
+            end
+        end
+
+        mutable_root_arg === nothing && continue
+
+        # Only optimize if bounds checking is disabled:
+        # 1. Compiler proved nothrow → set IR_FLAG_NOUB (proven safe)
+        # 2. @inbounds disables boundscheck → don't set IR_FLAG_NOUB (user assertion)
+        compiler_proven_nothrow = has_flag(inst, IR_FLAG_NOTHROW)
+        inbounds_disabled = false
+        if !compiler_proven_nothrow && length(stmt.args) >= 4
+            bc_arg = stmt.args[4]
+            if isa(bc_arg, SSAValue)
+                bc_stmt = ir[bc_arg][:stmt]
+                if isexpr(bc_stmt, :boundscheck)
+                    inbounds_disabled = !isempty(bc_stmt.args) && bc_stmt.args[1] === false
+                end
+            end
+        end
+        (compiler_proven_nothrow || inbounds_disabled) || continue
+
+        # Safety check: Both instructions must be in the same basic block, and there must
+        # be no potentially-mutating operations between them.
+        # The original code takes a "snapshot" of the immutable tuple, but our optimization
+        # reads directly from the mutable struct's memory. If something could mutate the
+        # struct between the snapshot and the access, we'd read wrong data.
+        root_bb = block_for_inst(ir.cfg, mutable_root_idx)
+        outer_bb = block_for_inst(ir.cfg, idx)
+        root_bb == outer_bb || continue
+
+        is_safe = true
+        for check_idx in (mutable_root_idx + 1):(idx - 1)
+            check_inst = ir[SSAValue(check_idx)]
+            check_stmt = check_inst[:stmt]
+
+            # Skip trivially safe statements
+            check_stmt isa Union{Nothing, GotoNode, GotoIfNot, ReturnNode,
+                                 GlobalRef, QuoteNode, Int, Bool, Symbol} && continue
+
+            if isa(check_stmt, Expr)
+                # Allow pure getfield operations (reading doesn't mutate)
+                is_known_call(check_stmt, getfield, ir) && continue
+                # Allow effect-free + nothrow operations (can't mutate anything)
+                if has_flag(check_inst, IR_FLAG_EFFECT_FREE) && has_flag(check_inst, IR_FLAG_NOTHROW)
+                    continue
+                end
+            end
+
+            is_safe = false
+            break
+        end
+        is_safe || continue
+
+        # Compute transformation data
+        elem_type = fieldtype(tuple_type, 1)
+        elem_size = Int(sizeof(elem_type))
+        elem_align = Int(Base.datatype_alignment(elem_type))
+
+        # Only set NOUB if compiler proved bounds safety (not just @inbounds)
+        is_noub = compiler_proven_nothrow
+
+        transforms[idx] = (mutable_root_arg, accumulated_offset, elem_size, elem_align, elem_type, is_noub)
+    end
+
+    isempty(transforms) && return ir
+
+    # Apply transformations using IncrementalCompact
+    compact = IncrementalCompact(ir)
+
+    for ((old_idx, idx), stmt) in compact
+        if haskey(transforms, old_idx)
+            (obj_arg, field_offset, elem_size, elem_align, elem_type, is_noub) = transforms[old_idx]
+
+            # Rename SSAValue arguments through compact's rename table
+            if isa(obj_arg, SSAValue)
+                obj_arg = compact.ssa_rename[obj_arg.id]
+                if isa(obj_arg, Refined)
+                    obj_arg = obj_arg.val
+                end
+            end
+
+            # Get the element index from the (already renamed) statement
+            outer_stmt = stmt::Expr
+            elem_idx_arg = outer_stmt.args[3]
+
+            new_call = Expr(:call, Core.Intrinsics.pointerref_field,
+                           obj_arg, field_offset, elem_size, elem_idx_arg, elem_align, elem_type)
+
+            compact[SSAValue(idx)] = new_call
+            compact[SSAValue(idx)][:type] = elem_type
+
+            # Set flags:
+            # - EFFECT_FREE: doesn't modify external state
+            # - NOTHROW: we've verified bounds are safe
+            # - TERMINATES: simple memory read
+            # - NOUB: only if compiler proved bounds (not just @inbounds assertion)
+            flag = IR_FLAG_EFFECT_FREE | IR_FLAG_NOTHROW | IR_FLAG_TERMINATES
+            if is_noub
+                flag |= IR_FLAG_NOUB
+            end
+            compact[SSAValue(idx)][:flag] = flag
+        end
+    end
+
+    return finish(compact)
+end

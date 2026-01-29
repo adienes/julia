@@ -2150,3 +2150,208 @@ let rf = (acc, x) -> ifelse(x > acc[1], (x,), (acc[1],))
     ir = first(only(Base.code_ircode(f_57827, (typeof(rf), Tuple{Float64}, Int64); optimize_until="CC: SROA")))
     @test ir isa Compiler.IRCode
 end
+
+# SRoL (Scalar Replacement of Loads) tests
+# ========================================
+# Test that pointerref_field optimization:
+# 1. Triggers when @inbounds is used
+# 2. Triggers when IR_FLAG_NOTHROW is set (compiler proved bounds safe)
+# 3. Preserves bounds checking otherwise
+# 4. Sets IR_FLAG_NOUB correctly (only for compiler-proven, not @inbounds)
+
+mutable struct SRoLTestHolder
+    data::NTuple{4, Float64}
+end
+
+# Heterogeneous tuple - should NOT be optimized
+mutable struct SRoLHeterogeneousHolder
+    data::Tuple{Int, Float64, Int, Float64}
+end
+
+# Helper to check if IR contains pointerref_field
+function has_pointerref_field_intrinsic(@nospecialize(f), @nospecialize(argtypes))
+    ir, _ = only(Base.code_ircode(f, argtypes))
+    ir_str = sprint(show, ir)
+    return occursin("pointerref_field", ir_str)
+end
+
+# Helper to check flags on pointerref_field calls
+function get_pointerref_field_flags(@nospecialize(f), @nospecialize(argtypes))
+    ir, _ = only(Base.code_ircode(f, argtypes))
+    for i in 1:length(ir.stmts)
+        stmt = ir.stmts[i][:stmt]
+        if stmt isa Expr && stmt.head === :call && length(stmt.args) >= 1
+            callee = stmt.args[1]
+            if callee === Core.Intrinsics.pointerref_field
+                return ir.stmts[i][:flag]
+            end
+        end
+    end
+    return nothing
+end
+
+# Helper to check if outer getfield has IR_FLAG_NOTHROW
+function outer_getfield_is_nothrow(@nospecialize(f), @nospecialize(argtypes))
+    ir, _ = only(Base.code_ircode(f, argtypes))
+    for i in 1:length(ir.stmts)
+        stmt = ir.stmts[i][:stmt]
+        if stmt isa Expr && Compiler.is_known_call(stmt, Core.getfield, ir)
+            if length(stmt.args) >= 3
+                val_arg = stmt.args[2]
+                if val_arg isa Core.SSAValue
+                    inner_stmt = ir.stmts[val_arg.id][:stmt]
+                    if inner_stmt isa Expr && Compiler.is_known_call(inner_stmt, Core.getfield, ir)
+                        return Compiler.has_flag(ir.stmts[i], Compiler.IR_FLAG_NOTHROW)
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+# @inbounds version SHOULD be optimized (has pointerref_field)
+@inline function srol_get_with_inbounds(h::SRoLTestHolder, i)
+    @inbounds h.data[i]
+end
+
+# Non-@inbounds version should NOT be optimized (preserves bounds check)
+@inline function srol_get_without_inbounds(h::SRoLTestHolder, i)
+    h.data[i]
+end
+
+let h = SRoLTestHolder((1.0, 2.0, 3.0, 4.0))
+    # Test that @inbounds version is optimized
+    @test has_pointerref_field_intrinsic(srol_get_with_inbounds, Tuple{SRoLTestHolder, Int})
+
+    # Test that non-@inbounds version preserves bounds checking
+    @test !has_pointerref_field_intrinsic(srol_get_without_inbounds, Tuple{SRoLTestHolder, Int})
+
+    # Verify that non-@inbounds is NOT marked nothrow (compiler can't prove safety)
+    @test !outer_getfield_is_nothrow(srol_get_without_inbounds, Tuple{SRoLTestHolder, Int})
+
+    # Test that out-of-bounds access throws BoundsError (not segfault)
+    @test_throws BoundsError srol_get_without_inbounds(h, 100)
+
+    # Test correct values are returned
+    for i in 1:4
+        @test srol_get_with_inbounds(h, i) == Float64(i)
+        @test srol_get_without_inbounds(h, i) == Float64(i)
+    end
+end
+
+# Test: IR_FLAG_NOUB is NOT set for @inbounds (user assertion, could still be UB)
+let flags = get_pointerref_field_flags(srol_get_with_inbounds, Tuple{SRoLTestHolder, Int})
+    @test flags !== nothing
+    # Should have EFFECT_FREE, NOTHROW, TERMINATES but NOT NOUB
+    @test Compiler.has_flag(flags, Compiler.IR_FLAG_EFFECT_FREE)
+    @test Compiler.has_flag(flags, Compiler.IR_FLAG_NOTHROW)
+    @test Compiler.has_flag(flags, Compiler.IR_FLAG_TERMINATES)
+    # NOUB should NOT be set for @inbounds - the user asserted safety but it could be wrong
+    @test !Compiler.has_flag(flags, Compiler.IR_FLAG_NOUB)
+end
+
+# Test: Heterogeneous tuples should NOT be optimized (stride arithmetic won't work)
+@inline function srol_get_heterogeneous(h::SRoLHeterogeneousHolder, i)
+    @inbounds h.data[i]
+end
+
+let h = SRoLHeterogeneousHolder((1, 2.0, 3, 4.0))
+    # Should NOT be optimized - tuple elements have different types/sizes
+    @test !has_pointerref_field_intrinsic(srol_get_heterogeneous, Tuple{SRoLHeterogeneousHolder, Int})
+    # But should still return correct values
+    @test srol_get_heterogeneous(h, 1) === 1
+    @test srol_get_heterogeneous(h, 2) === 2.0
+end
+
+# Test: Multiple SROL candidates in same function
+@inline function srol_multiple_accesses(h::SRoLTestHolder, i, j)
+    @inbounds h.data[i] + h.data[j]
+end
+
+let h = SRoLTestHolder((1.0, 2.0, 3.0, 4.0))
+    @test has_pointerref_field_intrinsic(srol_multiple_accesses, Tuple{SRoLTestHolder, Int, Int})
+    @test srol_multiple_accesses(h, 1, 4) == 5.0
+end
+
+# Test: IR_FLAG_NOTHROW path (future-proofing)
+# Currently, the Julia compiler doesn't mark variable-index tuple access as nothrow
+# even after explicit bounds checks. This test documents the current behavior and
+# ensures the IR_FLAG_NOTHROW code path exists for future compiler improvements.
+@inline function srol_after_boundscheck(h::SRoLTestHolder, i)
+    if 1 <= i <= 4
+        h.data[i]
+    else
+        0.0
+    end
+end
+
+let h = SRoLTestHolder((1.0, 2.0, 3.0, 4.0))
+    # Currently this is NOT optimized because compiler doesn't prove nothrow
+    # If/when the compiler improves, this test may need updating
+    @test !has_pointerref_field_intrinsic(srol_after_boundscheck, Tuple{SRoLTestHolder, Int})
+
+    for i in 1:4
+        @test srol_after_boundscheck(h, i) == Float64(i)
+    end
+    @test srol_after_boundscheck(h, 100) == 0.0
+end
+
+# The optimization should handle tuples wrapped in isbits structs
+struct SRoLSVector{N, T}
+    data::NTuple{N, T}
+end
+Base.@propagate_inbounds Base.getindex(v::SRoLSVector, i::Int) = v.data[i]
+
+mutable struct SRoLWrappedHolder
+    vec::SRoLSVector{4, Float64}
+end
+
+# Nested wrapper (two levels of isbits wrapping)
+struct SRoLInnerWrapper{N, T}
+    data::NTuple{N, T}
+end
+struct SRoLOuterWrapper{N, T}
+    inner::SRoLInnerWrapper{N, T}
+end
+Base.@propagate_inbounds Base.getindex(w::SRoLOuterWrapper, i::Int) = w.inner.data[i]
+
+mutable struct SRoLNestedHolder
+    wrapper::SRoLOuterWrapper{4, Float64}
+end
+
+@inline function srol_wrapped_inbounds(h::SRoLWrappedHolder, i)
+    @inbounds h.vec[i]
+end
+
+@inline function srol_wrapped_no_inbounds(h::SRoLWrappedHolder, i)
+    h.vec[i]
+end
+
+@inline function srol_nested_inbounds(h::SRoLNestedHolder, i)
+    @inbounds h.wrapper[i]
+end
+
+let h = SRoLWrappedHolder(SRoLSVector((1.0, 2.0, 3.0, 4.0)))
+    # Test that wrapped pattern with @inbounds is optimized
+    @test has_pointerref_field_intrinsic(srol_wrapped_inbounds, Tuple{SRoLWrappedHolder, Int})
+
+    # Test that wrapped pattern without @inbounds preserves bounds check
+    @test !has_pointerref_field_intrinsic(srol_wrapped_no_inbounds, Tuple{SRoLWrappedHolder, Int})
+
+    # Test correct values
+    for i in 1:4
+        @test srol_wrapped_inbounds(h, i) == Float64(i)
+        @test srol_wrapped_no_inbounds(h, i) == Float64(i)
+    end
+end
+
+let h = SRoLNestedHolder(SRoLOuterWrapper(SRoLInnerWrapper((1.0, 2.0, 3.0, 4.0))))
+    # Test that nested wrapped pattern with @inbounds is optimized
+    @test has_pointerref_field_intrinsic(srol_nested_inbounds, Tuple{SRoLNestedHolder, Int})
+
+    # Test correct values
+    for i in 1:4
+        @test srol_nested_inbounds(h, i) == Float64(i)
+    end
+end
