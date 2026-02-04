@@ -2719,11 +2719,16 @@ end
 
 Scalar Replacement of Loads optimization pass.
 
-This pass optimizes variable-indexed access to homogeneous tuples stored in mutable structs.
-It handles both direct tuples and tuples wrapped in isbits structs (e.g., StaticArrays):
+This pass optimizes variable-indexed access to homogeneous isbits types stored in mutable structs.
+It handles both direct fields and fields wrapped in isbits structs (e.g., StaticArrays):
 
-  Direct:  `getfield(getfield(mutable, :tuple_field), i)`
+  Direct:  `getfield(getfield(mutable, :isbits_field), i)`
   Wrapped: `getfield(getfield(getfield(mutable, :wrapper), :data), i)`
+
+The indexed type must be:
+- isbits (immutable and contains no references)
+- homogeneous (all fields have the same type)
+- contiguously laid out (no padding between fields)
 
 Without this optimization, accessing such fields with a variable index causes a defensive
 memcpy because LLVM's SROA cannot scalarize stack copies indexed by runtime values.
@@ -2745,22 +2750,26 @@ function srol_pass!(ir::IRCode, ::Union{Nothing,InliningState}=nothing)
         is_known_call(stmt, getfield, ir) || continue
         length(stmt.args) >= 3 || continue
 
-        # Outer getfield: getfield(tuple_ssa, elem_idx)
-        tuple_ssa = stmt.args[2]
-        isa(tuple_ssa, SSAValue) || continue
+        # Outer getfield: getfield(indexed_ssa, elem_idx)
+        indexed_ssa = stmt.args[2]
+        isa(indexed_ssa, SSAValue) || continue
 
-        # Check that the value being indexed is a homogeneous tuple
-        tuple_type = widenconst(argextype(tuple_ssa, ir))
-        isa(tuple_type, DataType) || continue
-        tuple_type <: Tuple || continue
-        isbitstype(tuple_type) || continue
+        # Check that the value being indexed is a homogeneous isbits type
+        indexed_type = widenconst(argextype(indexed_ssa, ir))
+        isa(indexed_type, DataType) || continue
+        isbitstype(indexed_type) || continue
 
-        # Check that tuple is homogeneous (all elements same type)
+        # Check that the type is homogeneous (all fields have the same type)
         # Required because we use stride arithmetic: offset = (i-1) * elem_size
-        params = tuple_type.parameters
-        length(params) >= 1 || continue
-        first_param = params[1]
-        all(==(first_param), params) || continue
+        nfields = fieldcount(indexed_type)
+        nfields >= 1 || continue
+        elem_type = fieldtype(indexed_type, 1)
+        all(i -> fieldtype(indexed_type, i) === elem_type, 1:nfields) || continue
+
+        # Verify contiguous layout (no padding between fields)
+        elem_size = sizeof(elem_type)
+        is_contiguous = all(i -> fieldoffset(indexed_type, i) == (i - 1) * elem_size, 1:nfields)
+        is_contiguous || continue
 
         # Check if the outer getfield uses a variable (non-constant) index
         elem_idx_type = argextype(stmt.args[3], ir)
@@ -2768,8 +2777,8 @@ function srol_pass!(ir::IRCode, ::Union{Nothing,InliningState}=nothing)
         widenconst(elem_idx_type) === Int || continue
 
         # Walk backwards through getfield chain to find mutable root
-        # This handles both direct tuples and tuples wrapped in isbits structs
-        current_ssa = tuple_ssa
+        # This handles both direct fields and fields wrapped in isbits structs
+        current_ssa = indexed_ssa
         accumulated_offset = 0
         mutable_root_arg = nothing
         mutable_root_idx = nothing
@@ -2866,15 +2875,14 @@ function srol_pass!(ir::IRCode, ::Union{Nothing,InliningState}=nothing)
         end
         is_safe || continue
 
-        # Compute transformation data
-        elem_type = fieldtype(tuple_type, 1)
-        elem_size = Int(sizeof(elem_type))
+        # Compute transformation data (elem_type and elem_size already computed above)
+        elem_size_int = Int(elem_size)
         elem_align = Int(Base.datatype_alignment(elem_type))
 
         # Only set NOUB if compiler proved bounds safety (not just @inbounds)
         is_noub = compiler_proven_nothrow
 
-        transforms[idx] = (mutable_root_arg, accumulated_offset, elem_size, elem_align, elem_type, is_noub)
+        transforms[idx] = (mutable_root_arg, accumulated_offset, elem_size_int, elem_align, elem_type, is_noub)
     end
 
     isempty(transforms) && return ir
