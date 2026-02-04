@@ -452,6 +452,34 @@ JL_DLLEXPORT jl_value_t *jl_pointerset(jl_value_t *p, jl_value_t *x, jl_value_t 
     return p;
 }
 
+// run time version of pointerref_field intrinsic
+// Loads element at index from an immutable aggregate field of a mutable struct
+JL_DLLEXPORT jl_value_t *jl_pointerref_field(jl_value_t *obj, jl_value_t *field_offset_v,
+                                              jl_value_t *elem_size_v, jl_value_t *idx,
+                                              jl_value_t *align, jl_value_t *elem_type)
+{
+    JL_TYPECHK(pointerref_field, long, field_offset_v);
+    JL_TYPECHK(pointerref_field, long, elem_size_v);
+    JL_TYPECHK(pointerref_field, long, idx);
+    JL_TYPECHK(pointerref_field, long, align);
+    JL_TYPECHK(pointerref_field, datatype, elem_type);
+    // Note: The compiler pass (srol_pass!) only emits this intrinsic for isbitstype
+    // element types, so jl_new_bits is safe here. Manual calls with pointer-containing
+    // types would be unsafe but are not a supported use case.
+
+    size_t field_offset = jl_unbox_long(field_offset_v);
+    size_t elem_size = jl_unbox_long(elem_size_v);
+    size_t i = jl_unbox_long(idx);
+
+    // Get pointer to object data
+    char *obj_data = (char*)jl_data_ptr(obj);
+
+    // Compute element address: obj_data + field_offset + (i-1) * elem_size
+    char *elem_ptr = obj_data + field_offset + (i - 1) * elem_size;
+
+    return jl_new_bits(elem_type, elem_ptr);
+}
+
 JL_DLLEXPORT jl_value_t *jl_atomic_pointerref(jl_value_t *p, jl_value_t *order)
 {
     JL_TYPECHK(atomic_pointerref, pointer, p);

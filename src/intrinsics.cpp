@@ -21,6 +21,7 @@ STATISTIC(EmittedRuntimeCalls, "Number of runtime intrinsic calls emitted");
 STATISTIC(EmittedIntrinsics, "Number of intrinsic calls emitted");
 STATISTIC(Emitted_pointerref, "Number of pointerref calls emitted");
 STATISTIC(Emitted_pointerset, "Number of pointerset calls emitted");
+STATISTIC(Emitted_pointerref_field, "Number of pointerref_field calls emitted");
 STATISTIC(Emitted_pointerarith, "Number of pointer arithmetic calls emitted");
 STATISTIC(Emitted_atomic_fence, "Number of atomic_fence calls emitted");
 STATISTIC(Emitted_atomic_pointerref, "Number of atomic_pointerref calls emitted");
@@ -46,6 +47,7 @@ FunctionType *get_intr_args2(LLVMContext &C) { return FunctionType::get(JuliaTyp
 FunctionType *get_intr_args3(LLVMContext &C) { return FunctionType::get(JuliaType::get_prjlvalue_ty(C), {JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C)}, false); }
 FunctionType *get_intr_args4(LLVMContext &C) { return FunctionType::get(JuliaType::get_prjlvalue_ty(C), {JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C)}, false); }
 FunctionType *get_intr_args5(LLVMContext &C) { return FunctionType::get(JuliaType::get_prjlvalue_ty(C), {JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C)}, false); }
+FunctionType *get_intr_args6(LLVMContext &C) { return FunctionType::get(JuliaType::get_prjlvalue_ty(C), {JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C)}, false); }
 
 const auto &runtime_func() {
     static struct runtime_funcs_t {
@@ -882,6 +884,92 @@ static jl_cgval_t emit_pointerset(jl_codectx_t &ctx, ArrayRef<jl_cgval_t> argv)
     return e;
 }
 
+static jl_cgval_t emit_runtime_pointerref_field(jl_codectx_t &ctx, ArrayRef<jl_cgval_t> argv)
+{
+    return emit_runtime_call(ctx, pointerref_field, argv, 6);
+}
+
+// Load element at variable index from an immutable aggregate field of a mutable struct
+// pointerref_field(obj, field_byte_offset, elem_size, elem_idx, align, elem_type)
+// Computes: obj_data_ptr + field_byte_offset + (elem_idx - 1) * elem_size
+// This avoids the defensive memcpy that would occur when loading an immutable aggregate
+// from a mutable struct and then indexing it with a variable index.
+static jl_cgval_t emit_pointerref_field(jl_codectx_t &ctx, ArrayRef<jl_cgval_t> argv)
+{
+    const jl_cgval_t &obj = argv[0];
+    const jl_cgval_t &field_offset_arg = argv[1];
+    const jl_cgval_t &elem_size_arg = argv[2];
+    const jl_cgval_t &elem_idx = argv[3];
+    const jl_cgval_t &align_arg = argv[4];
+    const jl_cgval_t &elem_type_arg = argv[5];
+
+    // Validate constant arguments
+    if (!field_offset_arg.constant || !jl_is_long(field_offset_arg.constant))
+        return emit_runtime_pointerref_field(ctx, argv);
+    if (!elem_size_arg.constant || !jl_is_long(elem_size_arg.constant))
+        return emit_runtime_pointerref_field(ctx, argv);
+    if (!align_arg.constant || !jl_is_long(align_arg.constant))
+        return emit_runtime_pointerref_field(ctx, argv);
+    if (!elem_type_arg.constant || !jl_is_datatype(elem_type_arg.constant))
+        return emit_runtime_pointerref_field(ctx, argv);
+
+    size_t field_offset = jl_unbox_long(field_offset_arg.constant);
+    size_t elem_size = jl_unbox_long(elem_size_arg.constant);
+    unsigned align_nb = jl_unbox_long(align_arg.constant);
+    jl_datatype_t *elem_type = (jl_datatype_t*)elem_type_arg.constant;
+
+    // Validate element type
+    if (jl_is_typevar((jl_value_t*)elem_type))
+        return emit_runtime_pointerref_field(ctx, argv);
+
+    // Validate index type
+    if (elem_idx.typ != (jl_value_t*)jl_long_type)
+        return emit_runtime_pointerref_field(ctx, argv);
+
+    // The object must be boxed (it's a mutable struct)
+    if (!obj.isboxed && !obj.ispointer())
+        return emit_runtime_pointerref_field(ctx, argv);
+
+    // Get the element index value
+    Value *idx = emit_unbox(ctx, ctx.types().T_size, elem_idx);
+    // Convert from 1-based to 0-based indexing
+    Value *idx0 = ctx.builder.CreateSub(idx, ConstantInt::get(ctx.types().T_size, 1));
+    setName(ctx.emission_context, idx0, "pointerref_field_idx");
+
+    // Compute element byte offset: idx0 * elem_size
+    Value *elem_offset = ctx.builder.CreateMul(idx0, ConstantInt::get(ctx.types().T_size, elem_size));
+    setName(ctx.emission_context, elem_offset, "elem_offset");
+
+    // Get pointer to object data
+    Value *obj_ptr;
+    if (obj.isboxed) {
+        obj_ptr = emit_bitcast(ctx, boxed(ctx, obj), ctx.types().T_ptr);
+    } else {
+        obj_ptr = data_pointer(ctx, obj);
+    }
+
+    // Compute field pointer: obj_ptr + field_offset
+    Value *field_ptr = emit_ptrgep(ctx, obj_ptr, ConstantInt::get(ctx.types().T_size, field_offset));
+    setName(ctx.emission_context, field_ptr, "field_ptr");
+
+    // Compute element pointer: field_ptr + elem_offset
+    Value *elem_ptr = emit_ptrgep(ctx, field_ptr, elem_offset);
+    setName(ctx.emission_context, elem_ptr, "elem_ptr");
+
+    // Load the element
+    bool isboxed;
+    Type *llvm_elem_type = julia_type_to_llvm(ctx, (jl_value_t*)elem_type, &isboxed);
+    if (type_is_ghost(llvm_elem_type)) {
+        return ghostValue(ctx, (jl_value_t*)elem_type);
+    }
+
+    auto load = typed_load(ctx, elem_ptr, nullptr, (jl_value_t*)elem_type,
+                           ctx.tbaa().tbaa_data, nullptr, isboxed,
+                           AtomicOrdering::NotAtomic, false, align_nb);
+    setName(ctx.emission_context, load.V, "pointerref_field");
+    return load;
+}
+
 // ptr + offset
 // ptr - offset
 static jl_cgval_t emit_pointerarith(jl_codectx_t &ctx, intrinsic f,
@@ -1370,6 +1458,10 @@ static jl_cgval_t emit_intrinsic(jl_codectx_t &ctx, intrinsic f, jl_value_t **ar
         ++Emitted_pointerset;
         assert(nargs == 4);
         return emit_pointerset(ctx, argv);
+    case pointerref_field:
+        ++Emitted_pointerref_field;
+        assert(nargs == 6);
+        return emit_pointerref_field(ctx, argv);
 
     case add_ptr:
     case sub_ptr:

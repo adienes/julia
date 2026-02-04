@@ -757,6 +757,14 @@ add_tfunc(add_ptr, 2, 2, pointerarith_tfunc, 1)
 add_tfunc(sub_ptr, 2, 2, pointerarith_tfunc, 1)
 add_tfunc(pointerref, 3, 3, pointerref_tfunc, 4)
 add_tfunc(pointerset, 4, 4, pointerset_tfunc, 5)
+# pointerref_field(obj, field_offset, elem_size, idx, align, elem_type) -> elem_type
+@nospecs function pointerref_field_tfunc(𝕃::AbstractLattice, obj, field_offset, elem_size, idx, align, elem_type)
+    # The return type is specified explicitly as the last argument
+    isa(elem_type, Const) && return elem_type.val
+    isa(elem_type, PartialStruct) && return widenconst(elem_type)
+    return widenconst(elem_type)
+end
+add_tfunc(pointerref_field, 6, 6, pointerref_field_tfunc, 4)
 add_tfunc(atomic_fence, 2, 2, atomic_fence_tfunc, 4)
 add_tfunc(atomic_pointerref, 2, 2, atomic_pointerref_tfunc, 4)
 add_tfunc(atomic_pointerset, 3, 3, atomic_pointerset_tfunc, 5)
@@ -2939,6 +2947,16 @@ function intrinsic_exct(𝕃::AbstractLattice, f::IntrinsicFunction, argtypes::V
         return Union{}
     end
 
+    if f === Intrinsics.pointerref_field
+        # pointerref_field(obj, field_offset, elem_size, idx, align, elem_type)
+        # Type check all integer arguments
+        if !(argtypes[2] ⊑ Int && argtypes[3] ⊑ Int &&
+             argtypes[4] ⊑ Int && argtypes[5] ⊑ Int)
+            return TypeError
+        end
+        return Union{}
+    end
+
     if f === Intrinsics.pointerset
         eT = pointer_eltype(argtypes[1])
         if !known_is_valid_intrinsic_elptr(𝕃, argtypes[1])
@@ -3052,6 +3070,7 @@ function is_pure_intrinsic_infer(f::IntrinsicFunction, is_effect_free::Union{Not
             f === Intrinsics.llvmcall ||              # can do arbitrary things
             f === Intrinsics.atomic_pointermodify ||  # can do arbitrary things
             f === Intrinsics.pointerref ||            # this one is volatile
+            f === Intrinsics.pointerref_field ||      # this one is volatile (like pointerref)
             f === Intrinsics.sqrt_llvm_fast ||        # this one may differ at runtime (by a few ulps)
             f === Intrinsics.have_fma ||              # this one depends on the runtime environment
             f === Intrinsics.cglobal)                 # cglobal lookup answer changes at runtime
@@ -3074,7 +3093,7 @@ function intrinsic_effects(f::IntrinsicFunction, argtypes::Vector{Any})
         consistent = ALWAYS_FALSE
     end
     nothrow = intrinsic_nothrow(f, argtypes)
-    inaccessiblememonly = is_effect_free && !(f === Intrinsics.pointerref) ? ALWAYS_TRUE : ALWAYS_FALSE
+    inaccessiblememonly = is_effect_free && !(f === Intrinsics.pointerref || f === Intrinsics.pointerref_field) ? ALWAYS_TRUE : ALWAYS_FALSE
     return Effects(EFFECTS_TOTAL; consistent, effect_free, nothrow, inaccessiblememonly)
 end
 

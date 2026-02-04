@@ -94,6 +94,7 @@
     /*  pointer access */ \
     ADD_I(pointerref, 3) \
     ADD_I(pointerset, 4) \
+    ADD_I(pointerref_field, 6) \
     /*  pointer atomics */ \
     ADD_I(atomic_fence, 2) \
     ADD_I(atomic_pointerref, 2) \
