@@ -107,7 +107,7 @@ istrivialerror(stack::ExceptionStack) =
 
 function display_error(io::IO, stack::ExceptionStack)
     printstyled(io, "ERROR: "; bold=true, color=Base.error_color())
-    show_exception_stack(IOContext(io, :limit => true), stack)
+    show_exception_stack(IOContext(io, :limit => true, :err_params_active => true), stack)
     println(io)
 end
 display_error(stack::ExceptionStack) = display_error(stderr, stack)
@@ -115,7 +115,7 @@ display_error(stack::ExceptionStack) = display_error(stderr, stack)
 # these forms are depended on by packages outside Julia
 function display_error(io::IO, er, bt)
     printstyled(io, "ERROR: "; bold=true, color=Base.error_color())
-    showerror(IOContext(io, :limit => true), er, bt, backtrace = bt!==nothing)
+    showerror(IOContext(io, :limit => true, :err_params_active => true), er, bt, backtrace = bt!==nothing)
     println(io)
 end
 display_error(er, bt=nothing) = display_error(stderr, er, bt)

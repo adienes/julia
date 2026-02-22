@@ -695,6 +695,7 @@ export
     IOContext,
     displaysize,
     dump,
+    err_params!,
     print,
     println,
     printstyled,

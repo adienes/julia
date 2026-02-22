@@ -2912,3 +2912,88 @@ let m = only(methods(f_show_method))
         @test "f_show_method(x::T) where T<:Integer" == s
     end
 end
+
+# test err_params! per-parameter stacktrace type display
+@testset "err_params!" begin
+    struct ErrParamsTest1{A, B, C, D} end
+    struct ErrParamsTest2{A, B, C} end
+
+    # helper: render a type in stacktrace-limited context
+    function show_limited(@nospecialize(T::Type))
+        tlf = Ref(false)
+        str = sprint(show, T; context=(:stacktrace_types_limited => tlf,))
+        return str, tlf[]
+    end
+
+    # before configuring, normal display (no masking)
+    str, lim = show_limited(ErrParamsTest1{Vector{Int}, Dict{String,Int}, Float64, Bool})
+    @test !lim
+    @test str == "ErrParamsTest1{Vector{Int64}, Dict{String, Int64}, Float64, Bool}"
+
+    # all hidden (empty modes)
+    err_params!(ErrParamsTest1)
+    str, lim = show_limited(ErrParamsTest1{Vector{Int}, Dict{String,Int}, Float64, Bool})
+    @test lim
+    @test str == "ErrParamsTest1{…}"
+
+    # first param full, rest hidden
+    err_params!(ErrParamsTest1, [:full])
+    str, lim = show_limited(ErrParamsTest1{Vector{Int}, Dict{String,Int}, Float64, Bool})
+    @test lim
+    @test str == "ErrParamsTest1{Vector{Int64}, …}"
+
+    # first param name-only
+    err_params!(ErrParamsTest2, [:name])
+    str, lim = show_limited(ErrParamsTest2{Vector{Int}, Dict{String,Int}, Float64})
+    @test lim
+    @test str == "ErrParamsTest2{Vector, …}"
+
+    # gap: hide first, show second full
+    err_params!(ErrParamsTest2, [:hide, :full])
+    str, lim = show_limited(ErrParamsTest2{Vector{Int}, Dict{String,Int}, Float64})
+    @test lim
+    @test str == "ErrParamsTest2{…, Dict{String, Int64}, …}"
+
+    # non-contiguous: name, hide, name
+    err_params!(ErrParamsTest2, [:name, :hide, :name])
+    str, lim = show_limited(ErrParamsTest2{Vector{Int}, Dict{String,Int}, Float64})
+    @test lim
+    @test str == "ErrParamsTest2{Vector, …, Float64}"
+
+    # all full — should still set the limit flag (configured bit is set)
+    err_params!(ErrParamsTest2, [:full, :full, :full])
+    str, lim = show_limited(ErrParamsTest2{Vector{Int}, Dict{String,Int}, Float64})
+    @test lim
+    @test str == "ErrParamsTest2{Vector{Int64}, Dict{String, Int64}, Float64}"
+
+    # Union param in :name mode
+    err_params!(ErrParamsTest2, [:name, :full, :full])
+    str, lim = show_limited(ErrParamsTest2{Union{Int,String}, Dict{String,Int}, Float64})
+    @test lim
+    @test str == "ErrParamsTest2{Union{…}, Dict{String, Int64}, Float64}"
+
+    # non-type param (integer) in :name mode shows as-is
+    struct ErrParamsTestVal{N, T} end
+    err_params!(ErrParamsTestVal, [:name, :full])
+    str, lim = show_limited(ErrParamsTestVal{3, Int})
+    @test lim
+    @test str == "ErrParamsTestVal{3, Int64}"
+
+    # normal show (no stacktrace context) is unchanged even with err_params configured
+    err_params!(ErrParamsTest1, [:full])
+    str = sprint(show, ErrParamsTest1{Vector{Int}, Dict{String,Int}, Float64, Bool})
+    @test str == "ErrParamsTest1{Vector{Int64}, Dict{String, Int64}, Float64, Bool}"
+
+    # error on unknown mode
+    @test_throws ArgumentError err_params!(ErrParamsTest1, [:bogus])
+
+    # error on too many modes
+    @test_throws ArgumentError err_params!(ErrParamsTest1, repeat([:full], 64))
+
+    # where clause filtering: hidden params don't contribute where clauses
+    struct ErrParamsTestW{T<:Number, S<:AbstractString} end
+    err_params!(ErrParamsTestW, [:full, :hide])
+    str, lim = show_limited(ErrParamsTestW{T, String} where T<:Number)
+    @test lim
+    @test str == "ErrParamsTestW{T, …} where T<:Number"
+end

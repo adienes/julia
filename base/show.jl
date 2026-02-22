@@ -747,6 +747,152 @@ function show_typeparams(io::IO, env::SimpleVector, orig::SimpleVector, wheres::
     nothing
 end
 
+"""
+    err_params!(T::Type, modes::AbstractVector{Symbol}=Symbol[])
+
+Configure per-parameter display modes for type `T` when shown in stack traces
+and error messages. Each element of `modes` corresponds to a type parameter and
+can be one of:
+
+- `:full`  — show the parameter fully (e.g. `Vector{Int}`)
+- `:name`  — show only the type name (e.g. `Vector`)
+- `:hide`  — hide the parameter entirely
+
+Parameters beyond the length of `modes` default to `:hide`. Up to 63 parameters
+are supported. When no `modes` are given (or an empty vector), all parameters are
+hidden and the type displays as `T{…}` in stack traces.
+
+This only affects display in stack trace context; normal `show(io, T)` is unchanged.
+
+# Examples
+```julia
+struct MyType{A, B, C} end
+err_params!(MyType, [:full, :name])
+# In stack traces: MyType{Vector{Int}, Dict, …}
+```
+"""
+function err_params!(@nospecialize(T::Type), modes::AbstractVector{Symbol}=Symbol[])
+    T isa DataType || T isa UnionAll || throw(ArgumentError("err_params! requires a DataType or UnionAll, got $(typeof(T))"))
+    tn = Core.typename(T)
+    n = length(modes)
+    n <= 63 || throw(ArgumentError("err_params! supports at most 63 parameter modes, got $n"))
+    show_mask = UInt64(1) << 63  # configured bit
+    name_mask = UInt64(0)
+    for (i, mode) in enumerate(modes)
+        if mode === :full
+            show_mask |= UInt64(1) << (i - 1)
+        elseif mode === :name
+            show_mask |= UInt64(1) << (i - 1)
+            name_mask |= UInt64(1) << (i - 1)
+        elseif mode === :hide
+            # default — bit stays 0
+        else
+            throw(ArgumentError("unknown mode :$mode; expected :full, :name, or :hide"))
+        end
+    end
+    # TypeName is ismutationfree, so the compiler would optimize away normal setfield!.
+    # Use ccall to bypass dead-store elimination.
+    ccall(:jl_set_nth_field, Cvoid, (Any, Csize_t, Any), tn,
+          fieldindex(Core.TypeName, :err_params) - 1, show_mask)
+    ccall(:jl_set_nth_field, Cvoid, (Any, Csize_t, Any), tn,
+          fieldindex(Core.TypeName, :err_params_mode) - 1, name_mask)
+    return nothing
+end
+
+# Show a single type parameter in :name mode (type name only, no parameters).
+# Uses show() to resolve aliases (e.g. Vector instead of Array), then strips parameters.
+function _show_param_nameonly(io::IO, @nospecialize(p))
+    if p isa Union
+        print(io, "Union{…}")
+    elseif p isa Type
+        s = sprint(show, p; context=io)
+        idx = findfirst('{', s)
+        if idx !== nothing
+            print(io, SubString(s, 1, prevind(s, idx)))
+        else
+            print(io, s)
+        end
+    elseif p isa TypeVar
+        print(io, p.name)
+    else
+        show(io, p)
+    end
+end
+
+# Show type parameters respecting the err_params bitvector masks.
+# show_mask bit i (0-indexed) = whether param i+1 is visible.
+# name_mask bit i = whether visible param i+1 uses name-only mode.
+function _show_typeparams_masked(io::IO, parameters::SimpleVector, wheres::Vector{TypeVar},
+                                 show_mask::UInt64, name_mask::UInt64)
+    n = length(parameters)
+    n == 0 && return
+    # Determine which params are visible
+    any_visible = false
+    for i in 1:n
+        if i <= 63 && (show_mask & (UInt64(1) << (i - 1))) != 0
+            any_visible = true
+            break
+        end
+    end
+    # If nothing is visible, just show {…}
+    if !any_visible
+        print(io, "{…}")
+        empty!(wheres)
+        return
+    end
+    # Filter wheres: remove TypeVars that only appear in hidden/name-only params
+    if !isempty(wheres)
+        kept = TypeVar[]
+        for w in wheres
+            dominated = false
+            for i in 1:n
+                visible_full = i <= 63 && (show_mask & (UInt64(1) << (i - 1))) != 0 &&
+                               (name_mask & (UInt64(1) << (i - 1))) == 0
+                if visible_full && has_typevar(parameters[i], w)
+                    dominated = true
+                    break
+                end
+            end
+            dominated && push!(kept, w)
+        end
+        resize!(wheres, length(kept))
+        wheres .= kept
+    end
+    print(io, "{")
+    need_comma = false
+    trailing_ellipsis = false
+    i = 1
+    while i <= n
+        visible = i <= 63 && (show_mask & (UInt64(1) << (i - 1))) != 0
+        if visible
+            if trailing_ellipsis
+                need_comma && print(io, ", ")
+                print(io, "…")
+                need_comma = true
+                trailing_ellipsis = false
+            end
+            need_comma && print(io, ", ")
+            nameonly = i <= 63 && (name_mask & (UInt64(1) << (i - 1))) != 0
+            p = parameters[i]
+            if nameonly
+                _show_param_nameonly(io, p)
+            else
+                show(io, p)
+            end
+            need_comma = true
+        else
+            trailing_ellipsis = true
+        end
+        i += 1
+    end
+    if trailing_ellipsis
+        need_comma && print(io, ", ")
+        print(io, "…")
+    end
+    print(io, "}")
+    nothing
+end
+
 function show_typealias(io::IO, name::GlobalRef, x::Type, env::SimpleVector, wheres::Vector)
     if !(get(io, :compact, false)::Bool)
         # Print module prefix unless alias is visible from module passed to
@@ -1231,7 +1377,17 @@ function show_datatype(io::IO, x::DataType, wheres::Vector{TypeVar}=TypeVar[])
     end
 
     show_type_name(io, x.name)
-    show_typeparams(io, parameters, (unwrap_unionall(x.name.wrapper)::DataType).parameters, wheres)
+    err_mask = x.name.err_params
+    typelimitflag = get(io, :stacktrace_types_limited, nothing)
+    err_active = typelimitflag isa RefValue{Bool} || get(io, :err_params_active, false)::Bool
+    if err_active && (err_mask & (UInt64(1) << 63)) != 0
+        _show_typeparams_masked(io, parameters, wheres, err_mask, x.name.err_params_mode)
+        if typelimitflag isa RefValue{Bool}
+            typelimitflag[] = true
+        end
+    else
+        show_typeparams(io, parameters, (unwrap_unionall(x.name.wrapper)::DataType).parameters, wheres)
+    end
 end
 
 function show_at_namedtuple(io::IO, syms::Tuple, types::DataType)
