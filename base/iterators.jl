@@ -429,6 +429,37 @@ end
     return _zip_iterate_interleave(xs1, xs2, ds)
 end
 
+# unrolled fast path for most common case of two subiterators
+@propagate_inbounds function _zip_iterate_all(is::Tuple{Any,Any}, ss::Tuple{Any,Any})
+    i1, i2 = is
+    s1, s2 = ss
+    d1 = isdone(i1, s1...)
+    d2 = isdone(i2, s2...)
+    (d1 === true || d2 === true) && return nothing
+    # match subiterator order of generic method
+    if d1 === missing && d2 === missing
+        a = iterate(i1, s1...)
+        a === nothing && return nothing
+        b = iterate(i2, s2...)
+        b === nothing && return nothing
+    elseif d1 === missing  # d2 === false
+        a = iterate(i1, s1...)
+        a === nothing && return nothing
+        b = iterate(i2, s2...)
+    else  # d1 === false
+        if d2 === missing
+            b = iterate(i2, s2...)
+            b === nothing && return nothing
+            a = iterate(i1, s1...)
+        else  # both false
+            a = iterate(i1, s1...)
+            b = iterate(i2, s2...)
+        end
+    end
+    (aval, astate), (bval, bstate) = a, b
+    return ((aval, bval), (astate, bstate))
+end
+
 @propagate_inbounds function _zip_iterate_some(is, ss, ds::Tuple{T,Vararg{Any}}, f::T) where T
     x = iterate(is[1], ss[1]...)
     x === nothing && return nothing
