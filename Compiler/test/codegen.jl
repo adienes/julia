@@ -1102,3 +1102,53 @@ function loop_preserve_any_ea(n)
 end
 loop_preserve_any_ea(10)
 @test (@allocated loop_preserve_any_ea(10)) == 0
+
+# blackbox compiles to zero-cost inline asm, not a runtime call
+@testset "blackbox codegen" begin
+    # Scalar blackbox: should produce inline asm, no call
+    blackbox_int(x::Int) = Base.blackbox(x)
+    ir_int = get_llvm(blackbox_int, Tuple{Int})
+    @test !occursin("call ", strip_debug_calls(ir_int)) || occursin("asm", ir_int)
+    @test !occursin("jl_", ir_int)
+
+    # Pointer/boxed blackbox: should produce julia.blackbox intrinsic (lowered to asm after GC)
+    blackbox_str(x::String) = Base.blackbox(x)
+    ir_str = get_llvm(blackbox_str, Tuple{String}, true, false, false)
+    @test occursin("julia.blackbox", ir_str)
+
+    # blackbox preserves value identity at runtime
+    @test Base.blackbox(42) == 42
+    @test Base.blackbox([1,2,3]) == [1,2,3]
+
+    # blackbox does not allocate for isbits types
+    @test (@allocated Base.blackbox(42)) == 0
+
+    # No gc frame needed for scalar blackbox
+    @test !occursin("%gcframe", get_llvm(blackbox_int, Tuple{Int}))
+
+    # Struct blackbox: uses memory clobber for unboxed aggregates
+    struct BlackboxTestStruct
+        a::Float64
+        b::Float64
+    end
+    blackbox_struct(x::BlackboxTestStruct) = Base.blackbox(x)
+    @test blackbox_struct(BlackboxTestStruct(1.0, 2.0)) == BlackboxTestStruct(1.0, 2.0)
+    ir_struct = get_llvm(blackbox_struct, Tuple{BlackboxTestStruct})
+    @test occursin("~{memory}", ir_struct)
+    @test !occursin("jl_", strip_debug_calls(ir_struct))
+
+    # blackbox barriers Julia-level constprop: return type must be Int, not Const(42)
+    @test Base.return_types() do; Base.blackbox(42); end |> only === Int
+end
+
+# sret parameters must have an alignment attribute (required by LLVM LangRef).
+@testset "sret alignment attribute" begin
+    struct SretAlignTest
+        a::Float32
+        b::Float32
+        c::Float32
+    end
+    @noinline f_srettest(x::Float32) = SretAlignTest(x, x+1, x+2)
+    ir = get_llvm(f_srettest, Tuple{Float32}, true, true, true)
+    @test occursin(r"sret\([^)]+\) align \d+", ir)
+end
