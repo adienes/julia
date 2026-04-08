@@ -1145,6 +1145,18 @@ function copyto!(dest::AbstractArray, dstart::Integer,
     return dest
 end
 
+function copyto!(dest::AbstractArray{T,N}, dstart::NTuple{N,Integer}, src::AbstractArray) where {T,N}
+    isempty(src) && return dest
+    @boundscheck checkbounds(dest, CartesianIndex(dstart))
+    @boundscheck checkbounds(dest, CartesianIndex(ntuple(i -> dstart[i] + size(src, i) - 1, Val(N))))
+    src′ = unalias(dest, src)
+    src_first = ntuple(i -> first(axes(src′, i)), Val(N))
+    @inbounds for I in CartesianIndices(src′)
+        dest[ntuple(i -> dstart[i] + I[i] - src_first[i], Val(N))...] = src′[I]
+    end
+    return dest
+end
+
 function copy(a::AbstractArray)
     @_propagate_inbounds_meta
     copymutable(a)
@@ -2723,36 +2735,20 @@ end
 
 function hvncat_fill!(A::AbstractArray{T, N}, scratch1::Vector{Int}, scratch2::Vector{Int}, d1::Int, d2::Int, as::Tuple) where {T, N}
     N > 1 || throw(ArgumentError("dimensions of the destination array must be at least 2"))
-    length(scratch1) == length(scratch2) == N ||
-        throw(ArgumentError("scratch vectors must have as many elements as the destination array has dimensions"))
+    length(scratch1) >= N ||
+        throw(ArgumentError("scratch vector must have at least as many elements as the destination array has dimensions"))
     0 < d1 < 3 &&
     0 < d2 < 3 &&
     d1 != d2 ||
         throw(ArgumentError("d1 and d2 must be either 1 or 2, exclusive."))
-    outdimsprod = cumprod(size(A))
     offsets = scratch1
-    inneroffsets = scratch2
     for a ∈ as
-        startindex = CartesianIndex(ntuple(i -> offsets[i] + 1, Val(N)))
         if isa(a, AbstractArray)
             if !isempty(a)
-                if length(a) > 4
-                    endindex = CartesianIndex(ntuple(i -> offsets[i] + cat_size(a, i), Val(N)))
-                    @inbounds A[startindex:endindex] = a
-                else
-                    for ai ∈ a
-                        @inbounds Ai = hvncat_calcindex(offsets, inneroffsets, outdimsprod, N)
-                        @inbounds A[Ai] = ai
-                        @inbounds for j ∈ 1:N
-                            inneroffsets[j] += 1
-                            inneroffsets[j] < cat_size(a, j) && break
-                            inneroffsets[j] = 0
-                        end
-                    end
-                end
+                @inbounds copyto!(A, ntuple(i -> offsets[i] + 1, Val(N)), a)
             end
         else
-            @inbounds A[startindex] = a
+            @inbounds A[CartesianIndex(ntuple(i -> offsets[i] + 1, Val(N)))] = a
         end
 
         @inbounds for i ∈ (d1, d2, 3:N...)
@@ -2761,17 +2757,6 @@ function hvncat_fill!(A::AbstractArray{T, N}, scratch1::Vector{Int}, scratch2::V
             offsets[i] = 0
         end
     end
-end
-
-@propagate_inbounds function hvncat_calcindex(offsets::Vector{Int}, inneroffsets::Vector{Int},
-                                                outdimsprod::NTuple{N, Int}, nd::Int) where {N}
-    Ai = inneroffsets[1] + offsets[1] + 1
-    for j ∈ 2:nd
-        increment = inneroffsets[j] + offsets[j]
-        increment *= outdimsprod[j - 1]
-        Ai += increment
-    end
-    Ai
 end
 
 """

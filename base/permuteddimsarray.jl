@@ -290,6 +290,17 @@ function permutedims!(dest, src::AbstractArray, perm)
     return dest
 end
 
+function Base.copyto!(dest::AbstractArray{T,N}, dstart::NTuple{N,Integer},
+                              src::PermutedDimsArray{S,N,perm}) where {T,S,N,perm}
+    isempty(src) && return dest
+    src′ = Base.unalias(dest, src)
+    psrc = parent(src′)
+    @inbounds for I in CartesianIndices(psrc)
+        dest[ntuple(i -> dstart[i] + I[perm[i]] - 1, Val(N))...] = psrc[I]
+    end
+    return dest
+end
+
 function Base.copyto!(dest::PermutedDimsArray{T,N}, src::AbstractArray{T,N}) where {T,N}
     checkbounds(dest, axes(src)...)
     _copy!(dest, src)
