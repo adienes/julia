@@ -1150,9 +1150,8 @@ function copyto!(dest::AbstractArray{T,N}, dstart::NTuple{N,Integer}, src::Abstr
     @boundscheck checkbounds(dest, CartesianIndex(dstart))
     @boundscheck checkbounds(dest, CartesianIndex(ntuple(i -> dstart[i] + size(src, i) - 1, Val(N))))
     src′ = unalias(dest, src)
-    src_first = ntuple(i -> first(axes(src′, i)), Val(N))
-    @inbounds for I in CartesianIndices(src′)
-        dest[ntuple(i -> dstart[i] + I[i] - src_first[i], Val(N))...] = src′[I]
+    @inbounds for I in CartesianIndices(size(src′))
+        dest[ntuple(i -> dstart[i] + I[i] - 1, Val(N))...] = src′[I]
     end
     return dest
 end
