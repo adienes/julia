@@ -1160,10 +1160,22 @@ function copyto!(dest::AbstractArray{T,N}, dstart::NTuple{N,Integer},
     @boundscheck checkbounds(src, CartesianIndex(sstart))
     @boundscheck checkbounds(src, CartesianIndex(ntuple(i -> sstart[i] + n[i] - 1, Val(N))))
     src′ = unalias(dest, src)
-    @inbounds for I in CartesianIndices(n)
-        dest[ntuple(i -> dstart[i] + I[i] - 1, Val(N))...] = src′[ntuple(i -> sstart[i] + I[i] - 1, Val(N))...]
-    end
+    _copyto_srcread!(IndexStyle(src′), dest, dstart, src′, sstart, n)
     return dest
+end
+
+@inline function _copyto_srcread!(::IndexLinear, dest::AbstractArray{T,N}, dstart, src, sstart, n) where {T,N}
+    k = LinearIndices(src)[sstart...]
+    @inbounds for I in CartesianIndices(n)
+        dest[ntuple(i -> dstart[i] + I[i] - 1, Val(N))...] = src[k]
+        k += 1
+    end
+end
+
+@inline function _copyto_srcread!(::IndexCartesian, dest::AbstractArray{T,N}, dstart, src, sstart, n) where {T,N}
+    @inbounds for I in CartesianIndices(n)
+        dest[ntuple(i -> dstart[i] + I[i] - 1, Val(N))...] = src[ntuple(i -> sstart[i] + I[i] - 1, Val(N))...]
+    end
 end
 
 function copy(a::AbstractArray)
