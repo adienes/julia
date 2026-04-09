@@ -1132,12 +1132,13 @@ end
 function copyto!(dest::AbstractArray, dstart::Integer,
                  src::AbstractArray, sstart::Integer,
                  n::Integer)
+    @_propagate_inbounds_meta
     n == 0 && return dest
     n < 0 && throw(ArgumentError(LazyString("tried to copy n=",
         n," elements, but n should be non-negative")))
     destinds, srcinds = LinearIndices(dest), LinearIndices(src)
-    (checkbounds(Bool, destinds, dstart) && checkbounds(Bool, destinds, dstart+n-1)) || throw(BoundsError(dest, dstart:dstart+n-1))
-    (checkbounds(Bool, srcinds, sstart)  && checkbounds(Bool, srcinds, sstart+n-1))  || throw(BoundsError(src,  sstart:sstart+n-1))
+    @boundscheck (checkbounds(Bool, destinds, dstart) && checkbounds(Bool, destinds, dstart+n-1)) || throw(BoundsError(dest, dstart:dstart+n-1))
+    @boundscheck (checkbounds(Bool, srcinds, sstart)  && checkbounds(Bool, srcinds, sstart+n-1))  || throw(BoundsError(src,  sstart:sstart+n-1))
     src′ = unalias(dest, src)
     @inbounds for i = 0:n-1
         dest[dstart+i] = src′[sstart+i]
@@ -1146,13 +1147,21 @@ function copyto!(dest::AbstractArray, dstart::Integer,
 end
 
 function copyto!(dest::AbstractArray{T,N}, dstart::NTuple{N,Integer}, src::AbstractArray) where {T,N}
+    copyto!(dest, dstart, src, ntuple(i -> first(axes(src, i)), Val(N)))
+end
+
+function copyto!(dest::AbstractArray{T,N}, dstart::NTuple{N,Integer},
+                 src::AbstractArray, sstart::NTuple{N,Integer}) where {T,N}
+    @_propagate_inbounds_meta
     isempty(src) && return dest
+    n = ntuple(i -> size(src, i), Val(N))
     @boundscheck checkbounds(dest, CartesianIndex(dstart))
-    @boundscheck checkbounds(dest, CartesianIndex(ntuple(i -> dstart[i] + size(src, i) - 1, Val(N))))
+    @boundscheck checkbounds(dest, CartesianIndex(ntuple(i -> dstart[i] + n[i] - 1, Val(N))))
+    @boundscheck checkbounds(src, CartesianIndex(sstart))
+    @boundscheck checkbounds(src, CartesianIndex(ntuple(i -> sstart[i] + n[i] - 1, Val(N))))
     src′ = unalias(dest, src)
-    src_shape = ntuple(i -> size(src′, i), Val(N))
-    @inbounds for I in CartesianIndices(src_shape)
-        dest[ntuple(i -> dstart[i] + I[i] - 1, Val(N))...] = src′[I]
+    @inbounds for I in CartesianIndices(n)
+        dest[ntuple(i -> dstart[i] + I[i] - 1, Val(N))...] = src′[ntuple(i -> sstart[i] + I[i] - 1, Val(N))...]
     end
     return dest
 end
@@ -2745,7 +2754,7 @@ function hvncat_fill!(A::AbstractArray{T, N}, scratch1::Vector{Int}, scratch2::V
     for a ∈ as
         if isa(a, AbstractArray)
             if !isempty(a)
-                @inbounds copyto!(A, ntuple(i -> offsets[i] + 1, Val(N)), a)
+                @inbounds copyto!(A, ntuple(i -> offsets[i] + 1, Val(N)), a, ntuple(i -> first(axes(a, i)), Val(N)))
             end
         else
             @inbounds A[CartesianIndex(ntuple(i -> offsets[i] + 1, Val(N)))] = a
