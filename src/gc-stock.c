@@ -35,6 +35,15 @@ static const size_t default_collect_interval = 5600 * 1024 * sizeof(void*); // ~
 static const size_t default_collect_interval = 3200 * 1024 * sizeof(void*); // ~12 MiB
 #endif
 
+// Trigger an automatic full collection when the heap has grown by this factor
+// since the last full collection. The overallocation curve grows the heap by
+// roughly 1.4× per ineffective incremental, so 4× corresponds to ~4 incrementals
+// that failed to bring the heap back down -- a strong signal that old-generation
+// pages need a full sweep. Lower values regress workloads that build up
+// long-lived structures across iterations (issue #53018) by triggering full
+// sweeps on freshly-promoted, still-live objects.
+static const double full_gc_heap_growth_threshold = 4.0;
+
 // ID of first GC thread
 int gc_first_tid;
 // Number of GC threads that may run parallel marking
@@ -203,7 +212,10 @@ static int mark_reset_age = 0;
 
 static int64_t scanned_bytes; // young bytes scanned while marking
 static int64_t perm_scanned_bytes; // old bytes scanned while marking
-static int64_t heap_size_after_last_full_gc = 0;
+// Baseline for the heap-growth full-GC trigger. Initialized so the first full
+// sweep doesn't fire on a near-zero startup heap; overwritten with the live
+// heap_size at the end of every full GC.
+static int64_t heap_size_after_last_full_gc = default_collect_interval;
 int prev_sweep_full = 1;
 int current_sweep_full = 0;
 int next_sweep_full = 0;
@@ -3351,21 +3363,18 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection) JL_NOTS
         promoted_bytes = 0;
         heap_size_after_last_full_gc = jl_atomic_load_relaxed(&gc_heap_stats.heap_size);
     }
-    // We want to trigger full GCs either if the heap size has grown a lot since the last full GC.
-    // For this we use the overallocation function to see what a reasonable rate of growth is,
-    // or if there is too much memory that has not seen a full GC after being promoted to old.
-    double old_ratio = (double)promoted_bytes/(double)heap_size;
-    double expected_heap_size = overallocation(heap_size_after_last_full_gc, 0, UINT64_MAX) + heap_size_after_last_full_gc;
-    double last_full_gc_heap_ratio = (double)heap_size/expected_heap_size;
+    // Decide whether the next collection should be a full sweep. The previous
+    // `promoted_bytes / heap_size > 0.15` heuristic fired on virtually every
+    // incremental in workloads that build up multi-megabyte structures across
+    // iterations: a single incremental promotes enough young bytes to exceed the
+    // ratio, scheduling a full sweep that runs immediately after, while those
+    // just-promoted objects are still alive. See issue #53018.
+    double last_full_gc_heap_ratio = (double)heap_size / (double)heap_size_after_last_full_gc;
     if (heap_size > user_max) {
         next_sweep_full = 1;
         gc_record_full_sweep_reason(FULL_SWEEP_REASON_USER_MAX_EXCEEDED);
     }
-    else if (old_ratio > 0.15) {
-        next_sweep_full = 1;
-        gc_record_full_sweep_reason(FULL_SWEEP_REASON_LARGE_PROMOTION_RATE);
-    }
-    else if (last_full_gc_heap_ratio > 1) {
+    else if (last_full_gc_heap_ratio > full_gc_heap_growth_threshold) {
         next_sweep_full = 1;
         gc_record_full_sweep_reason(FULL_SWEEP_REASON_LARGE_HEAP_GROWTH);
     }

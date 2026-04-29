@@ -56,6 +56,29 @@ function full_sweep_reasons_test()
     @test keys(reasons) == Set(Base.FULL_SWEEP_REASONS)
 end
 
+# Issue #53018: workloads that build up multi-megabyte structures across
+# iterations used to trigger an automatic full sweep on roughly every other
+# incremental, since `promoted_bytes / heap_size > 0.15` fired on the still-live
+# just-promoted bytes. Make sure we do not regress to that behavior.
+function issue_53018_test()
+    function work(m, n, k)
+        res = 0.0
+        for _ in 1:k
+            res += sum(sum.([rand(rand(1:m)) for _ in 1:n]))
+        end
+        res
+    end
+    work(100, 100, 1)  # warmup
+    GC.gc()
+    before = Base.full_sweep_reasons()
+    work(100, 100_000, 5)
+    after = Base.full_sweep_reasons()
+    full_sweeps = sum(after[k] - before[k] for k in keys(after))
+    # Pre-fix this MWE caused ~30 automatic full sweeps; post-fix it is in
+    # single digits. Set a generous bound so the test does not become flaky.
+    @test full_sweeps < 10
+end
+
 # !!! note:
 #     Since we run our tests on 32bit OS as well we confine ourselves
 #     to parameters that allocate about 512MB of objects. Max RSS is lower
@@ -81,6 +104,10 @@ end
 
 @testset "Full GC reasons" begin
     full_sweep_reasons_test()
+end
+
+@testset "issue-53018" begin
+    issue_53018_test()
 end
 
 @testset "GC Always Full" begin
