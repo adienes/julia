@@ -91,7 +91,11 @@ extern "C" {
 struct _jl_taggedvalue_bits {
     uintptr_t gc:2;
     uintptr_t in_image:1;
-    uintptr_t unused:1;
+    uintptr_t young_age:1;  // Generational age in young gen; 0 = freshly
+                            // allocated or just promoted, 1 = survived one
+                            // collection. Promotion to old gen happens when an
+                            // object marked alive at age 1 is swept. Ignored
+                            // for objects with the GC_OLD bit set.
 #ifdef _P64
     uintptr_t tag:60;
 #else

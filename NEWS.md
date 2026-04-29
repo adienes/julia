@@ -36,6 +36,15 @@ Compiler/Runtime improvements
     ([#41199], [#47574]).
   - Stack traces now show full method signatures with argument types for inlined
     frames, matching the display of non-inlined frames ([#53925]).
+  - The garbage collector now ages young objects: an object must survive two
+    incremental collections in young generation before being promoted to old
+    generation, instead of being promoted on first survival. Workloads that
+    build up multi-megabyte structures across iterations (e.g. populating a
+    `Vector{Vector{T}}` over a loop) no longer leak short-lived intermediate
+    state into the old generation, eliminating a class of repeated full sweeps
+    that could cost 50-90% of GC time. The full-sweep heuristic was also
+    simplified -- the prior `promoted_bytes / heap_size > 0.15` trigger has
+    been replaced with a single heap-growth threshold. See [#53018].
 
 Command-line option changes
 ---------------------------

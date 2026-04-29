@@ -47,13 +47,29 @@ Although Julia currently uses `libc` `malloc`, it also supports pre-loading othe
 
 ## Marking and Generational Collection
 
-Julia’s mark phase is implemented through a parallel depth-first-search that traverses the object graph to determine which objects are alive.
+Julia's mark phase is implemented through a parallel depth-first-search that traverses the object graph to determine which objects are alive.
 
-Julia stores age information for its generational GC in the object header: the lowest two bits of an object’s header store a mark bit, set when an object is marked, and an age bit, set when the object is promoted. Because Julia’s GC is non-moving, object age information can’t be only determined through the object's memory address, such as in GC implementations that allocate young objects in certain memory regions and relocate them to other memory regions during object promotion.
+Julia stores GC state in the object header. The four lowest bits of the header word are used as follows:
+
+| bit | name        | meaning                                                                                |
+|-----|-------------|----------------------------------------------------------------------------------------|
+| 0   | `gc[0]`     | combined with bit 1 to encode one of `GC_CLEAN`, `GC_MARKED`, `GC_OLD`, `GC_OLD_MARKED` |
+| 1   | `gc[1]`     | (see above)                                                                            |
+| 2   | `in_image`  | object was loaded from a system image                                                  |
+| 3   | `young_age` | young-generation age: 0 for fresh, 1 after surviving one collection                    |
+
+Because Julia's GC is non-moving, object generation/age information can't be determined from the object's memory address alone, as it can in GC implementations that segregate young and old objects into different memory regions.
+
+Young objects pass through two ages before being promoted:
+
+- **Age 0**: the freshly-allocated state. The mark phase marks the object (`GC_CLEAN` → `GC_MARKED`), and the next sweep transitions it to `(GC_CLEAN, age=1)` -- still young, but the *next* mark+sweep will promote it.
+- **Age 1**: an object marked alive while at age 1 is promoted to old (`GC_OLD`) by the next sweep, with the age bit cleared.
+
+This two-stage aging means a transient structure that happens to be alive across one collection (for example, a temporary `Vector` used during a single iteration of a loop) does not get promoted to old gen. Without aging, such structures leaked into the old generation and could only be reclaimed by a full sweep, which caused excessive full sweeps on workloads that build up multi-megabyte structures incrementally (see [issue #53018](https://github.com/JuliaLang/julia/issues/53018)). The threshold is `MAX_YOUNG_AGE = 1` (in `src/julia_internal.h`); raising it would catch more transient promotions but requires stealing additional bits from the type tag.
 
 Generational collection is implemented through sticky bits: objects are only pushed to the mark-stack, and therefore traced, if their mark-bits have not been set. When objects reach the oldest generation, their mark-bits aren't reset during a quick sweep, so these objects aren't traced during a subsequent mark phase. A full sweep, however, resets the mark-bits of all objects, so all of them are traced in a subsequent collection.
 
-When the mutator is running, a write barrier intercepts field writes and pushes an object’s address into a per-thread remembered set if the reference crosses generations. Objects in this remembered set are then traced during the next mark phase.
+When the mutator is running, a write barrier intercepts field writes and pushes an object's address into a per-thread remembered set if the reference crosses generations. Objects in this remembered set are then traced during the next mark phase.
 
 ## Sweeping
 

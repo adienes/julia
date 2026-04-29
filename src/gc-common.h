@@ -46,8 +46,15 @@ JL_EXTENSION typedef struct _bigval_t {
     //struct jl_taggedvalue_t <>;
     union {
         uintptr_t header;
+        // Bit layout must match `_jl_taggedvalue_bits` (see `julia.h`) so that
+        // bigval headers and pool-object tags can be manipulated by the same
+        // GC code. `in_image` is unused for bigvals -- bigvals are not loaded
+        // from the system image -- but is included here so the bit positions
+        // of `gc` and `young_age` line up with the pool-object tag.
         struct {
             uintptr_t gc:2;
+            uintptr_t in_image:1;
+            uintptr_t young_age:1;
         } bits;
     };
     // must be 64-byte aligned here, in 32 & 64 bit modes

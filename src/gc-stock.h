@@ -561,6 +561,11 @@ FORCE_INLINE void gc_big_object_link(bigval_t *sentinel_node, bigval_t *node) JL
 #define FULL_SWEEP_REASON_SWEEP_ALWAYS_FULL (0)
 #define FULL_SWEEP_REASON_FORCED_FULL_SWEEP (1)
 #define FULL_SWEEP_REASON_USER_MAX_EXCEEDED (2)
+// `LARGE_PROMOTION_RATE` is currently inactive: the underlying heuristic was
+// removed for issue #53018 because it triggered on still-live just-promoted
+// bytes. The reason code is retained (the slot in `jl_full_sweep_reasons` is
+// reserved) so that an alternate, sustained-promotion-aware heuristic can
+// be reintroduced later without changing the public reason indices.
 #define FULL_SWEEP_REASON_LARGE_PROMOTION_RATE (3)
 #define FULL_SWEEP_REASON_LARGE_HEAP_GROWTH (4)
 #define FULL_SWEEP_NUM_REASONS (5)

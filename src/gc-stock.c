@@ -224,6 +224,15 @@ int gc_disable_auto_full_sweep = 0; // when set, automatic full collections are 
 
 // Full collection heuristics
 static int64_t live_bytes = 0;
+// `promoted_bytes` accumulates the number of young bytes marked alive across
+// successive incremental sweeps. Note the semantic shift caused by object
+// aging: with aging, "marked alive young" no longer implies "promoted to old"
+// -- objects at age 0 transition to (CLEAN, age=1) on sweep instead of being
+// promoted -- so this counter actually measures the cumulative size of marked
+// young objects, not actual promotions. The old `promoted_bytes / heap_size`
+// full-sweep heuristic that relied on this name has been removed (issue #53018);
+// the counter is kept because external users may read it via `Base.gc_num()`
+// and it is still useful as a coarse "young survivor volume" metric.
 static int64_t promoted_bytes = 0;
 static int64_t last_live_bytes = 0; // live_bytes at last collection
 #ifdef __GLIBC__
@@ -258,9 +267,11 @@ FORCE_INLINE int gc_try_setmark_tag(jl_taggedvalue_t *o, uint8_t mark_mode) JL_N
     if (gc_marked(tag))
         return 0;
     if (mark_reset_age) {
-        // Reset the object as if it was just allocated
+        // Reset the object as if it was just allocated. This must clear both
+        // the GC state bits (so it transitions back to GC_MARKED young) and
+        // the young_age bit (so the next sweep treats it as age 0, not age 1).
         mark_mode = GC_MARKED;
-        tag = gc_set_bits(tag, mark_mode);
+        tag = (gc_set_bits(tag, mark_mode)) & ~(uintptr_t)GC_YOUNG_AGE;
     }
     else {
         if (gc_old(tag))
@@ -515,8 +526,18 @@ static bigval_t *sweep_list_of_young_bigvals(bigval_t *young) JL_NOTSAFEPOINT
         int bits = v->bits.gc;
         int old_bits = bits;
         if (gc_marked(bits)) {
+            // Same state machine as the pool-sweep alive case. See the comment
+            // in `gc_sweep_page` for the full transition table.
             if (sweep_full || bits == GC_MARKED) {
-                bits = GC_OLD;
+                int age = v->bits.young_age;
+                if (sweep_full || age >= MAX_YOUNG_AGE) {
+                    bits = GC_OLD;
+                    v->bits.young_age = 0;
+                }
+                else {
+                    bits = GC_CLEAN;
+                    v->bits.young_age = age + 1;
+                }
                 last_node = v;
             }
             else { // `bits == GC_OLD_MARKED`
@@ -943,12 +964,33 @@ static void gc_sweep_page(gc_page_profiler_serializer_t *s, jl_gc_pool_t *p, jl_
                 pfl_begin = (pfl_begin != NULL) ? pfl_begin : pfl;
                 pg_nfree++;
             }
-            else { // marked young or old
-                if (current_sweep_full || bits == GC_MARKED) { // old enough
-                    bits = v->bits.gc = GC_OLD; // promote
+            else { // marked young or old (alive)
+                // State transitions on alive objects in pool sweep:
+                //
+                //   sweep_full                              -> GC_OLD       (drop age)
+                //   incr  & GC_MARKED & age == MAX_YOUNG_AGE -> GC_OLD       (drop age, promote)
+                //   incr  & GC_MARKED & age <  MAX_YOUNG_AGE -> GC_CLEAN     (age++, stay young)
+                //   incr  & GC_OLD_MARKED                    -> unchanged    (cleaned up by next full)
+                //
+                // The "stay young, transition to CLEAN" case is the aging
+                // path: the object will be re-traversed by the next mark
+                // phase (since CLEAN is "not yet marked this cycle"), so its
+                // outgoing edges get re-scanned -- which is required for
+                // correctness if any of those edges have been mutated.
+                if (current_sweep_full || bits == GC_MARKED) {
+                    int age = v->bits.young_age;
+                    if (current_sweep_full || age >= MAX_YOUNG_AGE) {
+                        v->bits.gc = GC_OLD;
+                        v->bits.young_age = 0;
+                    }
+                    else {
+                        v->bits.gc = GC_CLEAN;
+                        v->bits.young_age = age + 1;
+                        has_young = 1;
+                    }
                 }
                 prev_nold++;
-                has_marked |= gc_marked(bits);
+                has_marked |= gc_marked(v->bits.gc);
                 freedall = 0;
             }
             v = (jl_taggedvalue_t*)((char*)v + osize);
@@ -4110,33 +4152,38 @@ JL_DLLEXPORT jl_value_t *jl_gc_internal_obj_base_ptr(void *p)
                     return NULL;
                 goto valid_object;
             }
-            // case 3: this is a page with a freelist
-            // marked or old objects can't be on the freelist
+            // case 3: this is a page with a freelist.
+            //
+            // We need to distinguish three states a cell can be in here:
+            //   (a) live object (alive at last sweep, possibly with age=1)
+            //   (b) freshly allocated since the last sweep
+            //   (c) on the freelist (dead)
+            //
+            // The GC state bits (`bits.gc`) and the young_age bit together
+            // give us most of what we need. A non-zero `bits.gc` means
+            // GC_MARKED / GC_OLD / GC_OLD_MARKED -- never a freelist entry.
             if (cell->bits.gc)
                 goto valid_object;
-            // When allocating from a freelist, three subcases are possible:
-            // * The freelist of a page has been exhausted; this was handled
-            //   under case 1, as nfree == 0.
-            // * The freelist of the page has not been used, and the age bits
-            //   reflect whether a cell is on the freelist or an object.
-            // * The freelist is currently being allocated from. In this case,
-            //   pool->freelist will point to the current page; any cell with
-            //   a lower address will be an allocated object, and for cells
-            //   with the same or a higher address, the corresponding age
-            //   bit will reflect whether it's on the freelist.
-            // Age bits are set in sweep_page() and are 0 for freelist
-            // entries and 1 for live objects. The above subcases arise
-            // because allocating a cell will not update the age bit, so we
-            // need extra logic for pages that have been allocated from.
-            // We now distinguish between the second and third subcase.
-            // Freelist entries are consumed in ascending order. Anything
-            // before the freelist pointer was either live during the last
-            // sweep or has been allocated since.
+            // Aged-young objects (gc=GC_CLEAN with young_age=1) are alive: a
+            // pool-sweep transitions surviving young from (GC_MARKED, age=0)
+            // to (GC_CLEAN, age=1) without freeing them, so a non-zero age
+            // bit unambiguously means "live".
+            if (cell->bits.young_age)
+                goto valid_object;
+            // We're left with (b) freshly-allocated and (c) freelist entry,
+            // both of which have gc=GC_CLEAN and young_age=0. Distinguish them
+            // by position relative to the freelist pointer:
+            //   * On a fresh page (bumping from `newpages`), a cell before
+            //     the bump pointer is allocated; this was handled in case 2.
+            //   * On a page being allocated from a freelist, freelist entries
+            //     are consumed in ascending address order. Any cell at an
+            //     address strictly less than `pool->freelist` was either live
+            //     at the last sweep (case a, but with gc=0 we wouldn't reach
+            //     here) or has been allocated since (case b).
             if (gc_page_data(cell) == gc_page_data(pool->freelist)
                 && (char *)cell < (char *)pool->freelist)
                 goto valid_object;
-            // already skipped marked or old objects above, so here
-            // the age bits are 0, thus the object is on the freelist
+            // None of the above: cell is on the freelist.
             return NULL;
         }
         // Not a freelist entry, therefore a valid object.
@@ -4145,7 +4192,9 @@ JL_DLLEXPORT jl_value_t *jl_gc_internal_obj_base_ptr(void *p)
         // as they must not be passed to the usual marking functions.
         // Note that jl_buff_tag is real pointer into libjulia,
         // thus it cannot be a type reference.
-        if ((cell->header & ~(uintptr_t) 3) == jl_buff_tag)
+        // Mask off all 4 GC/state bits (gc, in_image, young_age) so the
+        // comparison is independent of any state on the cell.
+        if ((cell->header & ~(uintptr_t) 0xf) == jl_buff_tag)
             return NULL;
         return jl_valueof(cell);
     }

@@ -424,6 +424,20 @@ static inline void memassign_safe(int hasptr, char *dst, const jl_value_t *src, 
 #define GC_OLD    2 // if it is reachable it will be marked as old
 #define GC_OLD_MARKED (GC_OLD | GC_MARKED) // reachable and old
 #define GC_IN_IMAGE 4
+#define GC_YOUNG_AGE 8 // bit 3 of the tag; 1 = object has survived one young
+                       // collection and is eligible for promotion on its next
+                       // survival. See `young_age:1` in `_jl_taggedvalue_bits`.
+
+// Maximum young-generation age. An object is promoted to old gen when it is
+// found alive while its age is already MAX_YOUNG_AGE. With one age bit
+// (current layout), MAX_YOUNG_AGE = 1, meaning objects survive 2 collections
+// in young before promotion. This avoids promoting transient structures that
+// happen to be alive across a single collection -- see issue #53018.
+//
+// TODO: a higher MAX_YOUNG_AGE would catch more transient promotions, but
+// requires stealing additional bits from `tag:60` in `_jl_taggedvalue_bits`,
+// which in turn requires auditing every caller that masks the tag word.
+#define MAX_YOUNG_AGE 1
 
 // data structures for runtime codegen
 typedef struct _jl_abi_t {

@@ -56,6 +56,59 @@ function full_sweep_reasons_test()
     @test keys(reasons) == Set(Base.FULL_SWEEP_REASONS)
 end
 
+# Read the GC state and young_age bits out of an object's header.
+# Layout (from src/julia.h `_jl_taggedvalue_bits`):
+#   bits 0-1: gc (GC_CLEAN=0, GC_MARKED=1, GC_OLD=2, GC_OLD_MARKED=3)
+#   bit  2:   in_image
+#   bit  3:   young_age
+function _read_tag_state(@nospecialize x)
+    tag = unsafe_load(Ptr{UInt}(pointer_from_objref(x) - sizeof(UInt)))
+    (gc = Int(tag & 0x3), age = Int((tag >> 3) & 0x1))
+end
+
+# Verify that an object is aged before being promoted to old gen, and that
+# short-lived objects can die in young without ever reaching old gen.
+function aging_state_machine_test()
+    # Force a quiescent state first
+    GC.gc(true); GC.gc(true)
+
+    # Allocate a fresh object
+    x = Ref(0)
+    s0 = _read_tag_state(x)
+    @test s0 == (gc = 0, age = 0)            # CLEAN, age 0
+
+    # One incremental: alive, age++
+    GC.gc(false)
+    s1 = _read_tag_state(x)
+    @test s1 == (gc = 0, age = 1)            # CLEAN, age 1 (still young)
+
+    # Second incremental: alive at age 1, promote to OLD
+    GC.gc(false)
+    s2 = _read_tag_state(x)
+    @test s2.gc == 2                         # GC_OLD
+    @test s2.age == 0                        # age cleared on promotion
+
+    # Verify mark transitions OLD -> OLD_MARKED on the next mark cycle.
+    GC.gc(false)
+    s3 = _read_tag_state(x)
+    @test s3.gc == 3                         # GC_OLD_MARKED
+end
+
+# Verify that a young object that becomes unreachable before age MAX_YOUNG_AGE+1
+# is freed in young (never reaches old gen).
+function aging_short_lived_dies_in_young_test()
+    # Wrap allocation in a function so the local stays alive only inside.
+    weak = let
+        x = Ref(0)
+        GC.gc(false)                          # x: (CLEAN, age=1) after this
+        WeakRef(x)
+    end
+    # x should be unreachable now. Two incrementals are enough to free it
+    # without it ever reaching old gen.
+    GC.gc(false)
+    @test weak.value === nothing
+end
+
 # Issue #53018: workloads that build up multi-megabyte structures across
 # iterations used to trigger an automatic full sweep on roughly every other
 # incremental, since `promoted_bytes / heap_size > 0.15` fired on the still-live
@@ -104,6 +157,11 @@ end
 
 @testset "Full GC reasons" begin
     full_sweep_reasons_test()
+end
+
+@testset "object aging" begin
+    aging_state_machine_test()
+    aging_short_lived_dies_in_young_test()
 end
 
 @testset "issue-53018" begin
