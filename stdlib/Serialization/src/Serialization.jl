@@ -270,10 +270,23 @@ function serialize(s::AbstractSerializer, x::Symbol)
     nothing
 end
 
+# Pointers into the data and typetag regions of a bits-union Array/Memory,
+# accounting for any element offset of an Array view into its backing Memory.
+function _bitsunion_pointers(a)
+    elsz = Base.elsize(a)
+    mem = isa(a, Array) ? getfield(a, :ref).mem : a
+    data_ptr = convert(Ptr{UInt8}, pointer(a))
+    mem_data_ptr = convert(Ptr{UInt8}, pointer(mem))
+    elem_offset = (data_ptr - mem_data_ptr) ÷ elsz
+    tag_ptr = ccall(:jl_genericmemory_typetagdata, Ptr{UInt8}, (Any,), mem) + elem_offset
+    return data_ptr, tag_ptr, length(a), elsz
+end
+
 function serialize_array_data(s::IO, a)
     require_one_based_indexing(a)
     isempty(a) && return 0
-    if eltype(a) === Bool
+    elty = eltype(a)
+    if elty === Bool
         last = a[1]::Bool
         count = 1
         for i = 2:length(a)
@@ -286,9 +299,45 @@ function serialize_array_data(s::IO, a)
             end
         end
         write(s, UInt8((UInt8(last) << 7) | count))
+    elseif Base.isbitsunion(elty)
+        # Layout is `[data: n*elsz][tags: n]`; emit each region as a raw blob.
+        data_ptr, tag_ptr, n, elsz = _bitsunion_pointers(a)
+        GC.@preserve a begin
+            unsafe_write(s, data_ptr, UInt(n * elsz))
+            unsafe_write(s, tag_ptr, UInt(n))
+        end
     else
         write(s, a)
     end
+end
+
+function deserialize_array_data!(s::IO, a)
+    require_one_based_indexing(a)
+    n = length(a)
+    n == 0 && return a
+    elty = eltype(a)
+    if elty === Bool
+        i = 1
+        while i <= n
+            b = read(s, UInt8)::UInt8
+            v = (b >> 7) != 0
+            count = b & 0x7f
+            nxt = i + count
+            while i < nxt
+                @inbounds a[i] = v
+                i += 1
+            end
+        end
+    elseif Base.isbitsunion(elty)
+        data_ptr, tag_ptr, _, elsz = _bitsunion_pointers(a)
+        GC.@preserve a begin
+            unsafe_read(s, data_ptr, UInt(n * elsz))
+            unsafe_read(s, tag_ptr, UInt(n))
+        end
+    else
+        read!(s, a)
+    end
+    return a
 end
 
 function serialize(s::AbstractSerializer, a::Array)
@@ -303,7 +352,7 @@ function serialize(s::AbstractSerializer, a::Array)
     else
         serialize(s, length(a))
     end
-    if isbitstype(elty)
+    if isbitstype(elty) || Base.isbitsunion(elty)
         serialize_array_data(s.io, a)
     else
         sizehint!(s.table, div(length(a),4))  # prepare for lots of pointers
@@ -329,7 +378,7 @@ function serialize(s::AbstractSerializer, m::Memory)
     serialize_cycle_header(s, m) && return
     serialize(s, length(m))
     elty = eltype(m)
-    if isbitstype(elty)
+    if isbitstype(elty) || Base.isbitsunion(elty)
         serialize_array_data(s.io, m)
     else
         sizehint!(s.table, div(length(m),4))  # prepare for lots of pointers
@@ -1429,6 +1478,12 @@ function deserialize_array(s::AbstractSerializer)
             s.table[slot] = a
             return read!(s.io, a)
         end
+        if format_version(s) >= 31 && Base.isbitsunion(elty)
+            a = Vector{elty}(undef, d1)
+            s.table[slot] = a
+            deserialize_array_data!(s.io, a)
+            return a
+        end
         dims = (Int(d1),)
     elseif d1 isa Dims
         dims = d1::Dims
@@ -1456,6 +1511,12 @@ function deserialize_array(s::AbstractSerializer)
         s.table[slot] = A
         return A
     end
+    if format_version(s) >= 31 && Base.isbitsunion(elty)
+        A = Array{elty, length(dims)}(undef, dims)
+        s.table[slot] = A
+        deserialize_array_data!(s.io, A)
+        return A
+    end
     A = Array{elty, length(dims)}(undef, dims)
     s.table[slot] = A
     sizehint!(s.table, s.counter + div(length(A)::Int,4))
@@ -1477,24 +1538,10 @@ function deserialize(s::AbstractSerializer, X::Type{Memory{T}} where T)
     slot = pop!(s.pending_refs) # e.g. deserialize_cycle
     n = deserialize(s)::Int
     elty = eltype(X)
-    if isbitstype(elty)
+    if isbitstype(elty) || (format_version(s) >= 31 && Base.isbitsunion(elty))
         A = X(undef, n)
-        if X === Memory{Bool}
-            i = 1
-            while i <= n
-                b = read(s.io, UInt8)::UInt8
-                v = (b >> 7) != 0
-                count = b & 0x7f
-                nxt = i + count
-                while i < nxt
-                    A[i] = v
-                    i += 1
-                end
-            end
-        else
-            A = read!(s.io, A)::X
-        end
         s.table[slot] = A
+        deserialize_array_data!(s.io, A)
         return A
     end
     A = X(undef, n)
