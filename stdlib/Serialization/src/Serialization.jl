@@ -83,7 +83,7 @@ const TAGS = Any[
 const NTAGS = length(TAGS)
 @assert NTAGS == 255
 
-const ser_version = 30 # do not make changes without bumping the version #!
+const ser_version = 31 # do not make changes without bumping the version #!
 
 format_version(::AbstractSerializer) = ser_version
 format_version(s::Serializer) = s.version
@@ -706,17 +706,22 @@ end
 serialize(s::AbstractSerializer, ::Type{Bottom}) = write_as_tag(s.io, BOTTOM_TAG)
 
 function serialize(s::AbstractSerializer, u::UnionAll)
-    writetag(s.io, UNIONALL_TAG)
     n = 0; t = u
     while isa(t, UnionAll)
         t = t.body
         n += 1
     end
     if isa(t, DataType) && t === unwrap_unionall(t.name.wrapper)
+        # wrapper form: dedup happens at the TypeName level
+        writetag(s.io, UNIONALL_TAG)
         write(s.io, UInt8(1))
         write(s.io, Int16(n))
         serialize(s, t)
     else
+        # non-wrapper form: dedup the UnionAll itself; the body cannot reference
+        # back into u in this form, so eager registration is safe (#58007)
+        serialize_cycle(s, u) && return
+        writetag(s.io, UNIONALL_TAG)
         write(s.io, UInt8(0))
         serialize(s, u.var)
         serialize(s, u.body)
@@ -951,6 +956,18 @@ function handle_deserialize(s::AbstractSerializer, b::Int32)
     elseif b == WRAPPER_DATATYPE_TAG
         tname = deserialize(s)::Core.TypeName
         return unwrap_unionall(tname.wrapper)
+    elseif b == UNIONALL_TAG
+        # v31+: non-wrapper UnionAlls are deduplicated via the back-ref table (#58007).
+        # Wrapper-form UnionAlls are dedup'd at the TypeName level instead.
+        form = read(s.io, UInt8)
+        if format_version(s) >= 31 && form == 0
+            slot = s.counter
+            s.counter += 1
+            result = deserialize_unionall(s, form)::UnionAll
+            s.table[slot] = result
+            return result
+        end
+        return deserialize_unionall(s, form)
     elseif b == OBJECT_TAG
         t = deserialize(s)
         if t === Missing
@@ -1627,29 +1644,27 @@ function deserialize_datatype(s::AbstractSerializer, full::Bool)
     return t
 end
 
-function deserialize(s::AbstractSerializer, ::Type{UnionAll})
-    form = read(s.io, UInt8)
+function deserialize_unionall(s::AbstractSerializer, form::UInt8)
     if form == 0
         var = deserialize(s)
         body = deserialize(s)
         return UnionAll(var, body)
-    else
-        n = read(s.io, Int16)
-        t = deserialize(s)::DataType
-        w = t.name.wrapper
-        k = 0
-        while isa(w, UnionAll)
-            w = w.body
-            k += 1
-        end
-        w = t.name.wrapper
-        k -= n
-        while k > 0
-            w = w.body
-            k -= 1
-        end
-        return w
     end
+    n = read(s.io, Int16)
+    t = deserialize(s)::DataType
+    w = t.name.wrapper
+    k = 0
+    while isa(w, UnionAll)
+        w = w.body
+        k += 1
+    end
+    w = t.name.wrapper
+    k -= n
+    while k > 0
+        w = w.body
+        k -= 1
+    end
+    return w
 end
 
 function deserialize(s::AbstractSerializer, ::Type{Task})
