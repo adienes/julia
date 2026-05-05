@@ -17,19 +17,120 @@ export serialize, deserialize, AbstractSerializer, Serializer
 
 abstract type AbstractSerializer end
 
+# Open-addressed identity-hash table mapping objects to `Int` counter values.
+# Used for the serialize-side cycle table: parallel `Memory{Any}` (keys) and
+# `Memory{Int}` (values) keep the counter stored inline, eliminating per-insert
+# boxing and the `RefValue{Cint}` allocation `IdDict.setindex!` would have.
+struct _CycleEmpty end
+const _empty_cycle_slot = _CycleEmpty()
+
+# Shared zero-length backing buffers for empty `CycleTable`s — avoids the
+# ~330-byte per-Serializer allocation cost when no cycle ever lands in the
+# table (small/scalar payloads). The buffers are zero-length so cannot be
+# mutated; on first insert `_cycle_grow!` allocates a real 16-slot table.
+const _EMPTY_CYCLE_KEYS = Memory{Any}(undef, 0)
+const _EMPTY_CYCLE_VALS = Memory{Int}(undef, 0)
+
+mutable struct CycleTable
+    keys::Memory{Any}
+    vals::Memory{Int}
+    count::Int
+    CycleTable() = new(_EMPTY_CYCLE_KEYS, _EMPTY_CYCLE_VALS, 0)
+end
+
+@inline function cycle_get(t::CycleTable, @nospecialize(key), default::Int)
+    sz = length(t.keys)
+    sz == 0 && return default
+    h = objectid(key)
+    mask = (sz % UInt) - one(UInt)
+    idx0 = h & mask
+    while true
+        @inbounds k = t.keys[Int(idx0) + 1]
+        k === _empty_cycle_slot && return default
+        k === key && return @inbounds t.vals[Int(idx0) + 1]
+        idx0 = (idx0 + one(UInt)) & mask
+    end
+end
+
+@noinline function _cycle_grow!(t::CycleTable)
+    old_keys = t.keys
+    old_vals = t.vals
+    # First grow from the shared empty buffer goes to 16 slots; subsequent
+    # grows quadruple to amortize the cost of `Memory` allocation and
+    # zero-init across more inserts (matches the mid-range strategy in
+    # `jl_idtable_rehash`).
+    old_sz = length(old_keys)
+    new_sz = old_sz == 0 ? 16 : old_sz * 4
+    new_keys = Memory{Any}(undef, new_sz)
+    new_vals = Memory{Int}(undef, new_sz)
+    @inbounds for i in 1:new_sz
+        new_keys[i] = _empty_cycle_slot
+    end
+    mask = (new_sz % UInt) - one(UInt)
+    @inbounds for i in 1:old_sz
+        k = old_keys[i]
+        k === _empty_cycle_slot && continue
+        v = old_vals[i]
+        idx0 = objectid(k) & mask
+        while new_keys[Int(idx0) + 1] !== _empty_cycle_slot
+            idx0 = (idx0 + one(UInt)) & mask
+        end
+        new_keys[Int(idx0) + 1] = k
+        new_vals[Int(idx0) + 1] = v
+    end
+    t.keys = new_keys
+    t.vals = new_vals
+    return t
+end
+
+@inline function cycle_insert!(t::CycleTable, @nospecialize(key), val::Int)
+    (t.count + 1) * 4 >= length(t.keys) * 3 && _cycle_grow!(t)
+    sz = length(t.keys)
+    mask = (sz % UInt) - one(UInt)
+    idx0 = objectid(key) & mask
+    while true
+        @inbounds k = t.keys[Int(idx0) + 1]
+        if k === _empty_cycle_slot
+            @inbounds t.keys[Int(idx0) + 1] = key
+            @inbounds t.vals[Int(idx0) + 1] = val
+            t.count += 1
+            return
+        end
+        # If we ever hit an existing key, leave the older value in place — for
+        # serialize_cycle the first-seen counter is what should win.
+        k === key && return
+        idx0 = (idx0 + one(UInt)) & mask
+    end
+end
+
+function Base.empty!(t::CycleTable)
+    @inbounds for i in 1:length(t.keys)
+        t.keys[i] = _empty_cycle_slot
+    end
+    t.count = 0
+    return t
+end
+
 mutable struct Serializer{I<:IO} <: AbstractSerializer
     io::I
     counter::Int
+    # Vestigial — kept only so `AbstractSerializer` fallback methods that
+    # access `s.table` still typecheck on `Serializer`. Cycle dedup goes
+    # through `cycle_table`; back-references go through `deserialize_table`.
     table::IdDict{Any,Any}
     pending_refs::Vector{Int}
     known_object_data::Dict{UInt64,Any}
     version::Int
     # Deserialize-side back-reference table. Slots are dense, sequential
-    # `Int`s and the same value of `s.table` is never read with both `Int` and
-    # `Any` keys at once, so a `Vector{Any}` indexed by counter is much
-    # cheaper than `IdDict` for deserialize.
+    # `Int`s, so a `Vector{Any}` indexed by counter is cheaper than `IdDict`.
     deserialize_table::Vector{Any}
-    Serializer{I}(io::I) where I<:IO = new(io, 0, IdDict(), Int[], Dict{UInt64,Any}(), ser_version, Any[])
+    # Serialize-side obj→counter table. Open-addressed with parallel
+    # `Memory{Any}` (keys, identity-keyed) and `Memory{Int}` (values, stored
+    # inline so the counter is never boxed).
+    cycle_table::CycleTable
+    Serializer{I}(io::I) where I<:IO =
+        new(io, 0, IdDict(), Int[], Dict{UInt64,Any}(),
+            ser_version, Any[], CycleTable())
 end
 
 Serializer(io::IO) = Serializer{typeof(io)}(io)
@@ -191,25 +292,38 @@ function write_as_tag(s::IO, tag)
     nothing
 end
 
-# cycle handling
-function serialize_cycle(s::AbstractSerializer, @nospecialize(x))
+# Look up `x` in the serialize-side cycle table. If present, return the
+# previously-assigned counter; otherwise insert at `s.counter`, advance the
+# counter, and return -1.
+@inline function _cycle_register!(s::AbstractSerializer, @nospecialize(x))
     offs = get(s.table, x, -1)::Int
-    if offs != -1
-        if offs <= typemax(UInt16)
-            writetag(s.io, SHORTBACKREF_TAG)
-            write(s.io, UInt16(offs))
-        elseif offs <= typemax(Int32)
-            writetag(s.io, BACKREF_TAG)
-            write(s.io, Int32(offs))
-        else
-            writetag(s.io, LONGBACKREF_TAG)
-            write(s.io, Int64(offs))
-        end
-        return true
-    end
+    offs == -1 || return offs
     s.table[x] = s.counter
     s.counter += 1
-    return false
+    return -1
+end
+@inline function _cycle_register!(s::Serializer, @nospecialize(x))
+    offs = cycle_get(s.cycle_table, x, -1)
+    offs == -1 || return offs
+    cycle_insert!(s.cycle_table, x, s.counter)
+    s.counter += 1
+    return -1
+end
+
+function serialize_cycle(s::AbstractSerializer, @nospecialize(x))
+    offs = _cycle_register!(s, x)
+    offs == -1 && return false
+    if offs <= typemax(UInt16)
+        writetag(s.io, SHORTBACKREF_TAG)
+        write(s.io, UInt16(offs))
+    elseif offs <= typemax(Int32)
+        writetag(s.io, BACKREF_TAG)
+        write(s.io, Int32(offs))
+    else
+        writetag(s.io, LONGBACKREF_TAG)
+        write(s.io, Int64(offs))
+    end
+    return true
 end
 
 function serialize_cycle_header(s::AbstractSerializer, @nospecialize(x))
@@ -227,7 +341,7 @@ end
 
 function reset_state(s::Serializer)
     s.counter = 0
-    empty!(s.table)
+    empty!(s.cycle_table)
     empty!(s.pending_refs)
     empty!(s.deserialize_table)
     s
