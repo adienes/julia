@@ -1101,7 +1101,9 @@ sizehint_table!(s::AbstractSerializer, n::Int) = sizehint!(s.table, n)
 
 @inline function settable!(s::Serializer, slot::Int, @nospecialize(x))
     tbl = s.deserialize_table
-    slot >= length(tbl) && resize!(tbl, slot + 1)
+    # Grow geometrically when extending past the end so callers paying out
+    # sequential slots only resize a logarithmic number of times.
+    slot >= length(tbl) && resize!(tbl, max(slot + 1, 2 * length(tbl) + 1))
     @inbounds tbl[slot + 1] = x
     return x
 end
