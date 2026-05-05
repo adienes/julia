@@ -475,6 +475,17 @@ function deserialize_array_data!(s::IO, a)
     return a
 end
 
+function _serialize_non_bits_elements!(s::AbstractSerializer, a)
+    sizehint_cycle!(s, div(length(a), 4))  # prepare for lots of pointers
+    @inbounds for i in eachindex(a)
+        if isassigned(a, i)
+            serialize(s, a[i])
+        else
+            writetag(s.io, UNDEFREF_TAG)
+        end
+    end
+end
+
 function serialize(s::AbstractSerializer, a::Array)
     serialize_cycle(s, a) && return
     elty = eltype(a)
@@ -490,14 +501,7 @@ function serialize(s::AbstractSerializer, a::Array)
     if isbitstype(elty) || Base.isbitsunion(elty)
         serialize_array_data(s.io, a)
     else
-        sizehint_cycle!(s, div(length(a),4))  # prepare for lots of pointers
-        @inbounds for i in eachindex(a)
-            if isassigned(a, i)
-                serialize(s, a[i])
-            else
-                writetag(s.io, UNDEFREF_TAG)
-            end
-        end
+        _serialize_non_bits_elements!(s, a)
     end
 end
 
@@ -516,14 +520,7 @@ function serialize(s::AbstractSerializer, m::Memory)
     if isbitstype(elty) || Base.isbitsunion(elty)
         serialize_array_data(s.io, m)
     else
-        sizehint_cycle!(s, div(length(m),4))  # prepare for lots of pointers
-        @inbounds for i in eachindex(m)
-            if isassigned(m, i)
-                serialize(s, m[i])
-            else
-                writetag(s.io, UNDEFREF_TAG)
-            end
-        end
+        _serialize_non_bits_elements!(s, m)
     end
 end
 
