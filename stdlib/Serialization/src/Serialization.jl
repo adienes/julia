@@ -24,7 +24,12 @@ mutable struct Serializer{I<:IO} <: AbstractSerializer
     pending_refs::Vector{Int}
     known_object_data::Dict{UInt64,Any}
     version::Int
-    Serializer{I}(io::I) where I<:IO = new(io, 0, IdDict(), Int[], Dict{UInt64,Any}(), ser_version)
+    # Deserialize-side back-reference table. Slots are dense, sequential
+    # `Int`s and the same value of `s.table` is never read with both `Int` and
+    # `Any` keys at once, so a `Vector{Any}` indexed by counter is much
+    # cheaper than `IdDict` for deserialize.
+    deserialize_table::Vector{Any}
+    Serializer{I}(io::I) where I<:IO = new(io, 0, IdDict(), Int[], Dict{UInt64,Any}(), ser_version, Any[])
 end
 
 Serializer(io::IO) = Serializer{typeof(io)}(io)
@@ -217,6 +222,14 @@ function reset_state(s::AbstractSerializer)
     s.counter = 0
     empty!(s.table)
     empty!(s.pending_refs)
+    s
+end
+
+function reset_state(s::Serializer)
+    s.counter = 0
+    empty!(s.table)
+    empty!(s.pending_refs)
+    empty!(s.deserialize_table)
     s
 end
 
@@ -951,7 +964,7 @@ end
 
 function deserialize_cycle(s::AbstractSerializer, @nospecialize(x))
     slot = pop!(s.pending_refs)
-    s.table[slot] = x
+    settable!(s, slot, x)
     nothing
 end
 
@@ -961,22 +974,44 @@ end
 #     slot = pop!(s.pending_refs)
 #     s.table[slot] = x
 function resolve_ref_immediately(s::AbstractSerializer, @nospecialize(x))
-    s.table[s.counter] = x
+    settable!(s, s.counter, x)
     s.counter += 1
     nothing
 end
 
+# Back-reference table accessors. `AbstractSerializer` defaults read/write the
+# `IdDict` for back-compat with subtypes; `Serializer` overrides to use a
+# `Vector{Any}` indexed by counter (cheaper for the dense `Int`-keyed pattern).
+settable!(s::AbstractSerializer, slot::Int, @nospecialize(x)) = (s.table[slot] = x; x)
+sizehint_table!(s::AbstractSerializer, n::Int) = sizehint!(s.table, n)
+
+@inline function settable!(s::Serializer, slot::Int, @nospecialize(x))
+    tbl = s.deserialize_table
+    slot >= length(tbl) && resize!(tbl, slot + 1)
+    @inbounds tbl[slot + 1] = x
+    return x
+end
+@inline sizehint_table!(s::Serializer, n::Int) = sizehint!(s.deserialize_table, n + 1; shrink=false)
+
 function gettable(s::AbstractSerializer, id::Int)
     get(s.table, id) do
-        errmsg = """Inconsistent Serializer state when deserializing.
-            Attempt to access internal table with key $id failed.
-
-            This might occur if the Serializer contexts when serializing and deserializing are inconsistent.
-            In particular, if multiple serialize calls use the same Serializer object then
-            the corresponding deserialize calls should also use the same Serializer object.
-        """
-        error(errmsg)
+        _gettable_error(id)
     end
+end
+@inline function gettable(s::Serializer, id::Int)
+    tbl = s.deserialize_table
+    (id + 1 <= length(tbl) && isassigned(tbl, id + 1)) || _gettable_error(id)
+    return @inbounds tbl[id + 1]
+end
+
+@noinline function _gettable_error(id)
+    error("""Inconsistent Serializer state when deserializing.
+        Attempt to access internal table with key $id failed.
+
+        This might occur if the Serializer contexts when serializing and deserializing are inconsistent.
+        In particular, if multiple serialize calls use the same Serializer object then
+        the corresponding deserialize calls should also use the same Serializer object.
+    """)
 end
 
 # deserialize_ is an internal function to dispatch on the tag
@@ -1013,7 +1048,7 @@ function handle_deserialize(s::AbstractSerializer, b::Int32)
             slot = s.counter
             s.counter += 1
             result = deserialize_unionall(s, form)::UnionAll
-            s.table[slot] = result
+            settable!(s, slot, result)
             return result
         end
         return deserialize_unionall(s, form)
@@ -1031,7 +1066,7 @@ function handle_deserialize(s::AbstractSerializer, b::Int32)
     elseif b == SHARED_REF_TAG
         slot = s.counter; s.counter += 1
         obj = deserialize(s)
-        s.table[slot] = obj
+        settable!(s, slot, obj)
         return obj
     elseif b == SYMBOL_TAG
         return deserialize_symbol(s, Int(read(s.io, UInt8)::UInt8))
@@ -1475,12 +1510,12 @@ function deserialize_array(s::AbstractSerializer)
     if isa(d1, Int32) || isa(d1, Int64)
         if elty !== Bool && isbitstype(elty)
             a = Vector{elty}(undef, d1)
-            s.table[slot] = a
+            settable!(s, slot, a)
             return read!(s.io, a)
         end
         if format_version(s) >= 31 && Base.isbitsunion(elty)
             a = Vector{elty}(undef, d1)
-            s.table[slot] = a
+            settable!(s, slot, a)
             deserialize_array_data!(s.io, a)
             return a
         end
@@ -1508,18 +1543,18 @@ function deserialize_array(s::AbstractSerializer)
         else
             A = read!(s.io, Array{elty}(undef, dims))
         end
-        s.table[slot] = A
+        settable!(s, slot, A)
         return A
     end
     if format_version(s) >= 31 && Base.isbitsunion(elty)
         A = Array{elty, length(dims)}(undef, dims)
-        s.table[slot] = A
+        settable!(s, slot, A)
         deserialize_array_data!(s.io, A)
         return A
     end
     A = Array{elty, length(dims)}(undef, dims)
-    s.table[slot] = A
-    sizehint!(s.table, s.counter + div(length(A)::Int,4))
+    settable!(s, slot, A)
+    sizehint_table!(s, s.counter + div(length(A)::Int,4))
     deserialize_fillarray!(A, s)
     return A
 end
@@ -1540,13 +1575,13 @@ function deserialize(s::AbstractSerializer, X::Type{Memory{T}} where T)
     elty = eltype(X)
     if isbitstype(elty) || (format_version(s) >= 31 && Base.isbitsunion(elty))
         A = X(undef, n)
-        s.table[slot] = A
+        settable!(s, slot, A)
         deserialize_array_data!(s.io, A)
         return A
     end
     A = X(undef, n)
-    s.table[slot] = A
-    sizehint!(s.table, s.counter + div(n, 4))
+    settable!(s, slot, A)
+    sizehint_table!(s, s.counter + div(n, 4))
     deserialize_fillarray!(A, s)
     return A
 end
@@ -1687,7 +1722,7 @@ function deserialize_datatype(s::AbstractSerializer, full::Bool)
             end
         end
     end
-    s.table[slot] = t
+    settable!(s, slot, t)
     return t
 end
 
