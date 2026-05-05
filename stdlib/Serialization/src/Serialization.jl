@@ -114,22 +114,16 @@ end
 mutable struct Serializer{I<:IO} <: AbstractSerializer
     io::I
     counter::Int
-    # Vestigial — kept only so `AbstractSerializer` fallback methods that
-    # access `s.table` still typecheck on `Serializer`. Cycle dedup goes
-    # through `cycle_table`; back-references go through `deserialize_table`.
-    table::IdDict{Any,Any}
     pending_refs::Vector{Int}
     known_object_data::Dict{UInt64,Any}
     version::Int
-    # Deserialize-side back-reference table. Slots are dense, sequential
-    # `Int`s, so a `Vector{Any}` indexed by counter is cheaper than `IdDict`.
+    # Back-reference table. Densely indexed by counter; a `Vector{Any}`
+    # is cheaper than `IdDict{Int,Any}` for that pattern.
     deserialize_table::Vector{Any}
-    # Serialize-side obj→counter table. Open-addressed with parallel
-    # `Memory{Any}` (keys, identity-keyed) and `Memory{Int}` (values, stored
-    # inline so the counter is never boxed).
+    # Serialize-side cycle counters; see `CycleTable`.
     cycle_table::CycleTable
     Serializer{I}(io::I) where I<:IO =
-        new(io, 0, IdDict(), Int[], Dict{UInt64,Any}(),
+        new(io, 0, Int[], Dict{UInt64,Any}(),
             ser_version, Any[], CycleTable())
 end
 
