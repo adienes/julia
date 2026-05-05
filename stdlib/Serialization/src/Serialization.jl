@@ -292,38 +292,46 @@ function write_as_tag(s::IO, tag)
     nothing
 end
 
-# Look up `x` in the serialize-side cycle table. If present, return the
-# previously-assigned counter; otherwise insert at `s.counter`, advance the
-# counter, and return -1.
-@inline function _cycle_register!(s::AbstractSerializer, @nospecialize(x))
-    offs = get(s.table, x, -1)::Int
-    offs == -1 || return offs
-    s.table[x] = s.counter
-    s.counter += 1
-    return -1
-end
-@inline function _cycle_register!(s::Serializer, @nospecialize(x))
-    offs = cycle_get(s.cycle_table, x, -1)
-    offs == -1 || return offs
-    cycle_insert!(s.cycle_table, x, s.counter)
-    s.counter += 1
-    return -1
+@inline function _emit_backref(io::IO, offs::Int)
+    if offs <= typemax(UInt16)
+        writetag(io, SHORTBACKREF_TAG)
+        write(io, UInt16(offs))
+    elseif offs <= typemax(Int32)
+        writetag(io, BACKREF_TAG)
+        write(io, Int32(offs))
+    else
+        writetag(io, LONGBACKREF_TAG)
+        write(io, Int64(offs))
+    end
+    nothing
 end
 
+# Serialize-side cycle-table accessors. `AbstractSerializer` defaults read/write
+# `s.table` for back-compat with subtypes; `Serializer` overrides to use its
+# inline `CycleTable` (which avoids the per-insert `Int` boxing and `RefValue`
+# allocation `IdDict.setindex!` would have).
+@inline _cycle_lookup(s::AbstractSerializer, @nospecialize(x)) = get(s.table, x, -1)::Int
+@inline _cycle_register!(s::AbstractSerializer, @nospecialize(x), v::Int) = (s.table[x] = v; nothing)
+@inline _cycle_lookup(s::Serializer, @nospecialize(x)) = cycle_get(s.cycle_table, x, -1)
+@inline _cycle_register!(s::Serializer, @nospecialize(x), v::Int) = (cycle_insert!(s.cycle_table, x, v); nothing)
+
+# Sizehint for the serialize-side cycle table. Only meaningful for
+# `AbstractSerializer` subtypes that still use `s.table` for cycle dedup;
+# `Serializer`'s `CycleTable` grows geometrically and gains nothing from
+# hinting, so the override skips the hint to avoid pre-sizing the unused
+# `IdDict`.
+sizehint_cycle!(s::AbstractSerializer, n::Int) = sizehint!(s.table, n)
+sizehint_cycle!(s::Serializer, n::Int) = nothing
+
 function serialize_cycle(s::AbstractSerializer, @nospecialize(x))
-    offs = _cycle_register!(s, x)
-    offs == -1 && return false
-    if offs <= typemax(UInt16)
-        writetag(s.io, SHORTBACKREF_TAG)
-        write(s.io, UInt16(offs))
-    elseif offs <= typemax(Int32)
-        writetag(s.io, BACKREF_TAG)
-        write(s.io, Int32(offs))
-    else
-        writetag(s.io, LONGBACKREF_TAG)
-        write(s.io, Int64(offs))
+    offs = _cycle_lookup(s, x)
+    if offs != -1
+        _emit_backref(s.io, offs)
+        return true
     end
-    return true
+    _cycle_register!(s, x, s.counter)
+    s.counter += 1
+    return false
 end
 
 function serialize_cycle_header(s::AbstractSerializer, @nospecialize(x))
@@ -482,7 +490,7 @@ function serialize(s::AbstractSerializer, a::Array)
     if isbitstype(elty) || Base.isbitsunion(elty)
         serialize_array_data(s.io, a)
     else
-        sizehint!(s.table, div(length(a),4))  # prepare for lots of pointers
+        sizehint_cycle!(s, div(length(a),4))  # prepare for lots of pointers
         @inbounds for i in eachindex(a)
             if isassigned(a, i)
                 serialize(s, a[i])
@@ -508,7 +516,7 @@ function serialize(s::AbstractSerializer, m::Memory)
     if isbitstype(elty) || Base.isbitsunion(elty)
         serialize_array_data(s.io, m)
     else
-        sizehint!(s.table, div(length(m),4))  # prepare for lots of pointers
+        sizehint_cycle!(s, div(length(m),4))  # prepare for lots of pointers
         @inbounds for i in eachindex(m)
             if isassigned(m, i)
                 serialize(s, m[i])
