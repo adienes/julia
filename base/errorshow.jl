@@ -457,6 +457,167 @@ stacktrace_expand_basepaths()::Bool = Base.get_bool_env("JULIA_STACKTRACE_EXPAND
 stacktrace_contract_userdir()::Bool = Base.get_bool_env("JULIA_STACKTRACE_CONTRACT_HOMEDIR", true) === true
 stacktrace_linebreaks()::Bool = Base.get_bool_env("JULIA_STACKTRACE_LINEBREAKS", false) === true
 
+# Closest-candidates ranking. Sort key per candidate:
+#   (align_call_to_sig, positional_call_to_sig_cost, !Base.morespecific).
+#
+# arg_type_distance(sig, called) = 1 - matched_credit / size(sig) ∈ [0, 1].
+# matched_credit: identical → size; same DataType head and arity → 1 + Σ
+# recursive credit on params; TypeVar with `called <: T.ub` → 1; otherwise
+# subtype-lattice fallback — size/2 for direct `<:`, size/3 for shared non-Any
+# supertype, else 0.
+#
+# align_call_to_sig: Needleman–Wunsch over arg tuples with arg_type_distance
+# as substitution cost and a flat gap penalty. Trailing varargs in sig are
+# expanded to length(call). For length(call) ∈ {2, 3} every permutation is
+# tried, paying TRANSPOSITION_PENALTY per swap.
+#
+# gap_penalty exceeds the max substitution cost (1.0) by SIMILARITY_TIEBREAKER
+# so same-arity methods rank above arity-mismatched ones at equal sub-cost.
+
+const SIMILARITY_TIEBREAKER = 0.05
+const TRANSPOSITION_PENALTY = 1/3
+
+function _type_size(@nospecialize(t))
+    t isa UnionAll && return _type_size(t.body)
+    t isa DataType || return 1
+    n = 1
+    for p in t.parameters
+        n += _type_size(p)
+    end
+    return n
+end
+
+function _subtype_credit(@nospecialize(a), @nospecialize(b))
+    a isa Type && b isa Type || return 0.0
+    has_free_typevars(a) && return 0.0
+    has_free_typevars(b) && return 0.0
+    sz = _type_size(a)
+    (a <: b || b <: a) && return 0.5 * sz
+    a isa DataType || return 0.0
+    sup = supertype(a)
+    while sup !== Any
+        b <: sup && return (1/3) * sz
+        sup = supertype(sup)
+    end
+    return 0.0
+end
+
+function _matched_credit(@nospecialize(sig), @nospecialize(called))
+    sig === called && return Float64(_type_size(sig))
+    # Peel `where` wrappers. Descend only if the body's head matches called
+    # (so TypeVar params can match via the TypeVar branch); otherwise fall
+    # back to subtype_credit on the wrapped form, where typevars are still
+    # bound and `<:` works.
+    if sig isa UnionAll
+        peeled = sig
+        while peeled isa UnionAll
+            peeled = peeled.body
+        end
+        if peeled isa DataType && called isa DataType &&
+           peeled.name === called.name && length(peeled.parameters) == length(called.parameters)
+            m = 1.0
+            for i in 1:length(peeled.parameters)
+                m += _matched_credit(peeled.parameters[i], called.parameters[i])
+            end
+            return m
+        end
+        return _subtype_credit(sig, called)
+    end
+    if sig isa TypeVar
+        called isa Type && called <: sig.ub && return 1.0
+        return 0.0
+    end
+    if sig isa DataType && called isa DataType &&
+       sig.name === called.name && length(sig.parameters) == length(called.parameters)
+        m = 1.0
+        for i in 1:length(sig.parameters)
+            m += _matched_credit(sig.parameters[i], called.parameters[i])
+        end
+        return m
+    end
+    return _subtype_credit(sig, called)
+end
+
+function arg_type_distance(@nospecialize(sig), @nospecialize(called))
+    sig === called && return 0.0
+    total = _type_size(sig)
+    total == 0 && return 0.0
+    return clamp(1.0 - _matched_credit(sig, called) / total, 0.0, 1.0)
+end
+
+function _expand_trailing_vararg(args, target_length::Int)
+    isempty(args) && return Any[]
+    last = args[end]
+    isvarargtype(last) || return Any[args...]
+    T = unwrapva(unwrap_unionall(last))
+    n_static = length(args) - 1
+    n_va = max(0, target_length - n_static)
+    out = Any[args[i] for i in 1:n_static]
+    for _ in 1:n_va
+        push!(out, T)
+    end
+    return out
+end
+
+function _nw_align(call, sig, gap_penalty::Float64)
+    M = length(call)
+    N = length(sig)
+    M == 0 && return Float64(N) * gap_penalty
+    N == 0 && return Float64(M) * gap_penalty
+    dp = Matrix{Float64}(undef, M+1, N+1)
+    dp[1, 1] = 0.0
+    for i in 1:M; dp[i+1, 1] = i * gap_penalty; end
+    for j in 1:N; dp[1, j+1] = j * gap_penalty; end
+    for i in 1:M, j in 1:N
+        sub = dp[i, j] + arg_type_distance(sig[j], call[i])
+        del = dp[i, j+1] + gap_penalty
+        ins = dp[i+1, j] + gap_penalty
+        dp[i+1, j+1] = min(sub, del, ins)
+    end
+    return dp[M+1, N+1]
+end
+
+# Permutations of `n` indices with their transposition counts. Identity-only
+# for n ∉ {2, 3}; the cost of N! grows fast enough that 3 is a hard cap.
+function _call_permutations(n::Int)
+    n == 2 && return ((Int[1,2], 0), (Int[2,1], 1))
+    n == 3 && return ((Int[1,2,3], 0),
+                       (Int[1,3,2], 1), (Int[2,1,3], 1), (Int[3,2,1], 1),
+                       (Int[2,3,1], 2), (Int[3,1,2], 2))
+    return ((collect(1:n), 0),)
+end
+
+function align_call_to_sig(call_args, sig_args; gap_penalty::Float64=1.0 + SIMILARITY_TIEBREAKER)
+    sig = _expand_trailing_vararg(sig_args, length(call_args))
+    call = _expand_trailing_vararg(call_args, length(sig_args))
+    best = Inf
+    for (perm, n_trans) in _call_permutations(length(call))
+        permuted = Any[call[p] for p in perm]
+        cost = _nw_align(permuted, sig, gap_penalty) + n_trans * TRANSPOSITION_PENALTY
+        cost < best && (best = cost)
+    end
+    return best
+end
+
+# Slot-by-slot distance, no gap-shifting or permutation. Tiebreaker after
+# align_call_to_sig: prefers positional matches over internally-shifted ones
+# at equal alignment cost.
+function positional_call_to_sig_cost(call_args, sig_args)
+    sig = _expand_trailing_vararg(sig_args, length(call_args))
+    call = _expand_trailing_vararg(call_args, length(sig_args))
+    n = max(length(call), length(sig))
+    n == 0 && return 0.0
+    c = 0.0
+    for i in 1:n
+        if i > length(call) || i > length(sig)
+            c += 1.0      # missing-slot at this position
+        else
+            c += arg_type_distance(sig[i], call[i])
+        end
+    end
+    return c
+end
+
 function _resolves_to_self(tn::Core.TypeName)
     isdefined(tn, :module) || return true
     m = tn.module
@@ -532,9 +693,9 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs=[])
     f = ex.f
     ft = typeof(f)
     lines = String[]
-    line_score = Int[]
-    # These functions are special cased to only show if first argument is matched.
-    special = f === convert || f === getindex || f === setindex!
+    line_score = Float64[]
+    line_positional = Float64[]
+    line_methods = Method[]
     f isa Core.Builtin && return # `methods` isn't very useful for a builtin
     funcs = Tuple{Any,Vector{Any}}[(f, arg_types_param)]
 
@@ -574,7 +735,6 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs=[])
             end
             print(iob, "(")
             t_i = copy(arg_types_param)
-            right_matches = 0
             sig = sig0.parameters[2:end]
             for i = 1 : min(length(t_i), length(sig))
                 i > 1 && print(iob, ", ")
@@ -590,9 +750,6 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs=[])
                 # Checks if the type of arg 1:i of the input intersects with the current method
                 t_in = typeintersect(rewrap_unionall(Tuple{sig[1:i]...}, method.sig),
                                      rewrap_unionall(Tuple{t_i[1:j]...}, method.sig))
-                # If the function is one of the special cased then it should break the loop if
-                # the type of the first argument is not matched.
-                t_in === Union{} && special && i == 1 && break
                 if t_in === Union{}
                     if get(io, :color, false)::Bool
                         let sigstr=sigstr
@@ -608,19 +765,7 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs=[])
                     # signature then there will be a type intersect
                     t_i[i] = sig[i]
                 else
-                    right_matches += j==i ? 1 : 0
                     print(iob, "::", sigstr...)
-                end
-            end
-            special && right_matches == 0 && continue
-
-            if length(t_i) > length(sig) && !isempty(sig) && Base.isvarargtype(sig[end])
-                # It ensures that methods like f(a::AbstractString...) gets the correct
-                # number of right_matches
-                for t in arg_types_param[length(sig):end]
-                    if t <: rewrap_unionall(unwrapva(unwrap_unionall(sig[end])), method.sig)
-                        right_matches += 1
-                    end
                 end
             end
 
@@ -690,14 +835,36 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs=[])
             modulecolor = get!(() -> popfirst!(STACKTRACE_MODULECOLORS), STACKTRACE_FIXEDCOLORS, m)
             print_module_path_file(iob, m, string(file), line; modulecolor, digit_align_width = 3)
             push!(lines, takestring!(buf))
-            push!(line_score, -(right_matches * 2 + (length(arg_types_param) < 2 ? 1 : 0)))
+            # Re-wrap so typevars stay bound; `<:` and `has_free_typevars`
+            # rely on the UnionAll wrapping.
+            sig_for_metric = Any[rewrap_unionall(s, method.sig) for s in sig]
+            push!(line_score, align_call_to_sig(arg_types_param, sig_for_metric))
+            push!(line_positional, positional_call_to_sig_cost(arg_types_param, sig_for_metric))
+            push!(line_methods, method)
         end
     end
 
     if !isempty(lines) # Display up to three closest candidates
         Base.with_output_color(:normal, io) do io
             print(io, "\n\nClosest candidates are:")
-            permute!(lines, sortperm(line_score))
+            # Sort by (alignment cost, positional cost); break ties by
+            # Base.morespecific. Epsilon comparison guards against fp drift.
+            keys = [(line_score[i], line_positional[i]) for i in eachindex(line_score)]
+            order = sortperm(keys)
+            tied(a, b) = abs(a[1] - b[1]) < 1e-9 && abs(a[2] - b[2]) < 1e-9
+            i = 1
+            while i <= length(order)
+                j = i
+                while j+1 <= length(order) && tied(keys[order[j+1]], keys[order[i]])
+                    j += 1
+                end
+                if j > i
+                    sort!(view(order, i:j), alg=Base.MergeSort,
+                          lt = (a, b) -> Base.morespecific(line_methods[a], line_methods[b]))
+                end
+                i = j + 1
+            end
+            permute!(lines, order)
             i = 0
             for line in lines
                 println(io)
