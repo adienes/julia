@@ -457,31 +457,22 @@ stacktrace_expand_basepaths()::Bool = Base.get_bool_env("JULIA_STACKTRACE_EXPAND
 stacktrace_contract_userdir()::Bool = Base.get_bool_env("JULIA_STACKTRACE_CONTRACT_HOMEDIR", true) === true
 stacktrace_linebreaks()::Bool = Base.get_bool_env("JULIA_STACKTRACE_LINEBREAKS", false) === true
 
-# --- candidate-method ranking ---
+# Closest-candidates ranking. Sort key per candidate:
+#   (align_call_to_sig, positional_call_to_sig_cost, !Base.morespecific).
 #
-# Given a call (a tuple of called arg types) and a method signature (a tuple of
-# sig arg types), score how close the method is to being the intended target.
-# Lower cost = closer match.
+# arg_type_distance(sig, called) = 1 - matched_credit / size(sig) ∈ [0, 1].
+# matched_credit: identical → size; same DataType head and arity → 1 + Σ
+# recursive credit on params; TypeVar with `called <: T.ub` → 1; otherwise
+# subtype-lattice fallback — size/2 for direct `<:`, size/3 for shared non-Any
+# supertype, else 0.
 #
-# Two ingredients:
+# align_call_to_sig: Needleman–Wunsch over arg tuples with arg_type_distance
+# as substitution cost and a flat gap penalty. Trailing varargs in sig are
+# expanded to length(call). For length(call) ∈ {2, 3} every permutation is
+# tried, paying TRANSPOSITION_PENALTY per swap.
 #
-#   arg_type_distance(sig, called) → distance in [0, 1]
-#       1 - matched_credit / size(sig)
-#       where matched_credit accumulates 1 per matching DataType head plus
-#       partial credit for related-but-unequal leaves (subtype lattice).
-#       Dividing by `size(sig)` makes the metric directional: it asks "how
-#       much of the sig's structure is satisfied by the call?" — so a tighter
-#       sig that the call satisfies via subtyping ranks better than a generic
-#       one (e.g. `::AbstractVecOrMat` beats `::Any` for a Matrix call).
-#
-#   align_call_to_sig(call, sig) → cost ≥ 0
-#       Needleman–Wunsch alignment of the two tuples with `arg_type_distance`
-#       as substitution cost and a flat gap penalty. Trailing varargs in `sig`
-#       are pre-expanded to fill `length(call)` so a vararg slot doesn't fight
-#       the alignment. Gap penalty is `1 + SIMILARITY_TIEBREAKER` so that, all
-#       else equal, same-arity candidates rank above arity-mismatch ones.
-#       For 2- and 3-arg calls we also try all permutations of the call args,
-#       paying `TRANSPOSITION_PENALTY` per swap, and take the minimum cost.
+# gap_penalty exceeds the max substitution cost (1.0) by SIMILARITY_TIEBREAKER
+# so same-arity methods rank above arity-mismatched ones at equal sub-cost.
 
 const SIMILARITY_TIEBREAKER = 0.05
 const TRANSPOSITION_PENALTY = 1/3
@@ -496,10 +487,6 @@ function _type_size(@nospecialize(t))
     return n
 end
 
-# Credit follows the harmonic pattern: identical → full size, direct subtype
-# → size/2, sibling under a non-`Any` common supertype → size/3. Scaling by
-# size keeps the per-arg distance in the same range whether sig is a small
-# abstract type (e.g. `Any`) or a parametric one (e.g. `AbstractDict`).
 function _subtype_credit(@nospecialize(a), @nospecialize(b))
     a isa Type && b isa Type || return 0.0
     has_free_typevars(a) && return 0.0
@@ -517,11 +504,10 @@ end
 
 function _matched_credit(@nospecialize(sig), @nospecialize(called))
     sig === called && return Float64(_type_size(sig))
-    # For a `where`-wrapped sig, descend only if peeling reaches a DataType
-    # whose head matches the called type — that's the case where TypeVar
-    # params can be matched against bounds. Otherwise treat the whole
-    # UnionAll as opaque and fall back to subtype credit on the wrapped form
-    # (so we keep the typevar binding info that `has_free_typevars` checks).
+    # Peel `where` wrappers. Descend only if the body's head matches called
+    # (so TypeVar params can match via the TypeVar branch); otherwise fall
+    # back to subtype_credit on the wrapped form, where typevars are still
+    # bound and `<:` works.
     if sig isa UnionAll
         peeled = sig
         while peeled isa UnionAll
@@ -591,8 +577,8 @@ function _nw_align(call, sig, gap_penalty::Float64)
     return dp[M+1, N+1]
 end
 
-# Permutations of length-N call args paired with their transposition count.
-# Only enumerated for N ∈ {2, 3}; for other N the identity is the only entry.
+# Permutations of `n` indices with their transposition counts. Identity-only
+# for n ∉ {2, 3}; the cost of N! grows fast enough that 3 is a hard cap.
 function _call_permutations(n::Int)
     n == 2 && return ((Int[1,2], 0), (Int[2,1], 1))
     n == 3 && return ((Int[1,2,3], 0),
@@ -613,9 +599,9 @@ function align_call_to_sig(call_args, sig_args; gap_penalty::Float64=1.0 + SIMIL
     return best
 end
 
-# Strict slot-by-slot cost — no NW gap-shifting, no permutation. Used as a
-# secondary key after `align_call_to_sig` to prefer candidates whose call args
-# line up positionally over ones that only match after an internal shift.
+# Slot-by-slot distance, no gap-shifting or permutation. Tiebreaker after
+# align_call_to_sig: prefers positional matches over internally-shifted ones
+# at equal alignment cost.
 function positional_call_to_sig_cost(call_args, sig_args)
     sig = _expand_trailing_vararg(sig_args, length(call_args))
     call = _expand_trailing_vararg(call_args, length(sig_args))
@@ -849,8 +835,8 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs=[])
             modulecolor = get!(() -> popfirst!(STACKTRACE_MODULECOLORS), STACKTRACE_FIXEDCOLORS, m)
             print_module_path_file(iob, m, string(file), line; modulecolor, digit_align_width = 3)
             push!(lines, takestring!(buf))
-            # Re-wrap each sig param with `method.sig`'s UnionAll context so
-            # free TypeVars become bound and `<:` works for the metric.
+            # Re-wrap so typevars stay bound; `<:` and `has_free_typevars`
+            # rely on the UnionAll wrapping.
             sig_for_metric = Any[rewrap_unionall(s, method.sig) for s in sig]
             push!(line_score, align_call_to_sig(arg_types_param, sig_for_metric))
             push!(line_positional, positional_call_to_sig_cost(arg_types_param, sig_for_metric))
@@ -861,15 +847,15 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs=[])
     if !isempty(lines) # Display up to three closest candidates
         Base.with_output_color(:normal, io) do io
             print(io, "\n\nClosest candidates are:")
-            # Primary: alignment cost. Secondary: positional cost (prefer
-            # straight slot-by-slot matches over internally-shifted ones).
+            # Sort by (alignment cost, positional cost); break ties by
+            # Base.morespecific. Epsilon comparison guards against fp drift.
             keys = [(line_score[i], line_positional[i]) for i in eachindex(line_score)]
             order = sortperm(keys)
-            # Tertiary: morespecific within fully-tied keys.
+            tied(a, b) = abs(a[1] - b[1]) < 1e-9 && abs(a[2] - b[2]) < 1e-9
             i = 1
             while i <= length(order)
                 j = i
-                while j+1 <= length(order) && keys[order[j+1]] == keys[order[i]]
+                while j+1 <= length(order) && tied(keys[order[j+1]], keys[order[i]])
                     j += 1
                 end
                 if j > i
