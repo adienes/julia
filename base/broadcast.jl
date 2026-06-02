@@ -1048,30 +1048,39 @@ end
     return dest
 end
 
-# For some BitArray operations, we can work at the level of chunks. The trivial
-# implementation just walks over the UInt64 chunks in a linear fashion.
+# For some BitArray operations, we can work at the level of UInt64 chunks.
 # This requires three things:
-#   1. The function must be known to work at the level of chunks (or can be converted to do so)
+#   1. The function must have a known chunk-level equivalent
 #   2. The only arrays involved must be BitArrays or scalar Bools
 #   3. There must not be any broadcasting beyond scalar — all array sizes must match
 # We could eventually allow for all broadcasting and other array types, but that
 # requires very careful consideration of all the edge effects.
-const ChunkableOp = Union{typeof(&), typeof(|), typeof(xor), typeof(~), typeof(identity),
-    typeof(!), typeof(*), typeof(==)} # these are convertible to chunkable ops by liftfuncs
-const BroadcastedChunkableOp{Style<:Union{Nothing,BroadcastStyle}, Axes, F<:ChunkableOp, Args<:Tuple} = Broadcasted{Style,Axes,F,Args}
-ischunkedbroadcast(R, bc::BroadcastedChunkableOp) = ischunkedbroadcast(R, bc.args)
+_chunkop_eq(x, y) = ~xor(x, y)
+_chunkop(f) = nothing
+_chunkop(::typeof(&)) = &
+_chunkop(::typeof(|)) = |
+_chunkop(::typeof(xor)) = xor
+_chunkop(::typeof(nand)) = nand
+_chunkop(::typeof(nor)) = nor
+_chunkop(::typeof(~)) = ~
+_chunkop(::typeof(identity)) = identity
+_chunkop(::typeof(!)) = ~
+_chunkop(::typeof(*)) = &
+_chunkop(::typeof(==)) = _chunkop_eq
+
+ischunkedbroadcast(R, bc::Broadcasted) = ischunkedbroadcast(R, bc, _chunkop(bc.f))
+ischunkedbroadcast(R, bc::Broadcasted, ::Nothing) = false
+ischunkedbroadcast(R, bc::Broadcasted, f) = ischunkedbroadcast(R, bc.args)
 ischunkedbroadcast(R, args) = false
 ischunkedbroadcast(R, args::Tuple{<:BitArray,Vararg{Any}}) = size(R) == size(args[1]) && ischunkedbroadcast(R, tail(args))
 ischunkedbroadcast(R, args::Tuple{<:Bool,Vararg{Any}}) = ischunkedbroadcast(R, tail(args))
-ischunkedbroadcast(R, args::Tuple{<:BroadcastedChunkableOp,Vararg{Any}}) = ischunkedbroadcast(R, args[1]) && ischunkedbroadcast(R, tail(args))
+ischunkedbroadcast(R, args::Tuple{<:Broadcasted,Vararg{Any}}) = ischunkedbroadcast(R, args[1]) && ischunkedbroadcast(R, tail(args))
 ischunkedbroadcast(R, args::Tuple{}) = true
 
-# Convert compatible functions to chunkable ones. They must also be green-lighted as ChunkableOps
-liftfuncs(bc::Broadcasted{<:Any,<:Any,<:Any}) = Broadcasted(bc.style, bc.f, map(liftfuncs, bc.args), bc.axes)
-liftfuncs(bc::Broadcasted{<:Any,<:Any,typeof(sign)}) = Broadcasted(bc.style, identity, map(liftfuncs, bc.args), bc.axes)
-liftfuncs(bc::Broadcasted{<:Any,<:Any,typeof(!)}) = Broadcasted(bc.style, ~, map(liftfuncs, bc.args), bc.axes)
-liftfuncs(bc::Broadcasted{<:Any,<:Any,typeof(*)}) = Broadcasted(bc.style, &, map(liftfuncs, bc.args), bc.axes)
-liftfuncs(bc::Broadcasted{<:Any,<:Any,typeof(==)}) = Broadcasted(bc.style, (~)∘(xor), map(liftfuncs, bc.args), bc.axes)
+# Convert compatible functions to chunk-level equivalents.
+liftfuncs(bc::Broadcasted{<:Any,<:Any,<:Any}) = liftfuncs(bc, _chunkop(bc.f))
+liftfuncs(bc::Broadcasted, ::Nothing) = Broadcasted(bc.style, bc.f, map(liftfuncs, bc.args), bc.axes)
+liftfuncs(bc::Broadcasted, f) = Broadcasted(bc.style, f, map(liftfuncs, bc.args), bc.axes)
 liftfuncs(x) = x
 
 liftchunks(::Tuple{}) = ()

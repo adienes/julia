@@ -869,6 +869,45 @@ end
 
 timesofar("unary arithmetic")
 
+# Check that same-size BitArray broadcasts for bitwise operations use the chunked path.
+@testset "chunked broadcast bit operations" begin
+    b1 = bitrand(130)
+    b2 = bitrand(130)
+    chunked(dest, f, args...) = Base.Broadcast.ischunkedbroadcast(dest,
+        convert(Base.Broadcast.Broadcasted{Nothing},
+            Base.Broadcast.instantiate(Base.Broadcast.broadcasted(f, args...))))
+    bcopy!(dest, f, args...) = copyto!(dest, Base.Broadcast.instantiate(Base.Broadcast.broadcasted(f, args...)))
+
+    for f in (!, ~, nand, nor)
+        dest = similar(b1)
+        @test chunked(dest, f, b1)
+        @test bcopy!(dest, f, b1) == f.(Vector(b1))
+        @test bitcheck(dest)
+    end
+
+    for f in (&, |, xor, nand, nor)
+        dest = similar(b1)
+        @test chunked(dest, f, b1, b2)
+        @test bcopy!(dest, f, b1, b2) == f.(Vector(b1), Vector(b2))
+        @test bitcheck(dest)
+
+        for x in (false, true)
+            @test chunked(dest, f, b1, x)
+            @test bcopy!(dest, f, b1, x) == f.(Vector(b1), x)
+            @test bitcheck(dest)
+            @test chunked(dest, f, x, b1)
+            @test bcopy!(dest, f, x, b1) == f.(x, Vector(b1))
+            @test bitcheck(dest)
+        end
+    end
+
+    dest = similar(b1)
+    bc = Base.Broadcast.instantiate(Base.Broadcast.broadcasted(nand, b1, Base.Broadcast.broadcasted(!, b2)))
+    @test Base.Broadcast.ischunkedbroadcast(dest, convert(Base.Broadcast.Broadcasted{Nothing}, bc))
+    @test copyto!(dest, bc) == nand.(Vector(b1), .!Vector(b2))
+    @test bitcheck(dest)
+end
+
 @testset "Binary arithmetic operators" begin
     @testset "Matrix{Bool}/Matrix{Bool}" begin
         b1 = bitrand(n1, n2)
