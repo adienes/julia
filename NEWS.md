@@ -79,6 +79,9 @@ New library features
   `c` to cleanly cancel immediately, `d` to detach, `i` for a profile peek,
   `v` to toggle verbose mode showing elapsed time, CPU%, and memory usage, and `?` for help. ([#60943]).
 * Instances of an `Enum` can now be given their own docstrings within the `@enum` definition ([#61955]).
+* `Base.Experimental.print_type_diff` prints a type with the parts that differ
+  from a reference type highlighted. It backs the `MethodError` "Closest
+  candidates" highlighting and can be reused in custom `showerror` methods ([#XXXXX]).
 
 Standard library changes
 ------------------------

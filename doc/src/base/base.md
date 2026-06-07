@@ -432,6 +432,7 @@ Base.current_exceptions
 Base.@assert
 Base.Experimental.register_error_hint
 Base.Experimental.show_error_hints
+Base.Experimental.print_type_diff
 Base.ArgumentError
 Base.AssertionError
 Core.BoundsError
