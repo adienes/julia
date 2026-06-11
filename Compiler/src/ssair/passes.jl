@@ -567,6 +567,16 @@ function lift_comparison!(::typeof(===), compact::IncrementalCompact,
     lhs, rhs = args[2], args[3]
     vl = argextype(lhs, compact)
     vr = argextype(rhs, compact)
+    # Fold this comparison if it is statically decidable from the argument types.
+    # Inference normally folds these, but the types may have been refined within
+    # this very pass (e.g. by `lift_keyvalue_get!`).
+    result = egal_tfunc(𝕃ₒ, vl, vr)
+    if isa(result, Const)
+        compact[idx] = result.val
+        compact[SSAValue(idx)][:type] = result
+        add_flag!(compact[SSAValue(idx)], IR_FLAG_REFINED)
+        return
+    end
     if isa(vl, Const)
         isa(vr, Const) && return
         val = rhs
@@ -1085,9 +1095,13 @@ function lift_keyvalue_get!(compact::IncrementalCompact, idx::Int, stmt::Expr, �
         KeyValueWalker(compact))
 
     if lifted_val !== nothing
-        compact[idx] = Expr(:new, wrapper_typ, lifted_val.val)
+        newexpr = Expr(:new, wrapper_typ, lifted_val.val)
+        compact[idx] = newexpr
         compact[SSAValue(idx)][:type] = wrapper_typ
         add_flag!(compact[SSAValue(idx)], IR_FLAG_REFINED)
+        # The flags inherited from the replaced call may be too weak for the `:new` expr,
+        # preventing DCE in case it ends up unused. Refine them.
+        refine_new_effects!(𝕃ₒ, compact, idx, newexpr)
     else
         compact[idx] = nothing
     end
@@ -1546,6 +1560,11 @@ function sroa_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
         line = compact[SSAValue(idx)][:line]
         if lifted_val !== nothing && !⊑(𝕃ₒ, compact[SSAValue(idx)][:type], result_t)
             compact[idx] = lifted_val === nothing ? nothing : lifted_val.val
+            # Eagerly update the type so that lifting of any downstream uses processed
+            # later within this same pass can use the refined type (e.g. the key egality
+            # check in `lift_keyvalue_get!`). `IR_FLAG_REFINED` is still required for the
+            # refinement to be propagated into the types of any users at the next compaction.
+            compact[SSAValue(idx)][:type] = result_t
             add_flag!(compact[SSAValue(idx)], IR_FLAG_REFINED)
         elseif lifted_val === nothing || isa(lifted_val.val, AnySSAValue)
             # Save some work in a later compaction, by inserting this into the renamer now,

@@ -2175,6 +2175,18 @@ let src = code_typed1(foosvalconstprop, ())
     @test count(is_constfield_load, src.code) == 0
 end
 
+# JuliaLang/julia issue #58330: a scoped value lookup within the scope that sets it
+# should be folded away, including when SROA only discovers the constant set/get keys
+# during the pass itself
+const sval58330 = ScopedValue(1)
+function sval58330_macroform()
+    @with sval58330 => 2 sval58330[]
+end
+let src = code_typed1(sval58330_macroform, ())
+    is_keyvalue_get(@nospecialize x) = isexpr(x, :invoke) &&
+        singleton_type(argextype(x.args[2], src)) === Core.OptimizedGenerics.KeyValue.get
+    @test count(is_keyvalue_get, src.code) == 0
+end
 # JuliaLang/julia #59548
 # Rewrite `Core._apply_iterate` to use `Core.svec` instead of `tuple` to better match
 # the codegen ABI
