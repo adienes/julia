@@ -6619,6 +6619,12 @@ let apply_type_tfunc = Compiler.apply_type_tfunc
     # unknown components may turn out to be TypeVars at runtime
     @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), Any]) == Union{Type,TypeVar}
     @test !apply_type_nothrow(𝕃, Any[Const(Union), Const(Nothing), Any], Union{Type,TypeVar})
+    # a `Const` TypeVar has known object identity, so the union folds to a `Const`
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), Const(tv)]) === Const(Union{Nothing,tv})
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Union{}), Const(tv)]) === Const(tv)
+    @test apply_type_nothrow(𝕃, Any[Const(Union), Const(Nothing), Const(tv)], Const(Union{Nothing,tv}))
+    # but mixed with unknown components, the result may still be a bare TypeVar
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Type, Const(tv)]) == Union{Type,TypeVar}
     # a symbolic TypeVar from a `Type{B}` component stands for a type equal to it,
     # so the collapsed result is a `Type`, not the TypeVar object
     B = TypeVar(:B, Union{}, Integer)

@@ -1808,12 +1808,8 @@ function apply_type_tfunc(𝕃::AbstractLattice, argtypes::Vector{Any};
             ai = argtypes[i]
             if isa(ai, Const)
                 if !isa(ai.val, Type)
-                    if isa(ai.val, TypeVar)
-                        hasnonType = true
-                        mayTypeVar = true
-                    else
-                        return Bottom
-                    end
+                    isa(ai.val, TypeVar) || return Bottom
+                    mayTypeVar = true
                 end
             elseif isa(ai, PartialTypeVar)
                 mayTypeVar = true
@@ -1847,14 +1843,15 @@ function apply_type_tfunc(𝕃::AbstractLattice, argtypes::Vector{Any};
                 hasvaluetv = true
             else
                 aty = (ai::Const).val
+                hasvaluetv |= isa(aty, TypeVar)
             end
             ty = Union{ty, aty}
         end
         allconst && return Const(ty)
         isa(ty, Type) && return Type{ty}
         # the union collapsed to a bare TypeVar (e.g. Union{Union{}, T}); if it is a
-        # TypeVar value from a `PartialTypeVar` component, the runtime result is the
-        # TypeVar object itself, whereas a symbolic TypeVar from a `Type{B}`
+        # TypeVar value from a Const/PartialTypeVar component, the runtime result is
+        # the TypeVar object itself, whereas a symbolic TypeVar from a `Type{B}`
         # component stands for a type equal to it
         hasvaluetv || return Type{ty}
         hassymbolictv && return Union{Type,TypeVar}
