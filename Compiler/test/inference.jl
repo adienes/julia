@@ -7515,6 +7515,35 @@ let apply_type_tfunc = Compiler.apply_type_tfunc
     @test apply_type_tfunc(𝕃, Any[Const(Vector), Union{Type{Int},Type{Nothing}}]) == Union{Core.TypeEgal{Vector{Int}},Core.TypeEgal{Vector{Nothing}}}
 end
 
+# issue #53917: `Union` head `apply_type_tfunc` precision for `PartialTypeVar` components,
+# so that kwarg types like `Union{Nothing,<:Integer}` are not rebuilt on every call
+let apply_type_tfunc = Compiler.apply_type_tfunc
+    apply_type_nothrow = Compiler.apply_type_nothrow
+    𝕃 = Compiler.fallback_lattice
+    Const = Core.Const
+    tv = TypeVar(:T, Union{}, Integer)
+    ptv = Compiler.PartialTypeVar(tv, true, true)
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), ptv]) == Type{Union{Nothing,tv}}
+    @test apply_type_nothrow(𝕃, Any[Const(Union), Const(Nothing), ptv], Type{Union{Nothing,tv}})
+    # the union may collapse to the bare TypeVar object, which is not a `Type`
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Union{}), ptv]) === TypeVar
+    # unknown components may turn out to be TypeVars at runtime
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), Any]) == Union{Type,TypeVar}
+    @test !apply_type_nothrow(𝕃, Any[Const(Union), Const(Nothing), Any], Union{Type,TypeVar})
+    # a symbolic TypeVar from a `Type{B}` component stands for a type equal to it,
+    # so the collapsed result is a `Type`, not the TypeVar object
+    B = TypeVar(:B, Union{}, Integer)
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Union{}), Type{B}]) === Type{B}
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), Type{B}]) === Type{Union{Nothing,B}}
+end
+issue53917(v; y::Union{Nothing,<:Integer}=nothing) = isnothing(y) ? v[1] : v[y]
+let src = code_typed1(Core.kwcall, (NamedTuple{(:y,),Tuple{Int}}, typeof(issue53917), Vector{Int}))
+    # the `isa` check against the kwarg type should fold away, leaving no
+    # runtime TypeVar/UnionAll construction in the keyword sorter
+    @test count(iscall((src, Core._typevar)), src.code) == 0
+    @test count(stmt -> Meta.isexpr(stmt, :foreigncall), src.code) == 0
+end
+
 @test Base.infer_return_type((Bool,Int,)) do b, y
     x = b ? 1 : missing
     inner = y -> x + y
