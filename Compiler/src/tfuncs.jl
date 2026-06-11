@@ -1721,9 +1721,7 @@ function apply_type_nothrow(𝕃::AbstractLattice, argtypes::Vector{Any}, @nospe
     if headtype === Union
         # the union is valid as long as all components are Types or TypeVars
         for i = 2:length(argtypes)
-            ai = widenconditional(argtypes[i])
-            isa(ai, PartialTypeVar) && continue
-            ⊑(𝕃, ai, Union{Type,TypeVar}) || return false
+            ⊑(𝕃, widenconditional(argtypes[i]), Union{Type,TypeVar}) || return false
         end
         return true
     end

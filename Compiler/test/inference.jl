@@ -3635,6 +3635,14 @@ const DenseIdx = Union{IntRange,Integer}
 
 # Non uniformity in expressions with PartialTypeVar
 @test Compiler.:⊑(Compiler.PartialTypeVar(TypeVar(:N), true, true), TypeVar)
+# a PartialTypeVar is a runtime TypeVar object, so it is below any wider type too
+let ptv = Compiler.PartialTypeVar(TypeVar(:N), true, true)
+    @test Compiler.:⊑(ptv, Union{Type,TypeVar})
+    @test Compiler.:⊑(ptv, Any)
+    @test !Compiler.:⊑(ptv, Type)
+    @test !Compiler.:⊑(ptv, Union{})
+    @test !Compiler.:⊑(ptv, Compiler.PartialTypeVar(TypeVar(:N), true, true))
+end
 let N = TypeVar(:N)
     𝕃 = Compiler.SimpleInferenceLattice.instance
     argtypes = Any[Compiler.Const(NTuple),
