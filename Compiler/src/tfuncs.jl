@@ -1718,9 +1718,15 @@ function apply_type_nothrow(𝕃::AbstractLattice, argtypes::Vector{Any}, @nospe
     else
         return false
     end
-    # We know the apply_type is well formed. Otherwise our rt would have been
-    # Bottom (or Type).
-    (headtype === Union) && return true
+    if headtype === Union
+        # the union is valid as long as all components are Types or TypeVars
+        for i = 2:length(argtypes)
+            ai = widenconditional(argtypes[i])
+            isa(ai, PartialTypeVar) && continue
+            ⊑(𝕃, ai, Union{Type,TypeVar}) || return false
+        end
+        return true
+    end
     headtype === TypeEq && return typeeq_apply_type_nothrow(𝕃, argtypes)
     isa(rt, Const) && return true
     u = headtype
@@ -1797,43 +1803,62 @@ function apply_type_tfunc(𝕃::AbstractLattice, argtypes::Vector{Any};
     if headtype === Union
         largs == 1 && return Const(Bottom)
         hasnonType = false
+        mayTypeVar = false # could the result collapse to a bare TypeVar (e.g. Union{Union{}, T})?
         for i = 2:largs
             ai = argtypes[i]
             if isa(ai, Const)
                 if !isa(ai.val, Type)
                     if isa(ai.val, TypeVar)
                         hasnonType = true
+                        mayTypeVar = true
                     else
                         return Bottom
                     end
                 end
-            else
-                if !isType(ai)
-                    if !isa(ai, Type) || hasintersect(ai, Type) || hasintersect(ai, TypeVar)
-                        hasnonType = true
-                    else
-                        return Bottom
-                    end
+            elseif isa(ai, PartialTypeVar)
+                mayTypeVar = true
+            elseif !isType(ai)
+                if !isa(ai, Type) || hasintersect(ai, Type) || hasintersect(ai, TypeVar)
+                    hasnonType = true
+                    mayTypeVar |= !isa(ai, Type) || hasintersect(ai, TypeVar)
+                else
+                    return Bottom
                 end
             end
         end
         if largs == 2 # Union{T} --> T
             return tmeet(widenconst(argtypes[2]), Union{Type,TypeVar})
         end
-        hasnonType && return Type
+        hasnonType && return mayTypeVar ? Union{Type,TypeVar} : Type
         ty = Union{}
         allconst = true
+        hasvaluetv = hassymbolictv = false
         for i = 2:largs
             ai = argtypes[i]
             if isType(ai)
                 aty = type_parameter(ai)
                 allconst &= hasuniquerep(aty)
+                hassymbolictv |= isa(aty, TypeVar)
+            elseif isa(ai, PartialTypeVar)
+                # the bounds of this TypeVar are known precisely, but the runtime
+                # TypeVar object is created fresh, so its identity is not constant
+                aty = ai.tv
+                allconst = false
+                hasvaluetv = true
             else
                 aty = (ai::Const).val
             end
             ty = Union{ty, aty}
         end
-        return allconst ? Const(ty) : Type{ty}
+        allconst && return Const(ty)
+        isa(ty, Type) && return Type{ty}
+        # the union collapsed to a bare TypeVar (e.g. Union{Union{}, T}); if it is a
+        # TypeVar value from a `PartialTypeVar` component, the runtime result is the
+        # TypeVar object itself, whereas a symbolic TypeVar from a `Type{B}`
+        # component stands for a type equal to it
+        hasvaluetv || return Type{ty}
+        hassymbolictv && return Union{Type,TypeVar}
+        return TypeVar
     end
     if headtype === TypeEq
         return typeeq_apply_type_tfunc(𝕃, argtypes)
