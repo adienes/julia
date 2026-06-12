@@ -1149,6 +1149,36 @@ function changed_lineinfo(di::DebugInfo, codeloc::Int, prevloc::Int)
     end
 end
 
+# Check whether the exception handler of an `EnterNode` consists of nothing but a
+# bare `rethrow()` call, which makes it semantically equivalent to having no handler
+# at all: no user code runs in the handler and the exception continues to propagate
+# unchanged. Lowering generates this form for `tryfinally` blocks with a trivial
+# `finally` clause, e.g. the dynamic-scope-only construct `Base.ScopedValues.@with`.
+function is_bare_rethrow_handler(ci::CodeInfo, sv::OptimizationState, enteridx::Int, catchdest::Int)
+    code = ci.code
+    ssavaluetypes = ci.ssavaluetypes::Vector{Any}
+    catchblock = block_for_inst(sv.cfg, catchdest)
+    # The handler block must not be reachable in any other way. Note that handler
+    # blocks have a virtual predecessor `0` representing the edge from outside the
+    # function (see `compute_basic_blocks`).
+    enterblock = block_for_inst(sv.cfg, enteridx)
+    all(p::Int -> p == 0 || p == enterblock, sv.cfg.blocks[catchblock].preds) || return false
+    for i in sv.cfg.blocks[catchblock].stmts
+        stmt = code[i]
+        (stmt === nothing || i in sv.unreachable) && continue
+        # The first reachable statement must be a bare `rethrow()` call. Since it
+        # does not return, inference will have marked everything that follows it
+        # in this block (e.g. the `:pop_exception` for the normal exit path that
+        # is never taken) as unreachable.
+        isexpr(stmt, :(=)) && (stmt = stmt.args[2])
+        isexpr(stmt, :call) || return false
+        length(stmt.args) == 1 || return false
+        ssavaluetypes[i] === Union{} || return false
+        return singleton_type(argextype(stmt.args[1], ci, sv.sptypes)) === rethrow
+    end
+    return false
+end
+
 function convert_to_ircode(ci::CodeInfo, sv::OptimizationState)
     # Update control-flow to reflect any unreachable branches.
     ssavaluetypes = ci.ssavaluetypes::Vector{Any}
@@ -1190,6 +1220,19 @@ function convert_to_ircode(ci::CodeInfo, sv::OptimizationState)
                         # so we need to retain this enter for the time being. However,
                         # we use the special marker `0` to indicate that setting up
                         # the try/catch frame is not required.
+                        code[i] = EnterNode(expr, 0)
+                    else
+                        code[i] = nothing
+                    end
+                elseif catchdest != 0 && is_bare_rethrow_handler(ci, sv, i, catchdest)
+                    # The handler runs no user code and rethrows the exception
+                    # unchanged, so it is semantically no handler at all. Elide it:
+                    # no exception frame needs to be set up at runtime (during
+                    # unwinding, the task state is restored from the next enclosing
+                    # handler, see `jl_eh_restore_state`), and functions containing
+                    # such dynamic-scope-only regions become eligible for inlining.
+                    cfg_delete_edge!(sv.cfg, block_for_inst(sv.cfg, i), block_for_inst(sv.cfg, catchdest))
+                    if isdefined(expr, :scope)
                         code[i] = EnterNode(expr, 0)
                     else
                         code[i] = nothing
@@ -1481,11 +1524,21 @@ function statement_or_branch_cost(@nospecialize(stmt), line::Int, src::Union{Cod
     elseif stmt isa GotoIfNot
         thiscost = dst(stmt.dest) < line ? 40 : 0
     elseif stmt isa EnterNode
-        # try/catch is a couple function calls,
-        # but don't inline functions with try/catch
-        # since these aren't usually performance-sensitive functions,
-        # and llvm is more likely to miscompile them when these functions get large
-        thiscost = typemax(Int)
+        if stmt.catch_dest == 0
+            # An `EnterNode` without an exception handler only maintains the dynamic
+            # scope (e.g. `Base.ScopedValues.@with` blocks; no exception frame is set
+            # up at runtime). These do appear in performance-sensitive code, and
+            # inlining them is required for the OptimizedGenerics.KeyValue
+            # optimizations of scoped value lookups, so only charge the cost of the
+            # scope bookkeeping, which is roughly a runtime call.
+            thiscost = 20
+        else
+            # try/catch is a couple function calls,
+            # but don't inline functions with try/catch
+            # since these aren't usually performance-sensitive functions,
+            # and llvm is more likely to miscompile them when these functions get large
+            thiscost = typemax(Int)
+        end
     end
     return thiscost
 end

@@ -2187,6 +2187,61 @@ let src = code_typed1(sval58330_macroform, ())
         singleton_type(argextype(x.args[2], src)) === Core.OptimizedGenerics.KeyValue.get
     @test count(is_keyvalue_get, src.code) == 0
 end
+# the closure form requires inlining `with`, which contains the scope `EnterNode`;
+# its bare-`rethrow` handler must have been elided into a frame-less enter
+function sval58330_closureform()
+    with(sval58330 => 2) do
+        sval58330[]
+    end
+end
+let src = code_typed1(sval58330_closureform, ())
+    is_keyvalue_get(@nospecialize x) = isexpr(x, :invoke) &&
+        singleton_type(argextype(x.args[2], src)) === Core.OptimizedGenerics.KeyValue.get
+    @test count(isinvoke(:with), src.code) == 0
+    @test count(is_keyvalue_get, src.code) == 0
+    @test count(x -> isa(x, EnterNode) && x.catch_dest != 0, src.code) == 0
+    @test count(isinvoke(:rethrow), src.code) == 0
+end
+# a handler that does run user code must not be elided
+function sval58330_realhandler()
+    try
+        error("x")
+    catch
+        println("cleanup")
+        rethrow()
+    end
+end
+let src = code_typed1(sval58330_realhandler, ())
+    @test count(x -> isa(x, EnterNode) && x.catch_dest != 0, src.code) == 1
+end
+# the scope operand of a frame-less EnterNode must be renumbered when
+# `convert_to_ircode` inserts unreachable markers earlier in the function
+# (this used to leave a stale reference, making `current_scope` read garbage)
+@noinline sval58330_read() = sval58330[]
+function sval58330_renumber(c::Bool)
+    if c
+        error("x")
+    end
+    @with sval58330 => 2 sval58330_read()
+end
+@test sval58330_renumber(false) == 2
+@test_throws ErrorException sval58330_renumber(true)
+# unwinding through the elided (frame-less) scope enter into a real handler
+# must restore the dynamic scope
+function sval58330_unwind()
+    local caught = 0
+    try
+        with(sval58330 => 2) do
+            sval58330[] == 2 || error("scope not entered")
+            throw(DomainError(0))
+        end
+    catch ex
+        ex isa DomainError || rethrow()
+        caught = sval58330[]
+    end
+    return caught
+end
+@test sval58330_unwind() == 1
 # JuliaLang/julia #59548
 # Rewrite `Core._apply_iterate` to use `Core.svec` instead of `tuple` to better match
 # the codegen ABI
