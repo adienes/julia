@@ -283,6 +283,21 @@ ci = code_lowered(g, Tuple{Val{true}})[1]
                                  [], 0, 0, :propagate)[end] == Core.ReturnNode()
 end
 
+@testset "inlining EnterNode" begin
+    # both the catch destination and the scope SSA reference must be offset
+    code = Any[Core.EnterNode(2, Core.SSAValue(1))]
+    @test Meta.partially_inline!(copy(code), [], Tuple{}, [], 0, 3, :propagate)[1] ==
+        Core.EnterNode(5, Core.SSAValue(4))
+    # frame-less EnterNode: no catch destination, but the scope must still be offset
+    code = Any[Core.EnterNode(0, Core.SSAValue(1))]
+    @test Meta.partially_inline!(copy(code), [], Tuple{}, [], 0, 3, :propagate)[1] ==
+        Core.EnterNode(0, Core.SSAValue(4))
+    # scope-less EnterNode
+    code = Any[Core.EnterNode(2)]
+    @test Meta.partially_inline!(copy(code), [], Tuple{}, [], 0, 3, :propagate)[1] ==
+        Core.EnterNode(5)
+end
+
 @testset "Base.Meta docstrings" begin
     @test isempty(Docs.undocumented_names(Meta))
 end
