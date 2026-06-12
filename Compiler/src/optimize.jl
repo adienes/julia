@@ -1584,7 +1584,13 @@ function renumber_ir_elements!(body::Vector{Any}, ssachangemap::Vector{Int}, lab
             end
         elseif isa(el, EnterNode)
             tgt = el.catch_dest
-            if tgt != 0
+            if tgt == 0
+                # frame-less enter: there is no catch destination to renumber, but
+                # the scope reference still needs to be updated
+                if isdefined(el, :scope) && isa(el.scope, SSAValue)
+                    body[i] = EnterNode(0, SSAValue(el.scope.id + ssachangemap[el.scope.id]))
+                end
+            else
                 was_deleted = labelchangemap[tgt] == typemin(Int)
                 if was_deleted
                     @assert !isdefined(el, :scope)

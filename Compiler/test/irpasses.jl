@@ -1892,6 +1892,21 @@ let (ir,rt) = only(Base.code_ircode((Int,)) do y
     @test rt == Union{Nothing,Float64}
 end
 
+# `renumber_ir_elements!` must renumber the scope operand of frame-less (i.e.
+# `catch_dest == 0`) EnterNodes: the stale SSA reference made `Core.current_scope()`
+# observe an arbitrary value (here the Pair) when `convert_to_ircode` inserted
+# unreachable markers earlier in the function
+const sval_scope_renumber = ScopedValue(1)
+@noinline observe_current_scope() = Core.current_scope()
+function scope_renumber(c::Bool)
+    if c
+        error("x")
+    end
+    @with sval_scope_renumber => 2 observe_current_scope()
+end
+@test scope_renumber(false) isa Base.ScopedValues.Scope
+@test_throws ErrorException scope_renumber(true)
+
 # Test that adce_pass! sets Refined on PhiNode values
 let code = Any[
     # Basic Block 1
