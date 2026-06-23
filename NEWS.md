@@ -69,6 +69,9 @@ New library functions
 * `Base.generating_output()` has been made `public` (but not exported) to allow
   checking whether the current process is performing compilation for a
   pkgimage/sysimage ([#61224]).
+* `Base.Experimental.print_type_diff` prints a type with the parts that differ
+  from a reference type highlighted. It backs the `MethodError` "Closest
+  candidates" highlighting and can be reused in custom `showerror` methods ([#XXXXX]).
 
 New library features
 --------------------

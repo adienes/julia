@@ -333,6 +333,37 @@ function show_error_hints(io, ex, args...)
     end
 end
 
+"""
+    Experimental.print_type_diff(io::IO, a::Type, b::Type; highlight)
+
+Print `a`, highlighting the parts that differ from `b`.
+
+`a` and `b` are compared structurally, recursing into the parameters of matching
+types; the topmost differing subtrees are passed to `highlight`. Types that cannot
+be compared structurally (`Union`, `UnionAll`, `Vararg`, or differing type names)
+are passed to `highlight` whole. Only `a` is printed; `b` is the reference.
+
+`highlight(io, part)` prints the differing `part`. By default it prints `part` in
+red when `io` has `:color` set and as `!Matched{part}` otherwise, matching the
+[`MethodError`](@ref) "Closest candidates" display.
+
+# Examples
+```jldoctest
+julia> sprint(Base.Experimental.print_type_diff, @NamedTuple{a::Int, b::Char}, @NamedTuple{a::Int, b::String})
+"@NamedTuple{a::Int64, b::!Matched{Char}}"
+
+julia> sprint(io -> Base.Experimental.print_type_diff(io, Tuple{Int, Char}, Tuple{Int, String}; highlight = (io, ty) -> print(io, "<<", ty, ">>")))
+"Tuple{Int64, <<Char>>}"
+```
+"""
+function print_type_diff(io::IO, @nospecialize(a::Type), @nospecialize(b::Type);
+                         highlight=nothing)
+    use_color = get(io, :color, false)::Bool
+    mark = highlight === nothing ? Base.show_type_mismatch : (io, ty, _color, _top) -> highlight(io, ty)
+    Base.show_type_diff(io, a, b, use_color, #=top_level=#false, mark)
+    return nothing
+end
+
 # OpaqueClosure
 include("opaque_closure.jl")
 

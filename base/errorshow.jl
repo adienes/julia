@@ -457,14 +457,18 @@ stacktrace_expand_basepaths()::Bool = Base.get_bool_env("JULIA_STACKTRACE_EXPAND
 stacktrace_contract_userdir()::Bool = Base.get_bool_env("JULIA_STACKTRACE_CONTRACT_HOMEDIR", true) === true
 stacktrace_linebreaks()::Bool = Base.get_bool_env("JULIA_STACKTRACE_LINEBREAKS", false) === true
 
-# Print `::<sig>` with structural framing (type names, braces) in the default
-# color, matching parameters and their separating commas in gray, and the
-# topmost differing subtree(s) in `error_color`.
-function show_type_diff(io::IO, @nospecialize(sig), @nospecialize(called), use_color::Bool, top_level::Bool=true)
-    show_namedtuple_diff(io, sig, called, use_color, top_level) && return nothing
+# Print `sig` with structural framing (type names, braces) in the default color,
+# matching parameters and their separating commas in gray, and the topmost
+# differing subtree(s) via `mark` (by default, `error_color`).
+function show_type_diff(io::IO, @nospecialize(sig), @nospecialize(called), use_color::Bool, top_level::Bool=true, mark=show_type_mismatch)
+    if sig === called
+        top_level && print(io, "::")
+        return show_type_match(io, sig, use_color)
+    end
+    show_namedtuple_diff(io, sig, called, use_color, top_level, mark) && return nothing
     params = descend_params(io, sig, called)
     if params === nothing
-        return show_type_mismatch(io, sig, use_color, top_level)
+        return mark(io, sig, use_color, top_level)
     end
     top_level && print(io, "::")
     sig_params, called_params, alias = params
@@ -478,13 +482,7 @@ function show_type_diff(io::IO, @nospecialize(sig), @nospecialize(called), use_c
     print(io, "{")
     for k in 1:length(sig_params)
         k > 1 && show_separator(io, use_color)
-        sp = sig_params[k]
-        cp = called_params[k]
-        if sp === cp
-            show_type_match(io, sp, use_color)
-        else
-            show_type_diff(io, sp, cp, use_color, #=top_level=#false)
-        end
+        show_type_diff(io, sig_params[k], called_params[k], use_color, #=top_level=#false, mark)
     end
     print(io, "}")
 end
@@ -508,7 +506,7 @@ function show_type_match(io::IO, @nospecialize(ty), use_color::Bool)
 end
 
 function show_namedtuple_diff(io::IO, @nospecialize(sig), @nospecialize(called),
-                              use_color::Bool, top_level::Bool)
+                              use_color::Bool, top_level::Bool, mark)
     sig isa DataType && called isa DataType || return false
     sig.name === typename(NamedTuple) && called.name === typename(NamedTuple) || return false
     length(sig.parameters) == 2 && length(called.parameters) == 2 || return false
@@ -526,14 +524,9 @@ function show_namedtuple_diff(io::IO, @nospecialize(sig), @nospecialize(called),
         show_sym(io, s_syms[i])
         sp = s_types.parameters[i]
         cp = c_types.parameters[i]
-        if sp === cp
-            sp === Any && continue   # match `show_at_namedtuple` and don't print `::Any`
-            print(io, "::")
-            show_type_match(io, sp, use_color)
-        else
-            print(io, "::")
-            show_type_diff(io, sp, cp, use_color, #=top_level=#false)
-        end
+        sp === cp === Any && continue   # match `show_at_namedtuple` and don't print `::Any`
+        print(io, "::")
+        show_type_diff(io, sp, cp, use_color, #=top_level=#false, mark)
     end
     print(io, "}")
     return true
