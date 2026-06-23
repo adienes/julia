@@ -126,6 +126,7 @@ end
 # Any function `f` stored here must be consistent with the signature
 #    f(m::Method)::Tuple{Union{Symbol,String}, Union{Int32,Int64}}
 const methodloc_callback = Ref{Union{Function, Nothing}}(nothing)
+const _methodloc_callback_lock = ReentrantLock()
 
 function fixup_stdlib_path(path::String)
     # The file defining Base.Sys gets included after this file is included so make sure
@@ -150,9 +151,10 @@ end
 # This function does the method location updating
 function updated_methodloc(m::Method)::Tuple{String, Int32}
     file, line = m.file, m.line
-    if methodloc_callback[] !== nothing
+    callback = @lock _methodloc_callback_lock methodloc_callback[]
+    if callback !== nothing
         try
-            file, line = invokelatest(methodloc_callback[], m)::Tuple{Union{Symbol,String}, Union{Int32,Int64}}
+            file, line = invokelatest(callback, m)::Tuple{Union{Symbol,String}, Union{Int32,Int64}}
         catch
         end
     end
