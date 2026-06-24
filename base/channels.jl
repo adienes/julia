@@ -455,6 +455,104 @@ function put_unbuffered(c::Channel, v)
 end
 
 """
+    append!(c::Channel, iter)
+
+Add all items from the iterable `iter` to the channel `c`, blocking while the buffer is full
+until items are taken to make room, and return `c`.
+
+When `iter` is an `AbstractArray` whose elements can be stored in `c`, items are transferred
+to a buffered channel in bulk: `append!` acquires the channel's lock once and copies as many
+items as fit in the available buffer space before releasing it, repeating until every item is
+added. This requires far fewer lock operations than calling [`put!`](@ref) for each item and
+can be substantially faster. For any other iterable, or for an unbuffered channel, `append!`
+is equivalent to calling `put!` on each item in turn.
+
+`append!` is not atomic: items may become visible to consumers before the call returns, and
+if it stops early (for example because the channel is closed or iterating `iter` throws), the
+items added so far remain in the channel.
+
+!!! note
+    On the bulk `AbstractArray` path, elements are copied while the channel's lock is held, so
+    the array should be an ordinary one whose indexing does not block or perform operations on
+    the same channel.
+
+!!! compat "Julia 1.14"
+    This method requires Julia 1.14 or later.
+
+# Examples
+```jldoctest
+julia> c = Channel{Int}(4);
+
+julia> append!(c, 1:4);
+
+julia> take!(c, 4)
+4-element Vector{Int64}:
+ 1
+ 2
+ 3
+ 4
+```
+"""
+function append!(c::Channel, iter)
+    iter === c && throw(ArgumentError("cannot `append!` a channel to itself"))
+    for x in iter
+        put!(c, x)
+    end
+    return c
+end
+# Fast path: a buffered channel can absorb an array whose elements already have an acceptable
+# type in bulk, copying straight into the buffer instead of using a per-item `put!`.
+function append!(c::Channel{T}, a::AbstractArray{<:T}) where {T}
+    isbuffered(c) && return append_buffered(c, a)
+    for x in a
+        put!(c, x)
+    end
+    return c
+end
+
+# Copy the array `a` (at linear indices `firstindex(a) .+ (0:length-1)`) into the buffer of
+# `c` in lock-amortized chunks, blocking for space as needed. `a` must already hold values of
+# an acceptable element type. Exception-safe: a failure while copying a chunk leaves `c`'s
+# buffer and `n_avail` consistent. Elements are read while the channel lock is held, so `a`
+# should be an ordinary array whose indexing does not block or reenter the channel.
+function append_buffered(c::Channel, a::AbstractArray)
+    n = length(a)
+    n == 0 && return c
+    i0 = firstindex(a)
+    pos = 0  # number of items already transferred
+    lock(c)
+    # Count all items as available up front (as `put_buffered` does for its single item) so
+    # that `n_avail`/`isfull` see a blocked batched append the same way they see blocked `put!`s.
+    _increment_n_avail(c, n)
+    try
+        while pos < n
+            while length(c.data) == c.sz_max
+                check_channel_state(c)
+                wait(c.cond_put)
+            end
+            check_channel_state(c)
+            m = min(c.sz_max - length(c.data), n - pos)
+            old = length(c.data)
+            resize!(c.data, old + m)
+            try
+                copyto!(c.data, old + 1, a, i0 + pos, m)
+            catch
+                resize!(c.data, old)  # drop the uninitialized tail if copying failed
+                rethrow()
+            end
+            # notify all, since some of the waiters may be on a `fetch` or `wait` call.
+            notify(c.cond_take, nothing, true, false)
+            pos += m
+        end
+    finally
+        # Items that were not transferred (early exit or exception) are no longer pending.
+        pos < n && _increment_n_avail(c, pos - n)
+        unlock(c)
+    end
+    return c
+end
+
+"""
     fetch(c::Channel)
 
 Waits for and returns (without removing) the first available item from the `Channel`.
@@ -550,6 +648,113 @@ function take_unbuffered(c::Channel{T}) where T
     finally
         unlock(c)
     end
+end
+
+"""
+    take!(c::Channel, n::Integer, [buffer::AbstractVector]) -> buffer
+
+Remove and return up to `n` items from the channel `c` as a vector, blocking until `n` items
+have been taken or the channel is closed. If the channel is closed before `n` items are
+available, the returned vector holds only the items that were taken. Pass `n == typemax(Int)`
+or `n == Inf` to take every item until the channel closes.
+
+For a buffered `Channel`, items are removed in batches: `take!` acquires the channel's lock
+once and removes every currently-available item (up to `n`) before releasing it, which
+requires far fewer lock operations than calling [`take!`](@ref) once per item and can be
+substantially faster.
+
+If `buffer` is given it is used to store and return the result; it must support
+[`resize!`](@ref) and is resized to the number of items taken. Otherwise a new
+`Vector{eltype(c)}` is allocated. The result is written to `buffer` while the channel's lock
+is held, so an ordinary `Vector` should be used.
+
+!!! compat "Julia 1.14"
+    This method requires Julia 1.14 or later.
+
+# Examples
+```jldoctest
+julia> c = Channel{Int}(4);
+
+julia> append!(c, 1:4);
+
+julia> take!(c, 2)
+2-element Vector{Int64}:
+ 1
+ 2
+
+julia> take!(c, 2)
+2-element Vector{Int64}:
+ 3
+ 4
+```
+"""
+function take!(c::Channel{T}, n::Integer, buffer::AbstractVector=Vector{T}()) where {T}
+    n < 0 && throw(ArgumentError("the number of items to take must be ≥ 0"))
+    return isbuffered(c) ? take_buffered(c, Int(n), buffer) : take_unbuffered(c, Int(n), buffer)
+end
+function take!(c::Channel{T}, n::AbstractFloat, buffer::AbstractVector=Vector{T}()) where {T}
+    isinf(n) && n > 0 && return take!(c, typemax(Int), buffer)
+    isinteger(n) || throw(ArgumentError("the number of items to take must be a non-negative integer or Inf"))
+    return take!(c, Int(n), buffer)
+end
+
+function take_buffered(c::Channel, n::Int, buffer::AbstractVector)
+    bi = firstindex(buffer)
+    taken = 0
+    lock(c)
+    try
+        while taken < n
+            try
+                while isempty(c.data)
+                    check_channel_state(c)
+                    wait(c.cond_take)
+                end
+            catch e
+                # a normal close means no more items are coming; return the partial batch.
+                (e isa InvalidStateException && e.state === :closed) || rethrow()
+                break
+            end
+            m = min(n - taken, length(c.data))
+            if length(buffer) < taken + m
+                resize!(buffer, taken + m)
+            end
+            copyto!(buffer, bi + taken, c.data, 1, m)
+            deleteat!(c.data, 1:m)
+            _increment_n_avail(c, -m)
+            # notify all: up to `m` slots are now free for blocked `put!`/`append!` tasks.
+            notify(c.cond_put, nothing, true, false)
+            taken += m
+        end
+    finally
+        unlock(c)
+    end
+    # Trim after releasing the lock so a throwing `resize!` (e.g. a non-resizable buffer)
+    # cannot leak the channel lock.
+    length(buffer) == taken || resize!(buffer, taken)
+    return buffer
+end
+
+# 0-size channel
+function take_unbuffered(c::Channel{T}, n::Int, buffer::AbstractVector) where {T}
+    bi = firstindex(buffer)
+    taken = 0
+    while taken < n
+        local v::T
+        try
+            v = take_unbuffered(c)
+        catch e
+            (e isa InvalidStateException && e.state === :closed) || rethrow()
+            break
+        end
+        if bi + taken <= lastindex(buffer)
+            buffer[bi + taken] = v
+        else
+            push!(buffer, v)
+        end
+        taken += 1
+    end
+    length(buffer) == taken || resize!(buffer, taken)
+    return buffer
 end
 
 """

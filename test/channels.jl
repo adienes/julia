@@ -641,6 +641,160 @@ end
     @test push!(c, nothing) === c
 end
 
+# An AbstractArray of length `len` whose linear getindex throws once index `bad` is reached;
+# used to exercise the exception-safety of the bulk `append!` fast path.
+struct ThrowingArray <: AbstractVector{Int}
+    len::Int
+    bad::Int
+end
+Base.size(a::ThrowingArray) = (a.len,)
+Base.IndexStyle(::Type{ThrowingArray}) = IndexLinear()
+Base.getindex(a::ThrowingArray, i::Int) = i < a.bad ? i : error("boom")
+
+# Batched channel operations: append!(c, iter) and take!(c, n[, buffer])
+@testset "batch append!/take!" begin
+    @testset "append!" begin
+        # fits in buffer
+        let c = Channel{Int}(4)
+            @test append!(c, 1:4) === c
+            @test Base.n_avail(c) == 4
+            @test [take!(c) for _ in 1:4] == [1, 2, 3, 4]
+        end
+        # more items than buffer space blocks until drained
+        let c = Channel{Int}(3) do ch; append!(ch, 1:10); end
+            @test collect(c) == collect(1:10)
+        end
+        # element conversion (array eltype not <: channel eltype)
+        let c = Channel{Float64}(4)
+            append!(c, Int[1, 2, 3]); close(c)
+            @test collect(c) == [1.0, 2.0, 3.0]
+        end
+        # generic iterator without length, needing to block on a small buffer
+        let c = Channel{Int}(4) do ch; append!(ch, (2i for i in 1:10)); end
+            @test collect(c) == [2i for i in 1:10]
+        end
+        # array fast path into Channel{Any}
+        let c = Channel{Any}(4)
+            append!(c, [1, 2, 3]); close(c)
+            @test collect(c) == Any[1, 2, 3]
+        end
+        # unbuffered channel
+        let c = Channel{Int}() do ch; append!(ch, 1:3); end
+            @test collect(c) == [1, 2, 3]
+        end
+        # channel-to-channel transfer over a mix of buffer sizes
+        for (b1, b2) in Iterators.product((0, 3, 5), (0, 3, 5))
+            src = Channel{Int}(b1) do ch; append!(ch, 1:5); end
+            dst = Channel{Int}(b2) do ch; append!(ch, src); end
+            @test collect(dst) == [1, 2, 3, 4, 5]
+        end
+        # appending to a closed channel throws
+        let c = Channel{Int}(2)
+            close(c)
+            @test_throws InvalidStateException append!(c, 1:2)
+        end
+        # empty iterators are a no-op
+        let c = Channel{Int}(2)
+            @test append!(c, Int[]) === c
+            @test append!(c, 1:0) === c
+            @test Base.n_avail(c) == 0
+        end
+        # appending a channel to itself is rejected
+        let c = Channel{Int}(2)
+            @test_throws ArgumentError append!(c, c)
+        end
+    end
+
+    @testset "take!" begin
+        let c = Channel{Int}(4)
+            append!(c, 1:4)
+            @test take!(c, 0) == Int[]
+            @test take!(c, 2) == [1, 2]
+            @test Base.n_avail(c) == 2
+            @test take!(c, 1) == [3]
+            close(c)
+            @test take!(c, 5) == [4]      # closed: returns the partial remainder
+        end
+        # closing yields the partial batch
+        let c = Channel{Int}(3) do ch; append!(ch, 1:3); end
+            @test take!(c, 10) == [1, 2, 3]
+        end
+        # provided buffer is reused, grown, and trimmed
+        let c = Channel{Int}(8) do ch; append!(ch, 1:5); end
+            buf = Vector{Int}(undef, 2)
+            r = take!(c, 100, buf)
+            @test r === buf
+            @test r == [1, 2, 3, 4, 5]
+        end
+        # take all until close with Inf / typemax
+        for n in (Inf, typemax(Int))
+            c = Channel{Int}(3) do ch; append!(ch, 1:3); end
+            @test take!(c, n) == [1, 2, 3]
+        end
+        # unbuffered channel
+        let c = Channel{Int}() do ch; append!(ch, 1:3); end
+            @test take!(c, 3) == [1, 2, 3]
+        end
+        # invalid n
+        @test_throws ArgumentError take!(Channel{Int}(1), -1)
+        @test_throws ArgumentError take!(Channel{Int}(1), 1.5)
+    end
+
+    @testset "n_avail and exception safety" begin
+        # a blocked bulk append counts its pending items in n_avail, like blocked put!s
+        let c = Channel{Int}(3)
+            t = @async append!(c, collect(1:10))
+            @test timedwait(() -> Base.n_avail(c) == 10, 5.0) === :ok
+            @test Base.isfull(c)
+            out = Int[]
+            while length(out) < 10
+                append!(out, take!(c, 10))
+            end
+            wait(t)
+            @test out == collect(1:10)
+            @test Base.n_avail(c) == 0
+        end
+        # appending to a closed channel leaves n_avail unchanged
+        let c = Channel{Int}(5)
+            put!(c, 99); close(c)
+            @test_throws InvalidStateException append!(c, 1:3)
+            @test Base.n_avail(c) == 1
+        end
+        # a failure midway through a bulk copy leaves the buffer and n_avail consistent
+        let c = Channel{Int}(10)
+            @test_throws ErrorException append!(c, ThrowingArray(5, 3))
+            @test length(c.data) == Base.n_avail(c) == 0
+        end
+    end
+
+    @testset "concurrent producers/consumers" begin
+        # round-trip many items through a small buffer using batches across several tasks
+        item_n, batch, nt = 2000, 50, 4
+        ch = Channel{Int}(16)
+        producers = [Threads.@spawn begin
+            i = 1
+            while i <= item_n
+                hi = min(i + batch - 1, item_n)
+                append!(ch, i:hi)
+                i = hi + 1
+            end
+        end for _ in 1:nt]
+        got = Threads.Atomic{Int}(0)
+        checksum = Threads.Atomic{Int}(0)
+        consumers = [Threads.@spawn while true
+            v = take!(ch, batch)
+            isempty(v) && break
+            Threads.atomic_add!(got, length(v))
+            Threads.atomic_add!(checksum, sum(v))
+        end for _ in 1:nt]
+        wait.(producers)
+        close(ch)
+        wait.(consumers)
+        @test got[] == nt * item_n
+        @test checksum[] == nt * sum(1:item_n)
+    end
+end
+
 # Channel `show`
 let c = Channel(3)
     @test repr(c) == "Channel{Any}(3)"
