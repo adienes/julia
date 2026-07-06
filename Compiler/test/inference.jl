@@ -7549,6 +7549,10 @@ let apply_type_tfunc = Compiler.apply_type_tfunc
     B = TypeVar(:B, Union{}, Integer)
     @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Union{}), Type{B}]) === Type{B}
     @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), Type{B}]) === Type{Union{Nothing,B}}
+    # a `Union` head with a trailing vararg can still collapse to a bare TypeVar, so it
+    # must not be pinned down to `Type` (the non-vararg path widens likewise)
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), Vararg{Any}]) == Union{Type,TypeVar}
+    @test apply_type_tfunc(𝕃, Any[Const(Vector), Vararg{Any}]) === Type
 end
 issue53917(v; y::Union{Nothing,<:Integer}=nothing) = isnothing(y) ? v[1] : v[y]
 let src = code_typed1(Core.kwcall, (NamedTuple{(:y,),Tuple{Int}}, typeof(issue53917), Vector{Int}))

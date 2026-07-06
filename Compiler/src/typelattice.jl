@@ -528,9 +528,9 @@ end
         end
         return false
     elseif isa(a, PartialTypeVar)
-        a === b && return true
+        (a === b || b === TypeVar) && return true
         # the instance of a PartialTypeVar is a runtime TypeVar object
-        return isa(b, Type) && ⊑(widenlattice(lattice), TypeVar, b)
+        return isa(b, Type) && ⊑(widenlattice(lattice), widenconst(a), b)
     elseif isa(b, PartialTypeVar)
         return false
     end

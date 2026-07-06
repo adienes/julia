@@ -1926,7 +1926,11 @@ function apply_type_tfunc(𝕃::AbstractLattice, argtypes::Vector{Any};
     end
     largs = length(argtypes)
     if largs > 1 && isvarargtype(argtypes[end])
-        return isvarargtype(headtype) ? TypeofVararg : Type
+        isvarargtype(headtype) && return TypeofVararg
+        # a `Union` head can collapse to a bare `TypeVar` (`Union{T}` is `T`), which
+        # is not a `Type`, so the result cannot be pinned down to `Type` here
+        headtype === Union && return Union{Type, TypeVar}
+        return Type
     end
     if headtype === Union
         largs == 1 && return Const(Bottom)
@@ -1942,9 +1946,10 @@ function apply_type_tfunc(𝕃::AbstractLattice, argtypes::Vector{Any};
             elseif isa(ai, PartialTypeVar)
                 mayTypeVar = true
             elseif !(isTypeEq(ai) || (isTypeEgal(ai) && type_parameter(ai) isa Type))
-                if !isa(ai, Type) || hasintersect(ai, Type) || hasintersect(ai, TypeVar)
+                maytv = !isa(ai, Type) || hasintersect(ai, TypeVar)
+                if maytv || hasintersect(ai, Type)
                     hasnonType = true
-                    mayTypeVar |= !isa(ai, Type) || hasintersect(ai, TypeVar)
+                    mayTypeVar |= maytv
                 else
                     return Bottom
                 end
@@ -1956,7 +1961,7 @@ function apply_type_tfunc(𝕃::AbstractLattice, argtypes::Vector{Any};
         hasnonType && return mayTypeVar ? Union{Type,TypeVar} : Type
         ty = Union{}
         allconst = true
-        hasvaluetv = hassymbolictv = false
+        hassymbolictv = false
         for i = 2:largs
             ai = argtypes[i]
             if isTypeEgal(ai)
@@ -1973,20 +1978,18 @@ function apply_type_tfunc(𝕃::AbstractLattice, argtypes::Vector{Any};
                 # TypeVar object is created fresh, so its identity is not constant
                 aty = ai.tv
                 allconst = false
-                hasvaluetv = true
             else
                 aty = (ai::Const).val
-                hasvaluetv |= isa(aty, TypeVar)
             end
             ty = Union{ty, aty}
         end
         allconst && return Const(ty)
         isa(ty, Type) && return Type{ty}
         # the union collapsed to a bare TypeVar (e.g. Union{Union{}, T}); if it is a
-        # TypeVar value from a Const/PartialTypeVar component, the runtime result is
-        # the TypeVar object itself, whereas a symbolic TypeVar from a `Type{B}`
-        # component stands for a type equal to it
-        hasvaluetv || return Type{ty}
+        # TypeVar value from a Const/PartialTypeVar component (tracked by `mayTypeVar`),
+        # the runtime result is the TypeVar object itself, whereas a symbolic TypeVar
+        # from a `Type{B}` component stands for a type equal to it
+        mayTypeVar || return Type{ty}
         hassymbolictv && return Union{Type,TypeVar}
         return TypeVar
     end
