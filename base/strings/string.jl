@@ -422,7 +422,7 @@ const _UTF8_DFA_TABLE = let # let block rather than function doesn't pollute bas
         class_row[i]=row
     end
 
-    map(c->class_row[c+1],character_classes)
+    tuple(map(c->class_row[c+1],character_classes)...)
 end
 
 
@@ -431,24 +431,34 @@ const _UTF8_DFA_ACCEPT = _UTF8DFAState(4) #This state represents the start and e
 const _UTF8_DFA_INVALID = _UTF8DFAState(10) # If the state machine is ever in this state just stop
 
 # The dfa step is broken out so that it may be used in other functions. The mask was calculated to work with state shifts above
-@inline _utf_dfa_step(state::_UTF8DFAState, byte::UInt8) = @inbounds (_UTF8_DFA_TABLE[byte+1] >> state) & _UTF8DFAState(0x0000001E)
+# noub: `byte + 1` is always within the 256-entry table for a UInt8 argument
+@assume_effects :noub @inline _utf_dfa_step(state::_UTF8DFAState, byte::UInt8) = @inbounds (_UTF8_DFA_TABLE[byte+1] >> state) & _UTF8DFAState(0x0000001E)
 
 @inline function _isvalid_utf8_dfa(state::_UTF8DFAState, bytes::AbstractVector{UInt8}, first::Int = firstindex(bytes), last::Int = lastindex(bytes))
-    for i = first:last
+    @assume_effects :terminates_locally for i = first:last
        @inbounds state = _utf_dfa_step(state, bytes[i])
     end
     return (state)
 end
 
-@inline function  _find_nonascii_chunk(chunk_size,cu::AbstractVector{CU}, first,last) where {CU}
-    n=first
-    while n <= last - chunk_size
-        _isascii(cu,n,n+chunk_size-1) || return n
-        n += chunk_size
+# `_find_first_nonascii` for long inputs scanned from the start:
+# `_ASCII_CHUNK_SIZE`-wide probes, with the all-clean case finished by a single
+# overlapping wide scan; the narrow cascade only runs inside a known-dirty block.
+@inline function _find_first_nonascii_wide(cu::AbstractVector{UInt8}, i::Int, n::Int)
+    chunk = _ASCII_CHUNK_SIZE
+    # terminates_locally: each iteration advances `i` by `chunk`; the guards
+    # leave room for the advance so the arithmetic cannot wrap
+    @inbounds if n - i >= chunk
+        @assume_effects :terminates_locally while true
+            _isascii(cu, i, i + chunk - 1) || break
+            i += chunk
+            if n - i < chunk
+                _isascii(cu, n - chunk + 1, n) && return 0
+                break
+            end
+        end
     end
-    n= last-chunk_size+1
-    _isascii(cu,n,last) || return n
-    return nothing
+    return _find_first_nonascii(cu, i, n)
 end
 
 ##
@@ -461,38 +471,40 @@ end
 
 
 function byte_string_classify(bytes::AbstractVector{UInt8})
-    chunk_size = 1024
-    chunk_threshold =  chunk_size + (chunk_size ÷ 2)
     n = length(bytes)
-    if n > chunk_threshold
-        start = _find_nonascii_chunk(chunk_size,bytes,1,n)
-        isnothing(start) && return 1
-    else
-        _isascii(bytes,1,n) && return 1
+    if n < _ASCII_CHUNK_SIZE + _ASCII_CHUNK_SIZE ÷ 2
+        _isascii(bytes, 1, n) && return 1
         start = 1
+    else
+        start = _find_first_nonascii_wide(bytes, 1, n)
+        start == 0 && return 1
     end
-    return _byte_string_classify_nonascii(bytes,start,n)
+    return _byte_string_classify_nonascii(bytes, start, n)
 end
 
 function _byte_string_classify_nonascii(bytes::AbstractVector{UInt8}, first::Int, last::Int)
     chunk_size = 256
 
     start = first
-    stop = min(last,first + chunk_size - 1)
+    stop = start + min(chunk_size - 1, last - start)
     state = _UTF8_DFA_ACCEPT
-    while start <= last
+    # terminates_locally: both loops advance `start` by the constant
+    # `chunk_size`; subtraction guards keep the arithmetic from wrapping
+    @assume_effects :terminates_locally while true
         # try to process ascii chunks
         while state == _UTF8_DFA_ACCEPT
             _isascii(bytes,start,stop) || break
-            (start = start + chunk_size) <= last || break
-            stop = min(last,stop + chunk_size)
+            last - start < chunk_size && return ifelse(state == _UTF8_DFA_ACCEPT,2,0)
+            start += chunk_size
+            stop = start + min(chunk_size - 1, last - start)
         end
         # Process non ascii chunk
         state = _isvalid_utf8_dfa(state,bytes,start,stop)
         state == _UTF8_DFA_INVALID && return 0
 
-        start = start + chunk_size
-        stop = min(last,stop + chunk_size)
+        last - start < chunk_size && break
+        start += chunk_size
+        stop = start + min(chunk_size - 1, last - start)
     end
     return ifelse(state == _UTF8_DFA_ACCEPT,2,0)
 end
@@ -501,6 +513,10 @@ isvalid(::Type{String}, bytes::AbstractVector{UInt8}) = (@inline byte_string_cla
 isvalid(::Type{String}, s::AbstractString) =  (@inline byte_string_classify(s)) ≠ 0
 
 @inline isvalid(s::AbstractString) = @inline isvalid(String, codeunits(s))
+
+# nothrow: every index the classification chain reads is derived from the
+# codeunits' length, hence in bounds for a String (not so for arbitrary vectors)
+isvalid(s::String) = @assume_effects :nothrow isvalid(String, codeunits(s))
 
 is_valid_continuation(c) = c & 0xc0 == 0x80
 
@@ -632,28 +648,83 @@ end
     _length_continued(s, i, n, c)
 end
 
+# bytes counted bytewise around non-ASCII text before retrying the ASCII scan;
+# larger amortizes the hand-off cost, smaller resumes ASCII skipping sooner
+const _STRING_LENGTH_SCAN_WINDOW = 128
+
+# Index of the first byte >= 0x80 in cu[i:n], or 0 if all are ASCII.
+# Guards must use subtraction and leave room for the advance so that index
+# arithmetic cannot wrap even for a StringView over huge virtual data.
+@inline function _find_first_nonascii(cu::AbstractVector{UInt8}, i::Int, n::Int)
+    # terminates_locally: each loop advances `i` by a positive constant
+    @inbounds begin
+        @assume_effects :terminates_locally while n - i >= 256
+            _isascii(cu, i, i + 255) || break
+            i += 256
+        end
+        @assume_effects :terminates_locally while n - i >= 32
+            _isascii(cu, i, i + 31) || break
+            i += 32
+        end
+        @assume_effects :terminates_locally for k in i:n
+            cu[k] >= 0x80 && return k
+        end
+    end
+    return 0
+end
 
 @propagate_inbounds function _length_continued(s::Union{String, StringView}, i::Int, n::Int, c::Int)
     i < n || return c
-    b = codeunit(s, i)
-    while true
+    if s isa StringView && n == typemax(Int)
+        # only virtual StringView data can be this large; count the final byte
+        # separately so the hot loops below may assume `n + 1` cannot wrap
+        # (the `isa` keeps the `thisind` call out of the String specialization,
+        # preserving its effects)
+        c = _length_continued(s, i, n - 1, c)
+        return c - (thisind(s, n) < n)
+    end
+    cu = codeunits(s)
+    n - i < 32 && return first(_length_bytewise(cu, i, n, n, c, false))
+    @inbounds while true
+        if cu[i] < 0x80 # avoid paying for a failed scan on non-ASCII-dense text
+            j = _find_first_nonascii(cu, i, n)
+            # a trailing non-ASCII byte at n cannot extend a lead byte
+            (j == 0) | (j >= n) && return c
+            i = j
+        end
+        c, i = _length_bytewise(cu, i, i + min(_STRING_LENGTH_SCAN_WINDOW - 1, n - i), n, c)
+        i < n || return c
+    end
+end
+
+# Count the characters starting in `cu[i:stop]`: decrement `c` once per
+# continuation byte extending a lead byte. The lead-byte scan ends at `stop`,
+# but a character being consumed is always finished (never reading past `n`).
+# Returns `(c, i′)` with `i′ > stop` the first unconsumed index. Requires
+# `n < typemax(Int)` so the increments cannot wrap.
+# `windowed = false` drops the `stop` bound and its per-byte check.
+@inline function _length_bytewise(cu::AbstractVector{UInt8}, i::Int, stop::Int, n::Int, c::Int,
+                                  windowed::Bool = true)
+    @inbounds b = cu[i]
+    @inbounds while true
         while true
-            (i += 1) ≤ n || return c
+            (i += 1) ≤ n || return c, i
             0xc0 ≤ b ≤ 0xf7 && break
-            b = codeunit(s, i)
+            windowed && (i ≤ stop || return c, i)
+            b = cu[i]
         end
         l = b
-        b = codeunit(s, i) # cont byte 1
+        b = cu[i] # cont byte 1
         c -= (x = b & 0xc0 == 0x80)
         x & (l ≥ 0xe0) || continue
 
-        (i += 1) ≤ n || return c
-        b = codeunit(s, i) # cont byte 2
+        (i += 1) ≤ n || return c, i
+        b = cu[i] # cont byte 2
         c -= (x = b & 0xc0 == 0x80)
         x & (l ≥ 0xf0) || continue
 
-        (i += 1) ≤ n || return c
-        b = codeunit(s, i) # cont byte 3
+        (i += 1) ≤ n || return c, i
+        b = cu[i] # cont byte 3
         c -= (b & 0xc0 == 0x80)
     end
 end

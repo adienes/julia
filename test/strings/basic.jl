@@ -1575,3 +1575,65 @@ end
     u = b"hello"
     @test eltype(u) === UInt8
 end
+
+@testset "issue #48887: chunked length and vectorized isvalid" begin
+    # multibyte and malformed units straddling each size threshold of the
+    # chunked length (32-byte bypass, 128-byte scan windows, 256/32-byte probes)
+    units = ("é", "€", "😄", "\xc2", "\xf0\x80", "\x80", "\xff")
+    for unit in units, pad in (0, 31, 32, 127, 128, 255, 256)
+        for s in ("a"^pad * unit, "a"^pad * unit * "b"^4, unit * "a"^pad)
+            @test length(s) == length(collect(s))
+            # same bytes through the bounds-checked StringView path
+            @test length(StringView(Vector{UInt8}(codeunits(s)))) == length(s)
+        end
+    end
+    # ranged length starting at a nonzero offset
+    let s = "αβ" * "x"^300 * "γδ" * "y"^300
+        @test length(SubString(s, 3, ncodeunits(s))) == length(s) - 1
+    end
+
+    # the wide-probe (1024) and flat-path (1536) boundaries of byte_string_classify
+    for L in (1535, 1536, 2049), (unit, ok) in (("é", true), ("\x80", false))
+        @test isvalid("a"^L * unit) == ok
+        @test isvalid(unit * "a"^L) == ok
+        @test isvalid("a"^(L - 1) * unit * "a"^L) == ok
+    end
+    @test isvalid("a"^2000)
+
+    let rng = MersenneTwister(0x48887)
+        pool = UInt8[0x61:0x7a; 0x80; 0xbf; 0xc2; 0xe0; 0xed; 0xf0; 0xf4; 0xf8; 0xff]
+        for _ in 1:100
+            s = String(rand(rng, pool, rand(rng, 1:400)))
+            @test length(s) == length(collect(s))
+            @test isvalid(s) == all(isvalid, collect(s))
+        end
+    end
+
+    # regression: the probe and scan-window index arithmetic must not overflow
+    # near typemax (zero-step ranges make the huge StringViews lazy)
+    let n = typemax(Int) - 1
+        ascii = StringView(StepRangeLen(0x61, 0x00, n)) # 'a' ^ n
+        @test length(ascii, n - 100, n) == 101
+        @test length(ascii, n - 1000, n - 500) == 501
+        leads = StringView(StepRangeLen(0xc3, 0x00, n)) # every byte a lead byte
+        @test length(leads, n - 100, n) == 101
+        @test length(leads, n - 50, n) == 51
+    end
+    # at length exactly typemax(Int) the increments themselves must not wrap;
+    # tested via the internal entry points (the public ranged-length bounds
+    # check predates this code and cannot represent ncodeunits == typemax)
+    let M = typemax(Int)
+        ascii = StepRangeLen(0x61, 0x00, M)
+        leads = StepRangeLen(0xc3, 0x00, M)
+        @test Base._find_first_nonascii(ascii, M - 2, M) == 0
+        @test Base.length_continued(StringView(ascii), M - 100, M, 101) == 101
+        @test Base.length_continued(StringView(leads), M - 1, M, 2) == 2
+        @test Base._byte_string_classify_nonascii(leads, M - 1, M) == 0
+    end
+
+    # isvalid(::String) must stay constant-foldable
+    let e = Base.infer_effects(isvalid, (String,))
+        @test Core.Compiler.is_foldable(e)
+        @test Core.Compiler.is_removable_if_unused(e)
+    end
+end
