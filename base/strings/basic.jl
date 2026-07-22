@@ -619,13 +619,17 @@ isascii(c::Char) = bswap(reinterpret(UInt32, c)) < 0x80
 isascii(s::AbstractString) = all(isascii, s)
 isascii(c::AbstractChar) = UInt32(c) < 0x80
 
-@inline function _isascii(code_units::AbstractVector{CU}, first, last) where {CU}
+@inline function _isascii(code_units::AbstractVector{CU}, first::Int, last::Int) where {CU}
     r = zero(CU)
-    for n = first:last
+    @assume_effects :terminates_locally for n = first:last
         @inbounds r |= code_units[n]
     end
     return 0 ≤ r < 0x80
 end
+
+# Width of the wide vectorized ASCII scans; below 1.5x this width a single
+# flat `_isascii` over the whole range is cheaper than any chunk machinery.
+const _ASCII_CHUNK_SIZE = 1024
 
 #The chunking algorithm makes the last two chunks overlap in order to keep the size fixed
 @inline function  _isascii_chunks(chunk_size,cu::AbstractVector{CU}, first,last) where {CU}
@@ -644,8 +648,8 @@ This function is intended to be used by other string implementations that need a
 """
 function isascii(cu::AbstractVector{CU}) where {CU <: Integer}
     # Note that String and SubString{String} assume this is :nothrow :foldable
-    chunk_size = 1024
-    chunk_threshold =  chunk_size + (chunk_size ÷ 2)
+    chunk_size = _ASCII_CHUNK_SIZE
+    chunk_threshold = chunk_size + (chunk_size ÷ 2)
     first = firstindex(cu);   last = lastindex(cu)
     l = last - first + 1
     l < chunk_threshold && return _isascii(cu,first,last)
