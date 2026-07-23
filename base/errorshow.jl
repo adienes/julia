@@ -246,7 +246,7 @@ function show_convert_error(io::IO, ex::MethodError, arg_types_param)
     if T === nothing
         print(io, "First argument to `convert` must be a Type, got ", ex.args[1])
     else
-        p2 = arg_types_param[2]
+        p2 = argtype_for_display(arg_types_param[2])
         print_one_line = isa(T, DataType) && isa(p2, DataType) && T.name != p2.name
         printstyled(io, "Cannot `convert` an object of type ")
         print_one_line || printstyled(io, "\n  ")

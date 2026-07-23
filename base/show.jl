@@ -2608,6 +2608,12 @@ function print_within_stacktrace(io, s...; color=:normal, bold=false)
     end
 end
 
+# Display a `Core.TypeEgal{X}` argument (the `Core.Typeof` of a closed type) in
+# call position with the `Type{X}` spelling of the method signatures a user
+# would write to accept it — the same identification `descend_params` makes in
+# errorshow.jl. Outside call display the kind shows as `Core.Typeof(X)`.
+argtype_for_display(@nospecialize t) = t isa Core.TypeEgal ? Type{type_parameter(t)} : t
+
 function show_tuple_as_call(out::IO, name::Symbol, sig::Type;
                             demangle=false, kwargs=nothing, argnames=nothing,
                             qualified=false, hasfirst=true)
@@ -2641,7 +2647,7 @@ function show_tuple_as_call(out::IO, name::Symbol, sig::Type;
             print_within_stacktrace(io, argnames[i]; color=:light_black)
         end
         print(io, "::")
-        print_type_bicolor(env_io, sig[i]; use_color = get(io, :backtrace, false)::Bool)
+        print_type_bicolor(env_io, argtype_for_display(sig[i]); use_color = get(io, :backtrace, false)::Bool)
     end
     if kwargs !== nothing
         print(io, "; ")
@@ -2655,7 +2661,7 @@ function show_tuple_as_call(out::IO, name::Symbol, sig::Type;
                 print(io, "...")
             else
                 print(io, "::")
-                print_type_bicolor(io, t; use_color = get(io, :backtrace, false)::Bool)
+                print_type_bicolor(io, argtype_for_display(t); use_color = get(io, :backtrace, false)::Bool)
             end
         end
     end
