@@ -1005,6 +1005,18 @@ function show_unionaliases(io::IO, x::Union)
 end
 
 function show(io::IO, ::MIME"text/plain", @nospecialize(x::Type))
+    if x isa Core.TypeEgal
+        # the compact `Core.Typeof(X)` spelling, with the canonical kind name
+        # spelled out alongside, mirroring the `Type{X} (alias for TypeEq{X})`
+        # display of the equality kind
+        show(IOContext(io, :compact => true), x)
+        if !(get(io, :compact, false)::Bool)
+            printstyled(io, " (alias for "; color = :light_black)
+            printstyled(IOContext(io, :compact => false), x, color = :light_black)
+            printstyled(io, ")"; color = :light_black)
+        end
+        return
+    end
     if !print_without_params(x)
         if make_typealias(x, io) !== nothing || (unwrap_unionall(x) isa Union && x <: make_typealiases(x)[2])
             show(IOContext(io, :compact => true), x)
@@ -1029,10 +1041,22 @@ function show(io::IO, ::MIME"text/plain", @nospecialize(x::Type))
     end
 end
 
+# Unlike `TypeEq`, the egality kind has no user-level braces syntax; its familiar
+# spelling is the constructor call `Core.Typeof(X)`, which round-trips
+# (`Core.Typeof(X) === Core.TypeEgal{X}` for any closed `X`) analogously to
+# `typeof(sin)` for function singleton types. Normal (compact) printing uses that
+# spelling; non-compact contexts (e.g. the REPL's `text/plain` display) show the
+# canonical kind name `Core.TypeEgal{X}` instead.
 function show_typeegal(io::IO, @nospecialize(x::Core.TypeEgal))
-    print(io, "Core.TypeEgal{")
-    show(io, type_parameter(x))
-    print(io, "}")
+    if get(io, :compact, true)::Bool
+        print(io, "Core.Typeof(")
+        show(io, type_parameter(x))
+        print(io, ")")
+    else
+        print(io, "Core.TypeEgal{")
+        show(io, type_parameter(x))
+        print(io, "}")
+    end
 end
 function show(io::IO, @nospecialize(x::Core.AnyType))
     if x isa Core.TypeofBottom
