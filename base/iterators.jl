@@ -30,7 +30,7 @@ import Base:
     eltype, IteratorSize, IteratorEltype, promote_typejoin,
     haskey, keys, values, pairs,
     getindex, setindex!, get, iterate,
-    popfirst!, isdone, peek, intersect
+    popfirst!, isdone, peek, intersect, foreach
 
 export enumerate, zip, rest, countfrom, take, drop, takewhile, dropwhile, cycle, repeated, product, flatten, flatmap, partition, nth, findeach
 public accumulate, bfs, dfs, filter, map, peel, reverse, Reverse, Stateful
@@ -1799,6 +1799,8 @@ struct BreadthFirst{F, T, V}
     visited::V
 end
 
+const TreeTraversal = Union{DepthFirst, BreadthFirst}
+
 IteratorSize(::Type{<:DepthFirst}) = SizeUnknown()
 IteratorEltype(::Type{<:DepthFirst}) = EltypeUnknown()
 IteratorSize(::Type{<:BreadthFirst}) = SizeUnknown()
@@ -1828,6 +1830,11 @@ set may be pre-seeded or shared.
 `children` is called lazily and its iterator advanced one element at a time:
 with `:pre` not until after the node has been yielded. `:post` and `:leaves`
 require finite child iterators.
+
+`foreach`, `collect`, `map`, comprehensions, constructors such as `Set`, and
+reductions such as `sum` and `any` traverse by recursion: several times
+faster than element-by-element iteration, but the tree depth must fit in the
+call stack; element-by-element iteration has no depth limit.
 
 See also: [`Iterators.bfs`](@ref).
 
@@ -1987,10 +1994,11 @@ function _advance!(t::DepthFirst{order}, st::DepthFirstState) where {order}
     end
 end
 
-# Internal-iteration driver for the tree traversals. `body(accum, x)` returns
-# a control token; the driver interprets it. The default method reproduces the
-# external-protocol loop exactly; iterator types whose external protocol is
-# dynamically typed overload it with fused internal iteration.
+# Internal-iteration driver behind `foreach`/`collect`/the reductions on the
+# tree traversals. `body(accum, x)` returns a control token; the driver
+# interprets it. The default method reproduces the external-protocol loop
+# exactly; iterator types whose external protocol is dynamically typed
+# overload it with fused internal iteration.
 struct LoopContinue{A}
     accum::A
 end
@@ -2062,6 +2070,13 @@ function _iterate_loop(body, t::BreadthFirst, accum)
         end
     end
     return LoopContinue(accum)
+end
+
+# Standard consumers routed through the driver; the collectors (reduce.jl)
+# and `_any`/`_all` (anyall.jl) complete the set.
+function foreach(f, t::TreeTraversal)
+    _iterate_loop((_, x) -> (f(x); LoopContinue(nothing)), t, nothing)
+    return nothing
 end
 
 function iterate(t::BreadthFirst)
