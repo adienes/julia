@@ -160,6 +160,8 @@ Build system changes
 New library functions
 ---------------------
 
+* `Iterators.dfs` and `Iterators.bfs`: lazy depth-first and breadth-first traversal of trees
+  and graphs; `dfs` supports preorder, postorder, and leaves-only orders.
 * `tap(f)` creates a function that calls `f(x)` for side effects and returns `x` ([#61340]).
 * `unsplat(f)` creates a function that bundles its arguments into a tuple and passes them to `f`;
   it is the inverse of `splat` ([#62714]).
