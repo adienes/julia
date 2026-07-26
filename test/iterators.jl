@@ -1337,6 +1337,43 @@ Base.iterate(it::NoEltypeIt, st = 0) = st < 2 ? (st + 10, st + 1) : nothing
         @test collect(it) == collect(it)
     end
 
+    @testset "internal-iteration driver" begin
+        IT = Base.Iterators
+        collector(itr) = begin
+            r = IT._iterate_loop((acc, x) -> IT.LoopContinue(push!(acc, x)), itr, [])
+            (r::IT.LoopContinue).accum
+        end
+        Random.seed!(21)
+        for trial in 1:25
+            n = rand(2:30)
+            kids = Dict(i => [j for j in i+1:n if rand() < 0.25] for i in 1:n)
+            kc = i -> kids[i]
+            for order in (:pre, :post, :leaves)
+                @test collector(IT.dfs(kc, 1; order)) == collect(IT.dfs(kc, 1; order))
+                @test collector(IT.dfs(kc, 1; order, visited = Set{Int}())) ==
+                      collect(IT.dfs(kc, 1; order, visited = Set{Int}()))
+            end
+            @test collector(IT.bfs(kc, 1)) == collect(IT.bfs(kc, 1))
+            @test collector(IT.bfs(kc, 1; visited = Set{Int}())) ==
+                  collect(IT.bfs(kc, 1; visited = Set{Int}()))
+        end
+        # break unwinds the traversal and preserves the accumulator
+        infkids(n) = Int[2n, 2n + 1]
+        r = IT._iterate_loop(IT.dfs(infkids, 1), 0) do acc, x
+            x >= 8 ? IT.LoopBreak(acc) : IT.LoopContinue(acc + x)
+        end
+        @test r isa IT.LoopContinue && r.accum == 1 + 2 + 4
+        # return propagates out of the driver untouched
+        r = IT._iterate_loop(IT.dfs(infkids, 1), 0) do acc, x
+            x == 4 ? IT.LoopReturn(:found) : IT.LoopContinue(acc)
+        end
+        @test r isa IT.LoopReturn && r.val === :found
+        # generic default driver agrees on plain iterators
+        @test IT._iterate_loop((a, x) -> IT.LoopContinue(a + x), 1:10, 0).accum == 55
+        r = IT._iterate_loop((a, x) -> x == 4 ? IT.LoopBreak(a) : IT.LoopContinue(a + x), 1:10, 0)
+        @test r.accum == 6
+    end
+
     @testset "heterogeneous and unusual children iterators" begin
         hkids(x) = x == 1 ? Int[2, 3] : x == 2 ? Any[:a] : Int[]
         @test collect(Iterators.dfs(hkids, 1)) == [1, 2, :a, 3]

@@ -1987,6 +1987,83 @@ function _advance!(t::DepthFirst{order}, st::DepthFirstState) where {order}
     end
 end
 
+# Internal-iteration driver for the tree traversals. `body(accum, x)` returns
+# a control token; the driver interprets it. The default method reproduces the
+# external-protocol loop exactly; iterator types whose external protocol is
+# dynamically typed overload it with fused internal iteration.
+struct LoopContinue{A}
+    accum::A
+end
+struct LoopBreak{A}
+    accum::A
+end
+struct LoopReturn{T}
+    val::T
+end
+
+function _iterate_loop(body, itr, accum)
+    y = iterate(itr)
+    while y !== nothing
+        t = body(accum, y[1])
+        t isa LoopContinue || return t isa LoopBreak ? LoopContinue(t.accum) : t
+        accum = t.accum
+        y = iterate(itr, y[2])
+    end
+    return LoopContinue(accum)
+end
+
+# Fused internal iteration for the tree traversals: the recursion keeps every
+# frame's iterator and state as typed locals on the call stack, which is what
+# the external protocol cannot express. Children are still requested only
+# after `body` has seen the node, so pruning by mutation keeps working.
+function _iterate_loop(body, t::DepthFirst{order}, accum) where {order}
+    _visit!(t.visited, t.root) || return LoopContinue(accum)
+    r = _fold_node(body, t, t.root, accum)
+    r isa LoopBreak && return LoopContinue(r.accum)
+    return r
+end
+
+function _fold_node(body, t::DepthFirst{order}, node, accum) where {order}
+    if order === :pre
+        tk = body(accum, node)
+        tk isa LoopContinue || return tk
+        accum = tk.accum
+    end
+    isleaf = true
+    for c in t.children(node)
+        isleaf = false
+        _visit!(t.visited, c) || continue
+        tk = _fold_node(body, t, c, accum)
+        tk isa LoopContinue || return tk
+        accum = tk.accum
+    end
+    if order === :post || (order === :leaves && isleaf)
+        tk = body(accum, node)
+        tk isa LoopContinue || return tk
+        accum = tk.accum
+    end
+    return LoopContinue(accum)
+end
+
+function _iterate_loop(body, t::BreadthFirst, accum)
+    _visit!(t.visited, t.root) || return LoopContinue(accum)
+    tk = body(accum, t.root)
+    tk isa LoopContinue || return tk isa LoopBreak ? LoopContinue(tk.accum) : tk
+    accum = tk.accum
+    queue = Any[t.root]
+    while !isempty(queue)
+        p = popfirst!(queue)
+        for c in t.children(p)
+            _visit!(t.visited, c) || continue
+            tk = body(accum, c)
+            tk isa LoopContinue || return tk isa LoopBreak ? LoopContinue(tk.accum) : tk
+            accum = tk.accum
+            push!(queue, c)
+        end
+    end
+    return LoopContinue(accum)
+end
+
 function iterate(t::BreadthFirst)
     _visit!(t.visited, t.root) || return nothing
     return t.root, Start()
