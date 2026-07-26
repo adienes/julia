@@ -1742,16 +1742,12 @@ function finish(ts::DefaultTestSet; print_results::Bool=TESTSET_PRINT_ENABLE[])
     return ts
 end
 
-# Recursive function that fetches backtraces for any and all errors
-# or failures the testset and its children encountered
+# preserves result-recording order
 function filter_errors(ts::DefaultTestSet)
+    children(t) = t isa DefaultTestSet ? t.results : ()
     efs = Union{Fail, Error}[]
-    for t in ts.results
-        if isa(t, DefaultTestSet)
-            append!(efs, filter_errors(t))
-        elseif isa(t, Union{Fail, Error})
-            push!(efs, t)
-        end
+    foreach(Iterators.dfs(children, ts)) do t
+        t isa Union{Fail, Error} && push!(efs, t)
     end
     return efs
 end

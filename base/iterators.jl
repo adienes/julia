@@ -21,7 +21,7 @@ using .Core
 using Core: @doc
 
 using Base:
-    cld, fld, resize!, IndexCartesian, Checked
+    cld, fld, resize!, push!, pop!, IndexCartesian, Checked
 using .Checked: checked_mul
 
 import Base:
@@ -33,7 +33,7 @@ import Base:
     popfirst!, isdone, peek, intersect
 
 export enumerate, zip, rest, countfrom, take, drop, takewhile, dropwhile, cycle, repeated, product, flatten, flatmap, partition, nth, findeach
-public accumulate, filter, map, peel, reverse, Reverse, Stateful
+public accumulate, bfs, dfs, filter, map, peel, reverse, Reverse, Stateful
 
 """
     Iterators.map(f, iterators...)
@@ -1786,5 +1786,264 @@ julia> map(fifth_element, ("Willis", "Jovovich", "Oldman"))
 ```
 """
 nth(n::Integer) = Base.Fix2(nth, n)
+
+struct DepthFirst{order, F, T, V}
+    children::F
+    root::T
+    visited::V
+end
+
+struct BreadthFirst{F, T, V}
+    children::F
+    root::T
+    visited::V
+end
+
+IteratorSize(::Type{<:DepthFirst}) = SizeUnknown()
+IteratorEltype(::Type{<:DepthFirst}) = EltypeUnknown()
+IteratorSize(::Type{<:BreadthFirst}) = SizeUnknown()
+IteratorEltype(::Type{<:BreadthFirst}) = EltypeUnknown()
+
+_visit!(::Nothing, node) = true
+function _visit!(visited, node)
+    node in visited && return false
+    push!(visited, node)
+    return true
+end
+
+"""
+    Iterators.dfs(children, root; order = :pre, visited = nothing)
+
+Return a lazy depth-first traversal of the tree rooted at `root`, where
+`children(node)` returns its children. `order = :pre` yields nodes before
+their descendants, `:post` after them, and `:leaves` only childless nodes.
+Siblings follow `children` order.
+
+`visited` may be any container supporting `in` and `push!`; it records nodes
+and skips those already present and their subtrees. Use it for graphs:
+otherwise shared nodes repeat and cycles do not terminate. Because iteration
+mutates `visited`, a traversal using one should be consumed only once; the
+set may be pre-seeded or shared.
+
+`children` is called lazily and its iterator advanced one element at a time:
+with `:pre` not until after the node has been yielded. `:post` and `:leaves`
+require finite child iterators.
+
+See also: [`Iterators.bfs`](@ref).
+
+!!! compat "Julia 1.14"
+    This function requires at least Julia 1.14.
+
+# Examples
+```jldoctest
+julia> collect(Iterators.dfs(n -> n < 3 ? (2n, 2n + 1) : (), 1))
+5-element Vector{Int64}:
+ 1
+ 2
+ 4
+ 5
+ 3
+
+julia> graph = Dict(:a => [:b, :c], :b => [:d], :c => [:d], :d => Symbol[]);
+
+julia> collect(Iterators.dfs(n -> graph[n], :a; visited = Set{Symbol}()))
+4-element Vector{Symbol}:
+ :a
+ :b
+ :d
+ :c
+```
+"""
+function dfs(children, root; order::Symbol = :pre, visited = nothing)
+    order === :pre || order === :post || order === :leaves ||
+        throw(ArgumentError(LazyString("`order` must be `:pre`, `:post` or `:leaves`, got `:", order, "`")))
+    return DepthFirst{order, typeof(children), typeof(root), typeof(visited)}(children, root, visited)
+end
+
+"""
+    Iterators.bfs(children, root; visited = nothing)
+
+Return a lazy breadth-first (level-order) traversal of the tree rooted at
+`root`. See [`Iterators.dfs`](@ref) for `children`, `visited`, and laziness.
+
+!!! compat "Julia 1.14"
+    This function requires at least Julia 1.14.
+
+# Examples
+```jldoctest
+julia> collect(Iterators.bfs(n -> n < 3 ? (2n, 2n + 1) : (), 1))
+5-element Vector{Int64}:
+ 1
+ 2
+ 3
+ 4
+ 5
+```
+"""
+bfs(children, root; visited = nothing) = BreadthFirst(children, root, visited)
+
+# Traversal frame: a node whose child iterator has produced at least one
+# element, with that iterator's latest state.
+struct Frame
+    node::Any
+    it::Any
+    st::Any
+end
+
+# Traversal state. The protocol must carry every level of the descent in one
+# value, so the slots are dynamically typed and each step pays dynamic
+# dispatch on the frame's iterator; the internal-iteration consumers below
+# keep each level's types in its own call-stack frame instead. Only the
+# newest node can be unexpanded (`pending`), so frames always hold a live
+# iterator.
+mutable struct DepthFirstState
+    const stack::Vector{Frame}
+    pending::Any
+    haspending::Bool
+end
+
+mutable struct BreadthFirstState
+    const queue::Vector{Any}
+    hasactive::Bool
+    it::Any
+    st::Any
+    BreadthFirstState(queue) = new(queue, false)
+end
+
+struct Start end
+struct Done end
+
+iterate(t::DepthFirst, ::Done) = nothing
+iterate(t::BreadthFirst, ::Done) = nothing
+
+function iterate(t::DepthFirst{order}) where {order}
+    _visit!(t.visited, t.root) || return nothing
+    order === :pre && return t.root, Start()
+    it = t.children(t.root)
+    y = iterate(it)
+    y === nothing && return t.root, Done()
+    return _start(t, it, y)
+end
+
+function iterate(t::DepthFirst{:pre}, ::Start)
+    it = t.children(t.root)
+    y = iterate(it)
+    y === nothing && return nothing
+    return _start(t, it, y)
+end
+
+function _start(t::DepthFirst, it, y)
+    st = DepthFirstState([Frame(t.root, it, y[2])], nothing, false)
+    return _continue!(t, st, y[1])
+end
+
+iterate(t::DepthFirst, st::DepthFirstState) = _advance!(t, st)
+
+function _continue!(t::DepthFirst{order}, st::DepthFirstState, c) where {order}
+    if _visit!(t.visited, c)
+        st.pending = c
+        st.haspending = true
+        order === :pre && return c, st
+    end
+    return _advance!(t, st)
+end
+
+function _advance!(t::DepthFirst{order}, st::DepthFirstState) where {order}
+    stack = st.stack
+    while true
+        if st.haspending
+            p = st.pending
+            st.haspending = false
+            it = t.children(p)
+            y = iterate(it)
+            if y === nothing
+                order === :pre || return p, st
+                continue
+            end
+            push!(stack, Frame(p, it, y[2]))
+            c = y[1]
+            if _visit!(t.visited, c)
+                st.pending = c
+                st.haspending = true
+                order === :pre && return c, st
+            end
+        else
+            isempty(stack) && return nothing
+            f = stack[end]
+            y = iterate(f.it, f.st)
+            if y === nothing
+                pop!(stack)
+                order === :post && return f.node, st
+            else
+                stack[end] = Frame(f.node, f.it, y[2])
+                c = y[1]
+                if _visit!(t.visited, c)
+                    st.pending = c
+                    st.haspending = true
+                    order === :pre && return c, st
+                end
+            end
+        end
+    end
+end
+
+function iterate(t::BreadthFirst)
+    _visit!(t.visited, t.root) || return nothing
+    return t.root, Start()
+end
+
+function iterate(t::BreadthFirst, ::Start)
+    it = t.children(t.root)
+    y = iterate(it)
+    y === nothing && return nothing
+    st = BreadthFirstState(Any[])
+    st.it = it
+    st.st = y[2]
+    st.hasactive = true
+    return _continue!(t, st, y[1])
+end
+
+iterate(t::BreadthFirst, st::BreadthFirstState) = _advance!(t, st)
+
+function _continue!(t::BreadthFirst, st::BreadthFirstState, c)
+    if _visit!(t.visited, c)
+        push!(st.queue, c)
+        return c, st
+    end
+    return _advance!(t, st)
+end
+
+function _advance!(t::BreadthFirst, st::BreadthFirstState)
+    queue = st.queue
+    while true
+        if st.hasactive
+            y = iterate(st.it, st.st)
+            if y === nothing
+                st.hasactive = false
+            else
+                st.st = y[2]
+                c = y[1]
+                if _visit!(t.visited, c)
+                    push!(queue, c)
+                    return c, st
+                end
+            end
+        else
+            isempty(queue) && return nothing
+            p = popfirst!(queue)
+            it = t.children(p)
+            y = iterate(it)
+            y === nothing && continue
+            st.it = it
+            st.st = y[2]
+            st.hasactive = true
+            c = y[1]
+            if _visit!(t.visited, c)
+                push!(queue, c)
+                return c, st
+            end
+        end
+    end
+end
 
 end

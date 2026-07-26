@@ -1222,45 +1222,41 @@ julia> (path, dirs, files) = first(itr)
 ```
 """
 function walkdir(path = pwd(); topdown=true, follow_symlinks=false, onerror=throw)
-    return Channel{Tuple{String,Vector{String},Vector{String}}}(chnl ->
-        _walkdir(chnl, path, topdown, follow_symlinks, onerror))
-end
-
-function _walkdir(chnl, path, topdown, follow_symlinks, onerror)
-    tryf(f, p) = try
-            f(p)
-        catch err
-            isa(err, IOError) || rethrow()
-            try
-                onerror(err)
-            catch err2
-                close(chnl, err2)
+    return Channel{Tuple{String,Vector{String},Vector{String}}}() do chnl
+        tryf(f, p) = try
+                f(p)
+            catch err
+                isa(err, IOError) || rethrow()
+                try
+                    onerror(err)
+                catch err2
+                    close(chnl, err2)
+                end
+                return
             end
-            return
+        function readtriple(dir)
+            entries = tryf(p -> readdir(p, DirEntry), dir)
+            entries === nothing && return nothing
+            dirs = Vector{String}()
+            files = Vector{String}()
+            for entry in entries
+                # If we're not following symlinks, then treat all symlinks as files
+                if (!follow_symlinks && something(tryf(islink, entry), true)) || !something(tryf(isdir, entry), false)
+                    push!(files, basename(entry))
+                else
+                    push!(dirs, basename(entry))
+                end
+            end
+            return (dir, dirs, files)
         end
-    entries = tryf(p -> readdir(p, DirEntry), path)
-    entries === nothing && return
-    dirs = Vector{String}()
-    files = Vector{String}()
-    for entry in entries
-        # If we're not following symlinks, then treat all symlinks as files
-        if (!follow_symlinks && something(tryf(islink, entry), true)) || !something(tryf(isdir, entry), false)
-            push!(files, basename(entry))
-        else
-            push!(dirs, basename(entry))
-        end
+        # `dirs` is read after yielding so callers can prune subtrees
+        children((dir, dirs, files)::Tuple) =
+            Iterators.filter(!isnothing, Iterators.map(d -> readtriple(joinpath(dir, d)), dirs))
+        root = readtriple(path)
+        root === nothing && return
+        foreach(triple -> push!(chnl, triple),
+                Iterators.dfs(children, root; order = topdown ? :pre : :post))
     end
-
-    if topdown
-        push!(chnl, (path, dirs, files))
-    end
-    for dir in dirs
-        _walkdir(chnl, joinpath(path, dir), topdown, follow_symlinks, onerror)
-    end
-    if !topdown
-        push!(chnl, (path, dirs, files))
-    end
-    nothing
 end
 
 function unlink(p::AbstractString)

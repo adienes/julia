@@ -1249,3 +1249,111 @@ end == Vector{Int}
     # a greedy algorithm
     @test_throws MethodError last(zip(Iterators.filter(x -> x > 0, -5:5), Iterators.filter(x -> x % 2 == 0, -5:5)))  # (5, 4)
 end
+
+# traversal regression helpers: an iterator whose states include `nothing` and
+# change type every step (forces mid-frame widening that must resume, not
+# restart), and one whose eltype throws despite valid iteration
+struct WeirdStates end
+Base.iterate(::WeirdStates) = (10, missing)
+Base.iterate(::WeirdStates, ::Missing) = (20, nothing)
+Base.iterate(::WeirdStates, ::Nothing) = (30, "s")
+Base.iterate(::WeirdStates, ::String) = nothing
+struct NoEltypeIt end
+Base.IteratorEltype(::Type{NoEltypeIt}) = Base.EltypeUnknown()
+Base.eltype(::Type{NoEltypeIt}) = error("eltype is not meaningful")
+Base.iterate(it::NoEltypeIt, st = 0) = st < 2 ? (st + 10, st + 1) : nothing
+
+@testset "dfs/bfs" begin
+    arr_children(x) = x isa AbstractArray ? x : ()
+    nested = [1, [2, [3, 4]], 5]
+    graph = Dict(:a => [:b, :c], :b => [:d], :c => [:d], :d => Symbol[])
+    graph_children(n) = graph[n]
+
+    @testset "orders" begin
+        @test [x for x in Iterators.dfs(arr_children, nested) if x isa Int] == [1, 2, 3, 4, 5]
+        @test [x for x in Iterators.bfs(arr_children, nested) if x isa Int] == [1, 5, 2, 3, 4]
+        @test collect(Iterators.dfs(arr_children, [[1, 2], 3]; order = :post)) ==
+              Any[1, 2, [1, 2], 3, [[1, 2], 3]]
+        @test collect(Iterators.dfs(arr_children, Any[1, Any[], 2]; order = :leaves)) ==
+              Any[1, Any[], 2]
+        # a node with only visited children is not a leaf
+        @test collect(Iterators.dfs(graph_children, :a; order = :leaves, visited = Set{Symbol}())) ==
+              [:d]
+        @test collect(Iterators.dfs(arr_children, 42)) == [42]
+        @test collect(Iterators.dfs(arr_children, 42; order = :post)) == [42]
+        @test collect(Iterators.dfs(arr_children, 42; order = :leaves)) == [42]
+        @test collect(Iterators.bfs(arr_children, 42)) == [42]
+        @test_throws ArgumentError Iterators.dfs(arr_children, 1; order = :inorder)
+    end
+
+    @testset "visited" begin
+        @test collect(Iterators.dfs(graph_children, :a; visited = Set{Symbol}())) == [:a, :b, :d, :c]
+        @test collect(Iterators.dfs(graph_children, :a; visited = Set{Symbol}(), order = :post)) ==
+              [:d, :b, :c, :a]
+        @test collect(Iterators.bfs(graph_children, :a; visited = Set{Symbol}())) == [:a, :b, :c, :d]
+        @test collect(Iterators.dfs(graph_children, :a)) == [:a, :b, :d, :c, :d]
+        cyc = Dict(1 => [2], 2 => [3], 3 => [1])
+        @test collect(Iterators.dfs(n -> cyc[n], 1; visited = Set{Int}())) == [1, 2, 3]
+        @test collect(Iterators.bfs(n -> cyc[n], 1; visited = Set{Int}())) == [1, 2, 3]
+        @test collect(Iterators.dfs(graph_children, :a; visited = Set([:b]))) == [:a, :c, :d]
+        @test isempty(Iterators.dfs(graph_children, :a; visited = Set([:a])))
+        visited = Set{Symbol}()
+        @test collect(Iterators.dfs(graph_children, :b; visited)) == [:b, :d]
+        @test collect(Iterators.dfs(graph_children, :a; visited)) == [:a, :c]
+    end
+
+    @testset "laziness" begin
+        infkids(n) = (2n, 2n + 1)
+        @test collect(Iterators.take(Iterators.dfs(infkids, 1), 5)) == [1, 2, 4, 8, 16]
+        @test collect(Iterators.take(Iterators.bfs(infkids, 1), 7)) == 1:7
+        @test collect(Iterators.take(Iterators.bfs(n -> Iterators.countfrom(10n), 1), 4)) ==
+              [1, 10, 11, 12]
+        # `children` is not called before the node is yielded
+        calls = Int[]
+        countingkids(n) = (push!(calls, n); n < 3 ? (n + 1,) : ())
+        @test first(Iterators.dfs(countingkids, 1)) == 1
+        @test first(Iterators.bfs(countingkids, 1)) == 1
+        @test isempty(calls)
+        # children are advanced one element at a time
+        advanced = Int[]
+        lazykids(n) = ((push!(advanced, x); x) for x in (n == 0 ? (1:1000) : ()))
+        @test collect(Iterators.take(Iterators.dfs(lazykids, 0), 3)) == [0, 1, 2]
+        @test advanced == [1, 2]
+        # mutating a yielded node prunes its subtree
+        prunable = Any[1, Any[2, Any[3]], 4]
+        seen = Any[]
+        for x in Iterators.dfs(arr_children, prunable)
+            push!(seen, x)
+            x isa AbstractArray && !isempty(x) && x[1] == 2 && empty!(x)
+        end
+        @test seen == Any[prunable, 1, Any[], 4]
+    end
+
+    @testset "traits and restartability" begin
+        it = Iterators.dfs(arr_children, nested)
+        @test Base.IteratorSize(it) isa Base.SizeUnknown
+        @test Base.IteratorEltype(it) isa Base.EltypeUnknown
+        @test Base.IteratorSize(Iterators.bfs(arr_children, nested)) isa Base.SizeUnknown
+        @test collect(it) == collect(it)
+    end
+
+    @testset "heterogeneous and unusual children iterators" begin
+        hkids(x) = x == 1 ? Int[2, 3] : x == 2 ? Any[:a] : Int[]
+        @test collect(Iterators.dfs(hkids, 1)) == [1, 2, :a, 3]
+        @test collect(Iterators.dfs(hkids, 1; order = :post)) == [:a, 2, 3, 1]
+        @test collect(Iterators.dfs(hkids, 1; order = :leaves)) == [:a, 3]
+        @test collect(Iterators.bfs(hkids, 1)) == [1, 2, 3, :a]
+        # child-iterator states change type between steps, including `nothing`
+        wkids(x) = x === :root ? WeirdStates() : ()
+        for order in (:pre, :post, :leaves)
+            expect = order === :pre ? [:root, 10, 20, 30] :
+                     order === :post ? [10, 20, 30, :root] : [10, 20, 30]
+            @test collect(Iterators.dfs(wkids, :root; order)) == expect
+        end
+        @test collect(Iterators.bfs(wkids, :root)) == [:root, 10, 20, 30]
+        # EltypeUnknown children with a throwing eltype
+        nkids(x) = x === :root ? NoEltypeIt() : ()
+        @test collect(Iterators.dfs(nkids, :root)) == [:root, 10, 11]
+        @test collect(Iterators.bfs(nkids, :root)) == [:root, 10, 11]
+    end
+end

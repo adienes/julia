@@ -1201,36 +1201,19 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
             insert!(builder_value, fastkey, this)
         end
     end
-    function cleanup!(node::StackFrameTree)
-        stack = [node]
-        while !isempty(stack)
-            node = pop!(stack)
-            node.recur = 0
-            empty!(node.builder_key)
-            empty!(node.builder_value)
-            append!(stack, values(node.down))
-        end
-        nothing
+    foreach(Iterators.bfs(n -> values(n.down), root)) do node
+        node.recur = 0
+        empty!(node.builder_key)
+        empty!(node.builder_value)
     end
-    cleanup!(root)
     return root, nsleeping, is_task_profile
 end
 
 function maxstats(root::StackFrameTree)
-    maxcount = Ref(0)
-    maxflatcount = Ref(0)
-    maxoverhead = Ref(0)
-    maxmaxrecur = Ref(0)
-    stack = [root]
-    while !isempty(stack)
-        node = pop!(stack)
-        maxcount[] = max(maxcount[], node.count)
-        maxoverhead[] = max(maxoverhead[], node.overhead)
-        maxflatcount[] = max(maxflatcount[], node.flat_count)
-        maxmaxrecur[] = max(maxmaxrecur[], node.max_recur)
-        append!(stack, values(node.down))
+    m = mapreduce((a, b) -> max.(a, b), Iterators.bfs(n -> values(n.down), root)) do node
+        (node.count, node.flat_count, node.overhead, node.max_recur)
     end
-    return (count=maxcount[], count_flat=maxflatcount[], overhead=maxoverhead[], max_recur=maxmaxrecur[])
+    return (count=m[1], count_flat=m[2], overhead=m[3], max_recur=m[4])
 end
 
 # Print the stack frame tree starting at a particular root. Uses a worklist to

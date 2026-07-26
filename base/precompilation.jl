@@ -848,32 +848,6 @@ function scan_deps!(stack, could_be_cycle, cycles, pkg, dmap)
     return false
 end
 
-# restrict to dependencies of given packages
-function collect_all_deps(direct_deps, dep, alldeps=Set{Base.PkgId}())
-    for _dep in direct_deps[dep]
-        if !(_dep in alldeps)
-            push!(alldeps, _dep)
-            collect_all_deps(direct_deps, _dep, alldeps)
-        end
-    end
-    return alldeps
-end
-
-function visit_indirect_deps!(direct_deps::Dict{PkgId, Vector{PkgId}}, visited::Set{PkgId},
-                               node::PkgId, all_deps::Set{PkgId})
-    if node in visited
-        return
-    end
-    push!(visited, node)
-    for dep in get(Set{PkgId}, direct_deps, node)
-        if !(dep in all_deps)
-            push!(all_deps, dep)
-            visit_indirect_deps!(direct_deps, visited, dep, all_deps)
-        end
-    end
-    return
-end
-
 # Build dependency graph from an ExplicitEnv.
 # Returns a NamedTuple of (direct_deps, ext_to_parent, parent_to_exts, triggers, project_deps, serial_deps).
 function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, requested_pkgids::Vector{PkgId})
@@ -888,7 +862,7 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
     roots = manifest ? env.workspace_deps : env.project_deps
     pkg_uuids = Set{UUID}()
     for (_, uuid) in roots
-        _collect_reachable!(pkg_uuids, env.deps, uuid)
+        union!(pkg_uuids, Iterators.dfs(u -> get(Vector{UUID}, env.deps, u), uuid; visited = pkg_uuids))
     end
 
     for dep in pkg_uuids
@@ -947,10 +921,13 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
     while changed
         changed = false
         indirect_deps = Dict{PkgId, Set{PkgId}}()
+        children = pkg -> get(Set{PkgId}, direct_deps, pkg)
         for package in keys(direct_deps)
+            # `package` is included only when reached through a cycle
             all_deps = Set{PkgId}()
-            visited = Set{PkgId}()
-            visit_indirect_deps!(direct_deps, visited, package, all_deps)
+            for dep in children(package)
+                union!(all_deps, Iterators.dfs(children, dep; visited = all_deps))
+            end
             indirect_deps[package] = all_deps
         end
         for ext in keys(ext_to_parent)
@@ -1017,21 +994,21 @@ end
 # Returns true if the graph became empty (caller should return early).
 function filter_dep_graph!(direct_deps, pkg_names, manifest, project_deps, ext_to_parent, requested_pkgids)
     isempty(pkg_names) && return false
+    children = pkg -> direct_deps[pkg]
     keep = Set{PkgId}()
     for dep_pkgid in keys(direct_deps)
         if dep_pkgid.name in pkg_names
-            push!(keep, dep_pkgid)
-            collect_all_deps(direct_deps, dep_pkgid, keep)
+            union!(keep, Iterators.dfs(children, dep_pkgid; visited = keep))
         end
     end
     for requested_pkgid in requested_pkgids
         if haskey(direct_deps, requested_pkgid)
-            push!(keep, requested_pkgid)
-            collect_all_deps(direct_deps, requested_pkgid, keep)
+            union!(keep, Iterators.dfs(children, requested_pkgid; visited = keep))
         end
     end
     for ext in keys(ext_to_parent)
-        if issubset(collect_all_deps(direct_deps, ext), keep)
+        visited = Set{PkgId}()
+        if all(dep -> all(∈(keep), Iterators.dfs(children, dep; visited)), children(ext))
             push!(keep, ext)
         end
     end
@@ -2499,18 +2476,11 @@ function report_precompile_results!(s::PrecompileSession)
                                 push!(get!(Vector{PkgId}, reverse_deps, d), p)
                             end
                         end
-                        affected = Set{PkgId}()
-                        frontier = PkgId[p for p in loaded_set]
-                        while !isempty(frontier)
-                            p = pop!(frontier)
-                            for rdep in get(reverse_deps, p, PkgId[])
-                                if rdep ∉ affected && rdep ∉ loaded_set
-                                    push!(affected, rdep)
-                                    push!(frontier, rdep)
-                                end
-                            end
+                        children = p -> get(reverse_deps, p, PkgId[])
+                        visited = Set{PkgId}()
+                        sum(loaded_set; init = 0) do pkg
+                            count(∉(loaded_set), Iterators.bfs(children, pkg; visited))
                         end
-                        length(affected)
                     end
                     print(iostr, "\n  ",
                         color_string(string(s.n_loaded), Base.warn_color(), s.hascolor),
