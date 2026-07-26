@@ -1374,6 +1374,112 @@ Base.iterate(it::NoEltypeIt, st = 0) = st < 2 ? (st + 10, st + 1) : nothing
         @test r.accum == 6
     end
 
+    # consumers routed through the driver must agree with the protocol path
+    @testset "standard consumers" begin
+        IT = Base.Iterators
+        kids(n) = n < 8 ? (2n, 2n + 1) : ()
+        for itr in (IT.dfs(kids, 1), IT.dfs(kids, 1; order = :post),
+                    IT.dfs(kids, 1; order = :leaves), IT.bfs(kids, 1))
+            nodes = Int[]
+            for x in itr; push!(nodes, x); end
+            @test sum(itr) == sum(nodes)
+            @test prod(itr) == prod(nodes)
+            @test maximum(itr) == maximum(nodes)
+            @test minimum(itr) == minimum(nodes)
+            @test extrema(itr) == extrema(nodes)
+            @test count(isodd, itr) == count(isodd, nodes)
+            @test foldl(-, itr) == foldl(-, nodes)
+            @test foldl(-, itr; init = 100) == foldl(-, nodes; init = 100)
+            @test mapreduce(x -> 2x, +, itr) == mapreduce(x -> 2x, +, nodes)
+            @test sum(x -> x + 1, itr) == sum(x -> x + 1, nodes)
+            @test sum(x^2 for x in itr if isodd(x)) == sum(x^2 for x in nodes if isodd(x))
+            @test sum(IT.filter(isodd, IT.map(x -> 3x, itr))) == sum(3x for x in nodes if isodd(3x))
+            @test sum(IT.flatten(IT.map(x -> (x, -x), itr))) == 0
+            @test map(x -> x + 1, itr) == map(x -> x + 1, nodes)
+            @test [2x for x in itr if isodd(x)] == [2x for x in nodes if isodd(x)]
+            @test Int[x for x in itr] == nodes
+            @test Float64[x for x in itr] == nodes && Float64[x for x in itr] isa Vector{Float64}
+            @test collect(Int, itr) == nodes && collect(Int, itr) isa Vector{Int}
+            @test collect(Float64, (2x for x in itr if isodd(x))) ==
+                  Float64[2x for x in nodes if isodd(x)]
+            seen = Int[]
+            @test foreach(x -> push!(seen, x), itr) === nothing
+            @test seen == nodes
+            protocol = Base.@invoke Base.grow_to!(Vector{Union{}}()::Any, itr::Any)
+            c = collect(itr)
+            @test c == protocol && typeof(c) == typeof(protocol)
+        end
+
+        g = IT.dfs(kids, 1)
+        @test any(x -> x == 9, g) === true
+        @test any(x -> x == 99, g) === false
+        @test all(x -> x < 20, g) === true
+        @test all(isodd, g) === false
+        @test any(x -> x == 9 ? true : missing, g) === true
+        @test any(x -> x == 99 ? true : missing, g) === missing
+        @test all(x -> x == 99 ? false : missing, g) === missing
+        @test all(x -> x < 9 ? true : missing, g) === missing
+        @test all(x -> x == 9 ? false : missing, g) === false
+        @test any(x -> x == 9 ? true : missing, g) === true
+        @test (4 in g) && !(99 in g)
+        @test_throws TypeError any(x -> 1, g)
+        @test_throws TypeError all(x -> 0, g)
+        sg = Set(g)
+        sp = Base.@invoke Base.grow_to!(Set{Union{}}()::Any, g::Any)
+        @test sg == sp && typeof(sg) == typeof(sp)
+        pre = collect(g)
+        @test union!(Set([99]), g) == Set(vcat(99, pre))
+        @test union!(BitSet(), g) == BitSet(pre)
+        @test Set(2x for x in g) == Set(2x for x in pre)
+        # max_values saturation terminates on an infinite traversal
+        @test union!(Set{Bool}(), IT.dfs(x -> (!x,), true)) == Set([true, false])
+
+        # container family and eltype preserved exactly as the protocol grow_to!
+        for (dest, itr) in ((Base.IdSet{Symbol}(), IT.dfs(Returns(()), :x)),
+                            (BitSet(), IT.dfs(kids, 1)),
+                            (BitVector(), IT.dfs(Returns(()), true)))
+            gr = Base.grow_to!(dest, itr)
+            pr = Base.@invoke Base.grow_to!(dest::Any, itr::Any)
+            @test gr == pr && typeof(gr) == typeof(pr)
+        end
+
+        # short-circuiting consumers terminate on infinite trees
+        inf = IT.dfs(n -> (2n, 2n + 1), 1)
+        @test any(x -> x > 40, inf)
+        @test !all(x -> x < 40, inf)
+        @test 64 in inf
+        @test any(x -> x > 3, IT.bfs(n -> (2n, 2n + 1), 1))
+
+        # widening through heterogeneous nodes
+        mixed(x) = x isa Tuple ? x : ()
+        troot = (1, (2.5, (3,)), 0x04)
+        for itr in (IT.dfs(mixed, troot), IT.dfs(mixed, troot; order = :post), IT.bfs(mixed, troot))
+            protocol = Base.@invoke Base.grow_to!(Vector{Union{}}()::Any, itr::Any)
+            c = collect(itr)
+            @test c == protocol && typeof(c) == typeof(protocol)
+            gen = (x for x in itr)
+            cg = collect(gen)
+            pg = Base.@invoke Base.grow_to!(Vector{Union{}}()::Any, gen::Any)
+            @test cg == pg && typeof(cg) == typeof(pg)
+        end
+
+        cyc = Dict(1 => [2], 2 => [3], 3 => [1])
+        @test sum(IT.dfs(n -> cyc[n], 1; visited = Set{Int}())) == 6
+        empty_t = IT.dfs(kids, 1; visited = Set([1]))
+        @test sum(empty_t; init = 0.5) == 0.5
+        @test_throws ArgumentError sum(empty_t)
+        @test count(isodd, empty_t) == 0
+        @test !any(isodd, empty_t) && all(isodd, empty_t)
+        @test isempty(collect(empty_t)) && collect(empty_t) isa Vector
+        @test isempty([x for x in empty_t]) && [x for x in empty_t] isa Vector
+        @test Int[x for x in empty_t] isa Vector{Int}
+        @test collect(Int, empty_t) isa Vector{Int} && isempty(collect(Int, empty_t))
+
+        # no ambiguity with the AbstractDict grow_to! methods
+        pkids(p) = p.second < 3 ? (p.first + 1 => p.second + 1,) : ()
+        @test Dict(IT.dfs(pkids, 1 => 1)) == Dict(1 => 1, 2 => 2, 3 => 3)
+    end
+
     @testset "heterogeneous and unusual children iterators" begin
         hkids(x) = x == 1 ? Int[2, 3] : x == 2 ? Any[:a] : Int[]
         @test collect(Iterators.dfs(hkids, 1)) == [1, 2, :a, 3]
