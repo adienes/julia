@@ -87,6 +87,11 @@ Build system changes
 New library functions
 ---------------------
 
+* `Iterators.dfs` and `Iterators.bfs`: lazy depth-first and breadth-first traversal of trees
+  and graphs; `dfs` supports preorder, postorder, and leaves-only orders. `foreach`,
+  `collect`, `map`, comprehensions, and reductions such as `sum`, `count`, and `any` over
+  the traversals run as fused internal iteration, several times faster than
+  element-by-element iteration.
 * `tap(f)` creates a function that calls `f(x)` for side effects and returns `x`. ([#61340]).
 * `Base.set_binding_visibility!` sets the declared visibility (`:none`, `:public`, or
   `:export`) of a name in a module, allowing an `export` or `public` declaration to be

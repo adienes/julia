@@ -67,6 +67,35 @@ function _foldl_impl(op, init, itr::Union{Tuple,NamedTuple})
     @invoke _foldl_impl(op, init, itr::Any)
 end
 
+function _foldl_impl(op::OP, init, itr::Iterators.TreeTraversal) where {OP}
+    r = Iterators._iterate_loop((acc, x) -> Iterators.LoopContinue(op(acc, x)), itr, init)
+    return r.accum
+end
+
+# `map` and comprehensions reach the collectors with Generator/Filter/Flatten
+# wrappers still around the traversal; strip them into the reducing function
+# as mapfoldl_impl does and fold. For any other innermost iterator the `isa`
+# is statically false and these dispatch back to the generic methods.
+function grow_to!(dest::Union{AbstractVector, AbstractSet},
+                  itr::Union{Generator, Filter, Flatten, Iterators.TreeTraversal})
+    op, inner = _xfadjoint(function (d, el)
+            # matches the protocol grow_to!: retype at the first element
+            d === nothing && return push!(empty(dest, typeof(el)), el)
+            el isa eltype(d) ? push!(d, el) : push_widen(d, el)
+        end, itr)
+    inner isa Iterators.TreeTraversal || return @invoke grow_to!(dest::Any, itr::Any)
+    r = _foldl_impl(op, nothing, inner)
+    return r === nothing ? dest : r
+end
+
+function _collect(::Type{T},
+                  itr::Union{Generator, Filter, Flatten, Iterators.TreeTraversal},
+                  isz::SizeUnknown) where {T}
+    op, inner = _xfadjoint((a, el) -> (push!(a, el); a), itr)
+    inner isa Iterators.TreeTraversal || return @invoke _collect(T::Type, itr::Any, isz::SizeUnknown)
+    return _foldl_impl(op, Vector{T}(), inner)::Vector{T}
+end
+
 struct _InitialValue end
 
 """
