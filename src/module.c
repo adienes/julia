@@ -2309,7 +2309,6 @@ JL_DLLEXPORT jl_uuid_t jl_module_uuid(jl_module_t* m) { return m->uuid; }
 
 // TODO: make this part of the module constructor and read-only?
 JL_DLLEXPORT void jl_set_module_uuid(jl_module_t *m, jl_uuid_t uuid) { m->uuid = uuid; }
-JL_DLLEXPORT void jl_set_module_parent(jl_module_t *m, jl_module_t *parent) { jl_gc_write(m, m->parent, jl_module_t, parent); }
 
 int jl_is_submodule(jl_module_t *child, jl_module_t *parent) JL_NOTSAFEPOINT
 {
@@ -2347,11 +2346,6 @@ JL_DLLEXPORT void jl_add_to_module_init_list(jl_value_t *mod) JL_CANSAFEPOINT
     if (jl_module_init_order == NULL)
         jl_module_init_order = jl_alloc_vec_any(0);
     jl_array_ptr_1d_push(jl_module_init_order, mod);
-}
-
-JL_DLLEXPORT jl_svec_t *jl_module_get_bindings(jl_module_t *m)
-{
-    return jl_atomic_load_relaxed(&m->bindings);
 }
 
 JL_DLLEXPORT void jl_init_restored_module(jl_value_t *mod) JL_CANSAFEPOINT

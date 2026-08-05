@@ -79,27 +79,6 @@ function SecretBuffer!(d::AbstractVector{UInt8})
     s
 end
 
-function unsafe_SecretBuffer!(s::Cstring)
-    if s == C_NULL
-        throw(ArgumentError("cannot convert NULL to SecretBuffer"))
-    end
-    len = Int(ccall(:strlen, Csize_t, (Cstring,), s))
-    unsafe_SecretBuffer!(convert(Ptr{UInt8}, s), len)
-end
-function unsafe_SecretBuffer!(p::Ptr{UInt8}, len=1)
-    if p == C_NULL
-        throw(ArgumentError("cannot convert NULL to SecretBuffer"))
-    end
-    s = SecretBuffer(sizehint=len)
-    for i in 1:len
-        write(s, unsafe_load(p, i))
-    end
-    seek(s, 0)
-    unsafe_securezero!(p, len)
-    s
-end
-
-
 show(io::IO, s::SecretBuffer) = print(io, "SecretBuffer(\"*******\")")
 
 # Unlike other IO objects, equality is computed by value for convenience

@@ -78,10 +78,6 @@ end
     end
 end
 @testset "fenv" begin
-    @test Base.Rounding.from_fenv(Base.Rounding.to_fenv(RoundNearest)) == RoundNearest
-    @test Base.Rounding.from_fenv(Base.Rounding.to_fenv(RoundToZero)) == RoundToZero
-    @test Base.Rounding.from_fenv(Base.Rounding.to_fenv(RoundUp)) == RoundUp
-    @test Base.Rounding.from_fenv(Base.Rounding.to_fenv(RoundDown)) == RoundDown
     @test_throws ArgumentError Base.Rounding.from_fenv(-99)
 end
 
@@ -344,11 +340,11 @@ end
 
 @testset "rounding for F32/F64" begin
     for T in [Float32, Float64]
-        old = rounding(T)
+        old = Base.Rounding.rounding_raw(T)
         Base.Rounding.setrounding_raw(T, Base.Rounding.JL_FE_TOWARDZERO)
         @test rounding(T) == RoundToZero
         @test round(T(2.7)) == T(2.0)
-        Base.Rounding.setrounding_raw(T, Base.Rounding.to_fenv(old))
+        Base.Rounding.setrounding_raw(T, old)
     end
 end
 

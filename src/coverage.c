@@ -156,14 +156,6 @@ JL_DLLEXPORT void jl_clear_malloc_data(void) JL_NOTSAFEPOINT
     uv_mutex_unlock(&coverage_lock);
 }
 
-// Resets the code coverage
-JL_DLLEXPORT void jl_clear_coverage_data(void) JL_NOTSAFEPOINT
-{
-    uv_mutex_lock(&coverage_lock);
-    clear_log_data(&coverageData);
-    uv_mutex_unlock(&coverage_lock);
-}
-
 static void write_log_data(logdata_t *logData, const char *extension) JL_NOTSAFEPOINT
 {
     char base[4096];

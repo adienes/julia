@@ -253,43 +253,6 @@ using Distributed
     @test ref[] == nth
     @assert !islocked(c.cond_take)
 
-    # channeled_tasks
-    for T in [Any, Int]
-        tf_chnls1 = (c1, c2) -> (@assert take!(c1) == 1; put!(c2, 2))
-        chnls, tasks = Base.channeled_tasks(2, tf_chnls1; ctypes=[T,T], csizes=[N,N])
-        put!(chnls[1], 1)
-        @test take!(chnls[2]) === 2
-        @test_throws InvalidStateException wait(chnls[1])
-        @test_throws InvalidStateException wait(chnls[2])
-        @test istaskdone(tasks[1])
-        @test !isopen(chnls[1])
-        @test !isopen(chnls[2])
-
-        f = Future()
-        tf4 = (c1, c2) -> begin
-            @assert take!(c1) === 1
-            wait(f)
-        end
-
-        tf5 = (c1, c2) -> begin
-            put!(c2, 2)
-            wait(f)
-        end
-
-        chnls, tasks = Base.channeled_tasks(2, tf4, tf5; ctypes=[T,T], csizes=[N,N])
-        put!(chnls[1], 1)
-        @test take!(chnls[2]) === 2
-        yield()
-        put!(f, 1) # allow tf4 and tf5 to exit after now, eventually closing the channel
-
-        @test_throws InvalidStateException wait(chnls[1])
-        @test_throws InvalidStateException wait(chnls[2])
-        @test istaskdone(tasks[1])
-        @test istaskdone(tasks[2])
-        @test !isopen(chnls[1])
-        @test !isopen(chnls[2])
-    end
-
     # channel
     tf6 = c -> begin
         @assert take!(c) === 2

@@ -318,9 +318,6 @@ function ht_keyindex2_shorthash!(h::Dict{K,V}, key) where V where K
     return ht_keyindex2_shorthash!(h, key)
 end
 
-# Only for better backward compatibility. It can be removed in the future.
-ht_keyindex2!(h::Dict, key) = ht_keyindex2_shorthash!(h, key)[1]
-
 @propagate_inbounds function _setindex!(h::Dict, v, key, index, sh = _shorthash7(hash(key)))
     h.ndel -= isslotmissing(h, index)
     h.slots[index] = sh

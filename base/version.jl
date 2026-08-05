@@ -237,10 +237,6 @@ thispatch(v::VersionNumber) = VersionNumber(v.major, v.minor, v.patch)
 thisminor(v::VersionNumber) = VersionNumber(v.major, v.minor, 0)
 thismajor(v::VersionNumber) = VersionNumber(v.major, 0, 0)
 
-nextpatch(v::VersionNumber) = v < thispatch(v) ? thispatch(v) : VersionNumber(v.major, v.minor, v.patch+1)
-nextminor(v::VersionNumber) = v < thisminor(v) ? thisminor(v) : VersionNumber(v.major, v.minor+1, 0)
-nextmajor(v::VersionNumber) = v < thismajor(v) ? thismajor(v) : VersionNumber(v.major+1, 0, 0)
-
 ## julia version info
 
 """
@@ -274,9 +270,6 @@ const libllvm_version = if endswith(libllvm_version_string, "jl")
 else
     VersionNumber(libllvm_version_string)
 end
-
-libllvm_path() = ccall(:jl_get_libllvm, Any, ())
-
 
 ################
 # VersionBound #

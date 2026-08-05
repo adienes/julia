@@ -381,8 +381,6 @@
 (define (eventually-decl? e)
   (or (symbol? e) (and (pair? e) (memq (car e) '(|::| atomic const)) (eventually-decl? (cadr e)))))
 
-(define (make-decl n t) `(|::| ,n ,t))
-
 (define (ssavalue? e)
   (and (pair? e) (eq? (car e) 'ssavalue)))
 
@@ -468,11 +466,6 @@
 (define (return? e) (and (pair? e) (eq? (car e) 'return)))
 (define (thisfunction? e) (and (pair? e) (eq? (car e) 'thisfunction)))
 
-(define (tuple-call? e)
-  (and (length> e 1)
-       (eq? (car e) 'call)
-       (equal? (cadr e) '(core tuple))))
-
 (define (eq-sym? a b)
   (or (eq? a b) (and (ssavalue? a) (ssavalue? b) (eqv? (cdr a) (cdr b)))))
 
@@ -492,7 +485,6 @@
 (define (vinfo:capt v) (< 0 (logand (caddr v) 1)))
 (define (vinfo:asgn v) (< 0 (logand (caddr v) 2)))
 (define (vinfo:never-undef v) (< 0 (logand (caddr v) 4)))
-(define (vinfo:read v) (< 0 (logand (caddr v) 8)))
 (define (vinfo:sa v) (< 0 (logand (caddr v) 16)))
 (define (vinfo:nospecialize v) (< 0 (logand (caddr v) 128)))
 (define (set-bit x b val) (if val (logior x b) (logand x (lognot b))))

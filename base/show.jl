@@ -336,9 +336,6 @@ end
 # (Note that TTY and TTYTerminal io types have an implied :color property.)
 ioproperties(io::IO) = get(io, :color, false) ? ImmutableDict{Symbol,Any}(:color, true) : ImmutableDict{Symbol,Any}()
 ioproperties(io::IOContext) = io.dict
-# these can probably be deprecated, but there is a use in the ecosystem for them
-unwrapcontext(io::IO) = (io,)
-unwrapcontext(io::IOContext) = (io.io,)
 
 function IOContext(io::IO, dict::ImmutableDict{Symbol, Any})
     return IOContext{typeof(io)}(io, dict)
@@ -2810,32 +2807,6 @@ function print_type_bicolor(io, str::String; color=:normal, inner_color=:light_b
             printstyled(io, str[i:end]; color=inner_color)
         end
     end
-end
-
-resolvebinding(@nospecialize(ex)) = ex
-resolvebinding(ex::QuoteNode) = ex.value
-resolvebinding(ex::Symbol) = resolvebinding(GlobalRef(Main, ex))
-function resolvebinding(ex::Expr)
-    if ex.head === :. && isa(ex.args[2], Symbol)
-        parent = resolvebinding(ex.args[1])
-        if isa(parent, Module)
-            return resolvebinding(GlobalRef(parent, ex.args[2]))
-        end
-    end
-    return nothing
-end
-function resolvebinding(ex::GlobalRef)
-    isdefined(ex.mod, ex.name) || return nothing
-    isconst(ex.mod, ex.name) || return nothing
-    m = getfield(ex.mod, ex.name)
-    isa(m, Module) || return nothing
-    return m
-end
-
-function ismodulecall(ex::Expr)
-    return ex.head === :call && (ex.args[1] === GlobalRef(Base,:getfield) ||
-                                ex.args[1] === GlobalRef(Core,:getfield)) &&
-           isa(resolvebinding(ex.args[2]), Module)
 end
 
 function show(io::IO, tv::TypeVar)

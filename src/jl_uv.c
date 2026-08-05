@@ -346,38 +346,6 @@ JL_DLLEXPORT void *jl_uv_connect_handle(uv_connect_t *connect) { return connect-
 JL_DLLEXPORT uv_os_fd_t jl_uv_file_handle(jl_uv_file_t *f) { return f->file; }
 
 /**
- * @brief Get the data field from a UV request.
- *
- * @param req A pointer to `uv_req_t` representing the request.
- * @return A pointer to the data associated with the request.
- */
-JL_DLLEXPORT void *jl_uv_req_data(uv_req_t *req) { return req->data; }
-
-/**
- * @brief Set the data field of a UV request.
- *
- * @param req A pointer to `uv_req_t` representing the request.
- * @param data A pointer to the data to be associated with the request.
- */
-JL_DLLEXPORT void jl_uv_req_set_data(uv_req_t *req, void *data) { req->data = data; }
-
-/**
- * @brief Get the data field from a UV handle.
- *
- * @param handle A pointer to `uv_handle_t` representing the handle.
- * @return A pointer to the data associated with the handle.
- */
-JL_DLLEXPORT void *jl_uv_handle_data(uv_handle_t *handle) { return handle->data; }
-
-/**
- * @brief Get the handle associated with a UV write request.
- *
- * @param req A pointer to `uv_write_t` representing the write request.
- * @return A pointer to the handle associated with the write request.
- */
-JL_DLLEXPORT void *jl_uv_write_handle(uv_write_t *req) { return req->handle; }
-
-/**
  * @brief Process pending UV events.
  *
  * See also `uv_run` in the libuv documentation for status code enumeration.
@@ -1043,15 +1011,6 @@ JL_DLLEXPORT uint16_t jl_sockaddr_port4(struct sockaddr_in *addr)
 JL_DLLEXPORT uint16_t jl_sockaddr_port6(struct sockaddr_in6 *addr)
 {
     return addr->sin6_port;
-}
-
-
-JL_DLLEXPORT void jl_sockaddr_set_port(uv_sockaddr_in *addr, uint16_t port)
-{
-    if (addr->in.sa_family == AF_INET)
-        addr->v4.sin_port = port;
-    else
-        addr->v6.sin6_port = port;
 }
 
 JL_DLLEXPORT int jl_tcp_connect(uv_tcp_t *handle, void *host, uint16_t port,

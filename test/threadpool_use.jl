@@ -24,5 +24,5 @@ tp = :interactive
 @test fetch(Threads.@spawn tp Threads.threadpool()) === :interactive
 tp = :foo
 @test_throws ArgumentError Threads.@spawn tp Threads.threadpool()
-@test Threads.threadpooltids(:interactive) == [1]
-@test Threads.threadpooltids(:default) == [2]
+@test filter(i -> Threads.threadpool(i) === :interactive, 1:Threads.maxthreadid()) == [1]
+@test filter(i -> Threads.threadpool(i) === :default, 1:Threads.maxthreadid()) == [2]

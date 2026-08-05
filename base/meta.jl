@@ -655,11 +655,4 @@ function reescape(@nospecialize(unescaped_expr), @nospecialize(original_expr))
     end
 end
 
-"""
-    Meta.uncurly(expr)
-
-Turn `T{P...}` into just `T`.
-"""
-uncurly(@nospecialize ex) = isexpr(ex, :curly) ? ex.args[1] : ex
-
 end # module

@@ -473,17 +473,3 @@ function add_entrypoint(types::Type)
     push!(_entrypoint_mis, mi::MethodInstance)
     return true
 end
-
-function add_ccallable_entrypoints!()
-    # Collect all methods with ccallable annotations
-    ccallable_methods = Any[]
-    visit(Core.methodtable) do method
-        method = method::Method
-        if isdefined(method, :ccallable)
-            # Add the ccallable tuple signature
-            ccallable_sig = method.ccallable[2]  # Second element is the signature
-            add_entrypoint(ccallable_sig)
-        end
-        return true
-    end
-end

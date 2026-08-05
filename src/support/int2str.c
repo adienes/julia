@@ -37,33 +37,6 @@ int isdigit_base(char c, int base)
             (c >= 'A' && c < 'A'+base-10));
 }
 
-/* assumes valid base, returns 1 on error, 0 if OK */
-/*
-int str2int(char *str, size_t len, int64_t *res, uint32_t base)
-{
-    int64_t result, place;
-    char digit;
-    int i;
-
-    place = 1; result = 0;
-    for(i=len-1; i>=0; i--) {
-        digit = str[i];
-        if (!isdigit_base(digit, base))
-            return 1;
-        if (digit <= '9')
-            digit -= '0';
-        else if (digit >= 'a')
-            digit = digit-'a'+10;
-        else if (digit >= 'A')
-            digit = digit-'A'+10;
-        result += digit * place;
-        place *= base;
-    }
-    *res = result;
-    return 0;
-}
-*/
-
 #ifdef __cplusplus
 }
 #endif

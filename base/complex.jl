@@ -547,19 +547,6 @@ function sqrt(z::Complex)
     Complex(ξ,η)
 end
 
-# function sqrt(z::Complex)
-#     rz = float(real(z))
-#     iz = float(imag(z))
-#     r = sqrt((hypot(rz,iz)+abs(rz))/2)
-#     if r == 0
-#         return Complex(zero(iz), iz)
-#     end
-#     if rz >= 0
-#         return Complex(r, iz/r/2)
-#     end
-#     return Complex(abs(iz)/r/2, copysign(r,iz))
-# end
-
 """
     cis(x)
 
@@ -662,25 +649,6 @@ function log(z::Complex)
     end
     Complex(ρρ, angle(z))
 end
-
-# function log(z::Complex)
-#     ar = abs(real(z))
-#     ai = abs(imag(z))
-#     if ar < ai
-#         r = ar/ai
-#         re = log(ai) + log1p(r*r)/2
-#     else
-#         if ar == 0
-#             re = isnan(ai) ? ai : -inv(ar)
-#         elseif isinf(ai)
-#             re = oftype(ar,Inf)
-#         else
-#             r = ai/ar
-#             re = log(ar) + log1p(r*r)/2
-#         end
-#     end
-#     Complex(re, angle(z))
-# end
 
 function log10(z::Complex)
     a = log(z)

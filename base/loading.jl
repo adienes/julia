@@ -101,15 +101,6 @@ function isaccessiblefile(file)
     end
 end
 
-function isaccessiblepath(path)
-    return try
-        ispath(path)
-    catch err
-        err isa IOError || rethrow()
-        false
-    end
-end
-
 ## SHA1 and SHA256 ##
 for (name, namestr, numbytes) in [(:SHA1, "SHA1", 20), (:SHA256, "SHA256", 32)]
     @eval begin
@@ -2901,7 +2892,6 @@ maybe_root_module(key::PkgId) = @lock require_lock get(loaded_modules, key, noth
 loaded_modules_array() = @lock require_lock copy(loaded_modules_order)
 
 # after unreference_module, a subsequent require call will try to load a new copy of it, if stale
-# reload(m) = (unreference_module(m); require(m))
 function unreference_module(key::PkgId)
     @lock require_lock begin
     if haskey(loaded_modules, key)

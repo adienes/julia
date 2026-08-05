@@ -62,7 +62,6 @@
 extern "C" {
 #endif
 
-JL_DLLEXPORT int jl_sizeof_off_t(void) { return sizeof(off_t); }
 #ifndef _OS_WINDOWS_
 JL_DLLEXPORT int jl_sizeof_mode_t(void) { return sizeof(mode_t); }
 JL_DLLEXPORT int jl_ftruncate(int fd, int64_t length)
@@ -72,10 +71,6 @@ JL_DLLEXPORT int jl_ftruncate(int fd, int64_t length)
 JL_DLLEXPORT int64_t jl_lseek(int fd, int64_t offset, int whence)
 {
     return lseek(fd, (off_t)offset, whence);
-}
-JL_DLLEXPORT ssize_t jl_pwrite(int fd, const void *buf, size_t count, int64_t offset)
-{
-    return pwrite(fd, buf, count, (off_t)offset);
 }
 JL_DLLEXPORT void *jl_mmap(void *addr, size_t length, int prot, int flags,
                            int fd, int64_t offset)
@@ -196,16 +191,6 @@ JL_DLLEXPORT uint64_t jl_stat_blocks(char *statbuf)
 {
     return ((uv_stat_t*)statbuf)->st_blocks;
 }
-
-/*
-// atime is stupid, let's not support it
-JL_DLLEXPORT double jl_stat_atime(char *statbuf)
-{
-  uv_stat_t *s;
-  s = (uv_stat_t*)statbuf;
-  return (double)s->st_atim.tv_sec + (double)s->st_atim.tv_nsec * 1e-9;
-}
-*/
 
 JL_DLLEXPORT double jl_stat_mtime(char *statbuf)
 {

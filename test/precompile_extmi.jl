@@ -22,8 +22,6 @@ precompile_test_harness() do load_path
         CC.cache_owner(interp::ExampleInterpreter) = :ExampleInterpreter
 
         CC.get_inference_world(interp::ExampleInterpreter) = interp.world
-        CC.lock_mi_inference(::ExampleInterpreter, ::Core.MethodInstance) = nothing
-        CC.unlock_mi_inference(::ExampleInterpreter, ::Core.MethodInstance) = nothing
 
         function infer(mi, world)
             interp = ExampleInterpreter(world)

@@ -1,94 +1,5 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
-"""
-The module `Core.Compiler.Timings` provides a simple implementation of nested timers that
-can be used to measure the exclusive time spent inferring each method instance that is
-recursively inferred during type inference.
-
-This is meant to be internal to the compiler, and makes some specific assumptions about
-being used for this purpose alone.
-"""
-module Timings
-
-using ..Core
-using ..Compiler: -, +, :, Vector, length, first, empty!, push!, pop!, @inline,
-    @inbounds, copy, backtrace, _time_ns
-
-# What we record for any given frame we infer during type inference.
-struct InferenceFrameInfo
-    mi::Core.MethodInstance
-    sptypes::Vector{Compiler.VarState}
-    slottypes::Vector{Any}
-    nargs::Int
-end
-
-function _typeinf_identifier(frame::Compiler.InferenceState)
-    mi_info = InferenceFrameInfo(
-        frame.linfo,
-        copy(frame.sptypes),
-        copy(frame.slottypes),
-        length(frame.result.argtypes),
-    )
-    return mi_info
-end
-
-_typeinf_identifier(frame::InferenceFrameInfo) = frame
-
-"""
-    Compiler.Timing(mi_info, start_time, ...)
-
-Internal type containing the timing result for running type inference on a single
-MethodInstance.
-"""
-struct Timing
-    mi_info::InferenceFrameInfo
-    start_time::UInt64
-    cur_start_time::UInt64
-    time::UInt64
-    children::Core.Array{Timing,1}
-    bt         # backtrace collected upon initial entry to typeinf
-end
-Timing(mi_info, start_time, cur_start_time, time, children) = Timing(mi_info, start_time, cur_start_time, time, children, nothing)
-Timing(mi_info, start_time) = Timing(mi_info, start_time, start_time, UInt64(0), Timing[])
-
-# We keep a stack of the Timings for each of the MethodInstances currently being timed.
-# Since type inference currently operates via a depth-first search (during abstract
-# evaluation), this vector operates like a call stack. The last node in _timings is the
-# node currently being inferred, and its parent is directly before it, etc.
-# Each Timing also contains its own vector for all of its children, so that the tree
-# call structure through type inference is recorded. (It's recorded as a tree, not a graph,
-# because we create a new node for duplicates.)
-const _timings = Timing[]
-# ROOT() is an empty function used as the top-level Timing node to measure all time spent
-# *not* in type inference during a given recording trace. It is used as a "dummy" node.
-function ROOT() end
-const ROOTmi = Compiler.specialize_method(
-    first(Compiler.methods(ROOT)), Tuple{typeof(ROOT)}, Core.svec())
-"""
-    Compiler.reset_timings()
-
-Empty out the previously recorded type inference timings (`Compiler._timings`), and
-start the ROOT() timer again. `ROOT()` measures all time spent _outside_ inference.
-"""
-function reset_timings() end
-push!(_timings, Timing(
-    # The MethodInstance for ROOT(), and default empty values for other fields.
-    InferenceFrameInfo(ROOTmi, Compiler.VarState[], Any[Core.Const(ROOT)], 1),
-    _time_ns()))
-function close_current_timer() end
-function enter_new_timer(frame) end
-function exit_current_timer(_expected_frame_) end
-
-end  # module Timings
-
-"""
-    Compiler.__set_measure_typeinf(onoff::Bool)
-
-If set to `true`, record per-method-instance timings within type inference in the Compiler.
-"""
-__set_measure_typeinf(onoff::Bool) = __measure_typeinf__[] = onoff
-const __measure_typeinf__ = RefValue{Bool}(false)
-
 function result_edges(::AbstractInterpreter, caller::InferenceState)
     result = caller.result
     opt = result.src
@@ -876,22 +787,6 @@ function record_slot_assign!(sv::InferenceState)
         end
     end
     sv.src.slottypes = slottypes
-    return nothing
-end
-
-# find the dominating assignment to the slot `id` in the block containing statement `idx`,
-# returns `nothing` otherwise
-function find_dominating_assignment(id::Int, idx::Int, sv::InferenceState)
-    block = block_for_inst(sv.cfg, idx)
-    for pc in reverse(sv.cfg.blocks[block].stmts) # N.B. reverse since the last assignment is dominating this block
-        pc < idx || continue # N.B. needs pc ≠ idx as `id` can be assigned at `idx`
-        stmt = sv.src.code[pc]
-        isexpr(stmt, :(=)) || continue
-        lhs = stmt.args[1]
-        isa(lhs, SlotNumber) || continue
-        slot_id(lhs) == id || continue
-        return pc
-    end
     return nothing
 end
 

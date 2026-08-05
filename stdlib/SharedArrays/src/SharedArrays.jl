@@ -548,31 +548,6 @@ function Random.randn!(S::SharedArray)
     return S
 end
 
-# convenience constructors
-function shmem_fill(v, dims; kwargs...)
-    SharedArray{typeof(v),length(dims)}(dims; init = S->fill!(S.loc_subarr_1d, v), kwargs...)
-end
-shmem_fill(v, I::Int...; kwargs...) = shmem_fill(v, I; kwargs...)
-
-# rand variant with range
-function shmem_rand(TR::Union{DataType, UnitRange}, dims; kwargs...)
-    if isa(TR, UnitRange)
-        SharedArray{Int,length(dims)}(dims; init = S -> map!(x -> rand(TR), S.loc_subarr_1d, S.loc_subarr_1d), kwargs...)
-    else
-        SharedArray{TR,length(dims)}(dims; init = S -> map!(x -> rand(TR), S.loc_subarr_1d, S.loc_subarr_1d), kwargs...)
-    end
-end
-shmem_rand(TR::Union{DataType, UnitRange}, i::Int; kwargs...) = shmem_rand(TR, (i,); kwargs...)
-shmem_rand(TR::Union{DataType, UnitRange}, I::Int...; kwargs...) = shmem_rand(TR, I; kwargs...)
-
-shmem_rand(dims; kwargs...) = shmem_rand(Float64, dims; kwargs...)
-shmem_rand(I::Int...; kwargs...) = shmem_rand(I; kwargs...)
-
-function shmem_randn(dims; kwargs...)
-    SharedArray{Float64,length(dims)}(dims; init = S-> map!(x -> randn(), S.loc_subarr_1d, S.loc_subarr_1d), kwargs...)
-end
-shmem_randn(I::Int...; kwargs...) = shmem_randn(I; kwargs...)
-
 similar(S::SharedArray, T::Type, dims::Dims) = similar(S.s, T, dims)
 similar(S::SharedArray, T::Type) = similar(S.s, T, size(S))
 similar(S::SharedArray, dims::Dims) = similar(S.s, eltype(S), dims)

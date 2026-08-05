@@ -618,12 +618,6 @@ int ios_eof(ios_t *s)
     */
 }
 
-void ios_reseteof(ios_t *s)
-{
-    if (s->bm != bm_mem && s->fd != -1)
-        s->_eof = 0;
-}
-
 int ios_eof_blocking(ios_t *s)
 {
     if (s->state == bst_rd && s->bpos < s->size)
@@ -1013,15 +1007,6 @@ ios_t *ios_mem(ios_t *s, size_t initsize)
     return s;
 }
 
-ios_t *ios_str(ios_t *s, char *str)
-{
-    size_t n = strlen(str);
-    if (ios_mem(s, n+1)==NULL) return NULL;
-    ios_write(s, str, n+1);
-    ios_seek(s, 0);
-    return s;
-}
-
 ios_t *ios_static_buffer(ios_t *s, char *buf, size_t sz)
 {
     ios_mem(s, 0);
@@ -1119,30 +1104,6 @@ int ios_peekc(ios_t *s)
     size_t n = ios_readprep(s, 1);
     if (n == 0)  return IOS_EOF;
     return (unsigned char)s->buf[s->bpos];
-}
-
-int ios_ungetc(int c, ios_t *s)
-{
-    if (s->state == bst_wr)
-        return IOS_EOF;
-    if (c == '\n') s->lineno--;
-    if (s->u_colno > 0) s->u_colno--;
-    if (s->bpos > 0) {
-        s->bpos--;
-        if (s->buf[s->bpos] != (char)c)
-            s->buf[s->bpos] = (char)c;
-        s->_eof = 0;
-        return c;
-    }
-    if (s->size == s->maxsize) {
-        if (_buf_realloc(s, s->maxsize*2) == NULL)
-            return IOS_EOF;
-    }
-    memmove(s->buf + 1, s->buf, s->size);
-    s->buf[0] = (char)c;
-    s->size++;
-    s->_eof = 0;
-    return c;
 }
 
 int ios_getutf8(ios_t *s, uint32_t *pwc)

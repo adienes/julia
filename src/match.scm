@@ -1,9 +1,6 @@
 ; tree regular expression pattern matching
 ; by Jeff Bezanson
 
-; list of special pattern symbols that cannot be variable names
-(define metasymbols '(_ ...))
-
 ; expression tree pattern matching
 ; matches expr against pattern p and returns an assoc list
 ;    ((var . expr) (var . expr) ...)

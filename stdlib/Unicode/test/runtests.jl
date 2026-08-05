@@ -121,7 +121,6 @@ end
     end
 
     @test !isuppercase('ǅ') # titlecase is not uppercase
-    @test Base.Unicode.iscased('ǅ') # but is "cased"
 
     nocase=['א','ﺵ']
     alphas=vcat(alower,ulower,aupper,uupper,nocase,['ǅ'])
@@ -274,9 +273,6 @@ end
         end
     end
 
-    @test Base.Unicode.isgraphemebreak('α', 'β')
-    @test !Base.Unicode.isgraphemebreak('α', '\u0302')
-
     for pre in ("","ä"), post in ("","x̂")
         prelen = length(graphemes(pre))
         @test graphemes(pre * "öü" * post, (1:2) .+ prelen) == "öü"
@@ -411,7 +407,6 @@ end
         @test titlecase("abcD   EFG\n\thij", strict=true)  == "Abcd   Efg\n\tHij"
         @test titlecase("abcD   EFG\n\thij", strict=false) == "AbcD   EFG\n\tHij"
         @test titlecase("abc-def")                     == "Abc-Def"
-        @test titlecase("abc-def", wordsep = !Base.Unicode.iscased) == "Abc-Def"
         @test titlecase("abc-def", wordsep = isspace)  == "Abc-def"
         @test titlecase("bôrked") == "Bôrked"
     end
@@ -448,7 +443,6 @@ end
     overlong_char = reinterpret(Char, overlong_uint)
 
     state = Ref(Int32(1))
-    @test Base.Unicode.isgraphemebreak(u1, u2)
     @test Base.Unicode.isgraphemebreak!(state, u1, u2)
     @test state[] == 0
 

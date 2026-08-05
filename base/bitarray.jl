@@ -1497,8 +1497,6 @@ function findnextnot(B::BitArray, start::Int)
     end
     return nothing
 end
-findfirstnot(B::BitArray) = findnextnot(B,1)
-
 # returns the index of the first matching element
 function findnext(pred::Fix2{<:Union{typeof(isequal),typeof(==)},Bool},
                   B::BitArray, start::Integer)
@@ -1573,8 +1571,6 @@ function findprevnot(B::BitArray, start::Int)
     end
     return nothing
 end
-findlastnot(B::BitArray) = findprevnot(B, length(B))
-
 # returns the index of the previous matching element
 function findprev(pred::Fix2{<:Union{typeof(isequal),typeof(==)},Bool},
                   B::BitArray, start::Integer)

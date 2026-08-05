@@ -1602,56 +1602,6 @@ static Value *emit_datatype_size(jl_codectx_t &ctx, Value *dt, bool add_isunion=
     return Size;
 }
 
-/* this is valid code, it's simply unused
-static Value *emit_sizeof(jl_codectx_t &ctx, const jl_cgval_t &p)
-{
-    if (p.TIndex) {
-        Value *tindex = ctx.builder.CreateAnd(p.TIndex, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), 0x7f));
-        Value *size = ConstantInt::get(getInt32Ty(ctx.builder.getContext()), -1);
-        unsigned counter = 0;
-        bool allunboxed = for_each_uniontype_small(
-                [&](unsigned idx, jl_datatype_t *jt) {
-                    Value *cmp = ctx.builder.CreateICmpEQ(tindex, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), idx));
-                    size = ctx.builder.CreateSelect(cmp, ConstantInt::get(getInt32Ty(ctx.builder.getContext()), jl_datatype_size(jt)), size);
-                },
-                p.typ,
-                counter);
-        if (!allunboxed && p.ispointer() && p.V && !isa<AllocaInst>(p.V)) {
-            BasicBlock *currBB = ctx.builder.GetInsertBlock();
-            BasicBlock *dynloadBB = BasicBlock::Create(ctx.builder.getContext(), "dyn_sizeof", ctx.f);
-            BasicBlock *postBB = BasicBlock::Create(ctx.builder.getContext(), "post_sizeof", ctx.f);
-            Value *isboxed = ctx.builder.CreateICmpNE(
-                    ctx.builder.CreateAnd(p.TIndex, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), UNION_BOX_MARKER)),
-                    ConstantInt::get(getInt8Ty(ctx.builder.getContext()), 0));
-            ctx.builder.CreateCondBr(isboxed, dynloadBB, postBB);
-            ctx.builder.SetInsertPoint(dynloadBB);
-            Value *datatype = emit_typeof(ctx, p.V, false, false);
-            Value *dyn_size = emit_datatype_size(ctx, datatype);
-            ctx.builder.CreateBr(postBB);
-            dynloadBB = ctx.builder.GetInsertBlock(); // could have changed
-            ctx.builder.SetInsertPoint(postBB);
-            PHINode *sizeof_merge = ctx.builder.CreatePHI(getInt32Ty(ctx.builder.getContext()), 2);
-            sizeof_merge->addIncoming(dyn_size, dynloadBB);
-            sizeof_merge->addIncoming(size, currBB);
-            size = sizeof_merge;
-        }
-#ifndef NDEBUG
-        // try to catch codegen errors early, before it uses this to memcpy over the entire stack
-        CreateConditionalAbort(ctx.builder, ctx.builder.CreateICmpEQ(size, ConstantInt::get(getInt32Ty(ctx.builder.getContext()), -1)));
-#endif
-        return size;
-    }
-    else if (jl_is_concrete_type(p.typ)) {
-        return ConstantInt::get(getInt32Ty(ctx.builder.getContext()), jl_datatype_size(p.typ));
-    }
-    else {
-        Value *datatype = emit_typeof(ctx, p, false, false);
-        Value *dyn_size = emit_datatype_size(ctx, datatype);
-        return dyn_size;
-    }
-}
-*/
-
 static Value *emit_datatype_mutabl(jl_codectx_t &ctx, Value *dt)
 {
     jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_const);

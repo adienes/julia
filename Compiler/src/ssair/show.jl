@@ -11,7 +11,7 @@ using Base: isexpr, prec_decl, show_unquoted, with_output_color
 using .Compiler: ALWAYS_FALSE, ALWAYS_TRUE, BasicBlock, CFG, CachedMethodTable,
     DebugInfoStream, EMPTY_SPTYPES, Effects, IRCode, IncrementalCompact, InferenceResult,
     InferenceState, InvalidIRError, LimitedAccuracy, NativeInterpreter, StmtRange,
-    Timings, VarState, argextype, block_for_inst, compute_basic_blocks, edge_debuginfo,
+    VarState, argextype, block_for_inst, compute_basic_blocks, edge_debuginfo,
     get_ci_abi, get_ci_mi, has_prev_debuginfo, prev_debuginfo, scan_ssa_use!,
     singleton_type, source_location, sptypes_from_meth_instance, widenconst
 
@@ -923,8 +923,6 @@ function inline_linfo_printer(code::Union{IRCode,CodeInfo})
     end
 end
 
-_strip_color(s::String) = replace(s, r"\e\[\d+m"a => "")
-
 statementidx_lineinfo_printer(f, code::IRCode) = f(code.debuginfo, :var"unknown scope")
 statementidx_lineinfo_printer(f, code::CodeInfo) = f(code.debuginfo, :var"unknown scope")
 statementidx_lineinfo_printer(code) = statementidx_lineinfo_printer(DILineInfoPrinter, code)
@@ -1194,32 +1192,6 @@ function Base.show(io::IO, limited::LimitedAccuracy)
     print(io, "LimitedAccuracy(")
     show(io, limited.typ)
     print(io, ", #= ", length(limited.causes), " cause(s) =#)")
-end
-
-# These sometimes show up as Const-values in InferenceFrameInfo signatures
-function Base.show(io::IO, mi_info::Timings.InferenceFrameInfo)
-    mi = mi_info.mi
-    def = mi.def
-    if isa(def, Method)
-        if isdefined(def, :generator) && mi === def.generator
-            print(io, "InferenceFrameInfo generator for ")
-            show(io, def)
-        else
-            print(io, "InferenceFrameInfo for ")
-            argnames = [isa(a, Core.Const) ? (isa(a.val, Type) ? "" : a.val) : "" for a in mi_info.slottypes[1:mi_info.nargs]]
-            show_tuple_as_call(io, def.name, mi.specTypes; argnames, qualified=true)
-        end
-    else
-        di = mi.cache.debuginfo
-        file, line = debuginfo_firstline(di)
-        file = string(file)
-        line = isempty(file) || line < 0 ? "<unknown>" : "$file:$line"
-        print(io, "Toplevel InferenceFrameInfo thunk from ", def, " starting at ", line)
-    end
-end
-
-function Base.show(io::IO, tinf::Timings.Timing)
-    print(io, "Compiler.Timings.Timing(", tinf.mi_info, ") with ", length(tinf.children), " children")
 end
 
 @specialize

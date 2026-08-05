@@ -55,15 +55,10 @@ using Test, Random
         @test all(==(0x0), data2)
         @test s1 == s2
 
-        ptr3 = Base.unsafe_convert(Cstring, "setec astronomy")
-        s3 = Base.unsafe_SecretBuffer!(ptr3)
-        @test Base.unsafe_string(ptr3) == ""
-        @test s1 == s2 == s3
-
         s4 = SecretBuffer(split("setec astronomy", " ")[1]) # initialize from SubString
         s5 = convert(SecretBuffer, split("setec astronomy", " ")[1]) # initialize from SubString
         @test s4 == s5
-        shred!(s1); shred!(s2); shred!(s3); shred!(s4), shred!(s5);
+        shred!(s1); shred!(s2); shred!(s4), shred!(s5);
     end
     @testset "basics" begin
         s1 = SecretBuffer("setec astronomy")
@@ -126,14 +121,6 @@ using Test, Random
         @test hash(sb1, UInt(5)) === hash(sb2, UInt(5))
         shred!(sb1); shred!(sb2)
     end
-    @testset "NULL initialization" begin
-        null_ptr = Cstring(C_NULL)
-        @test_throws ArgumentError Base.unsafe_SecretBuffer!(null_ptr)
-        null_ptr = Ptr{UInt8}(C_NULL)
-        @test_throws ArgumentError Base.unsafe_SecretBuffer!(null_ptr)
-        @test_throws ArgumentError Base.unsafe_SecretBuffer!(null_ptr, 0)
-    end
-
     @testset "copiers" begin
         s1 = SecretBuffer()
         write(s1, "hello world")

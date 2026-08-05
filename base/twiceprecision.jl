@@ -118,43 +118,6 @@ end
 mul12(x::T, y::T) where {T} = (p = x * y; (p, zero(p)))
 mul12(x, y) = mul12(promote(x, y)...)
 
-"""
-    zhi, zlo = div12(x, y)
-
-A high-precision representation of `x / y` for floating-point
-numbers. Mathematically, `zhi + zlo ≈ x / y`, where `zhi` contains the
-most significant bits and `zlo` the least significant.
-
-Example:
-```jldoctest
-julia> x, y = Float32(π), 3.1f0
-(3.1415927f0, 3.1f0)
-
-julia> x / y
-1.013417f0
-
-julia> Float64(x) / Float64(y)
-1.0134170444063078
-
-julia> hi, lo = Base.div12(x, y)
-(1.013417f0, 3.8867366f-8)
-
-julia> Float64(hi) + Float64(lo)
-1.0134170444063066
-```
-"""
-function div12(x::T, y::T) where {T<:AbstractFloat}
-    # We lose precision if any intermediate calculation results in a subnormal.
-    # To prevent this from happening, standardize the values.
-    xs, xe = frexp(x)
-    ys, ye = frexp(y)
-    r = xs / ys
-    rh, rl = canonicalize2(r, -fma(r, ys, -xs)/ys)
-    ifelse(iszero(r) | !isfinite(r), (r, r), (ldexp(rh, xe-ye), ldexp(rl, xe-ye)))
-end
-div12(x::T, y::T) where {T} = (p = x / y; (p, zero(p)))
-div12(x, y) = div12(promote(x, y)...)
-
 
 ## TwicePrecision
 

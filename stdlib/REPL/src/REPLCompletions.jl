@@ -965,7 +965,6 @@ end
 include("latex_symbols.jl")
 include("emoji_symbols.jl")
 
-const non_identifier_chars = [" \t\n\r\"\\'`\$><=:;|&{}()[],+-*/?%^~"...]
 const whitespace_chars = [" \t\n\r"...]
 # "\"'`"... is added to whitespace_chars as none of the bslash_completions
 # characters contain any of these characters. It prohibits the

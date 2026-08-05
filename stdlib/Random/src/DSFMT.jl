@@ -6,7 +6,7 @@ import Base: copy, copy!, ==, hash
 using Base.GMP.MPZ
 
 export DSFMT_state, dsfmt_get_min_array_size, dsfmt_get_idstring,
-       dsfmt_init_gen_rand, dsfmt_init_by_array, dsfmt_gv_init_by_array,
+       dsfmt_init_by_array,
        dsfmt_fill_array_close_open!, dsfmt_fill_array_close1_open2!
 
 "Mersenne Exponent"
@@ -58,26 +58,12 @@ end
 
 const dsfmt_min_array_size = dsfmt_get_min_array_size()
 
-function dsfmt_init_gen_rand(s::DSFMT_state, seed::UInt32)
-    ccall((:dsfmt_init_gen_rand,:libdSFMT),
-          Cvoid,
-          (Ptr{Cvoid}, UInt32,),
-          s.val, seed)
-end
-
 function dsfmt_init_by_array(s::DSFMT_state, seed::StridedVector{UInt32})
     strides(seed) == (1,) || throw(ArgumentError("seed must have its stride equal to 1"))
     ccall((:dsfmt_init_by_array,:libdSFMT),
           Cvoid,
           (Ptr{Cvoid}, Ptr{UInt32}, Int32),
           s.val, seed, length(seed))
-end
-
-function dsfmt_gv_init_by_array(seed::Vector{UInt32})
-    ccall((:dsfmt_gv_init_by_array,:libdSFMT),
-          Cvoid,
-          (Ptr{UInt32}, Int32),
-          seed, length(seed))
 end
 
 function dsfmt_fill_array_close1_open2!(s::DSFMT_state, A::Ptr{Float64}, n::Int)

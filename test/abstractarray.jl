@@ -374,7 +374,6 @@ function test_scalar_indexing(::Type{T}, shape, ::Type{TestAbstractArray}) where
     @test A == B
     # Test indexing up to 5 dimensions
     trailing5 = CartesianIndex(ntuple(Returns(1), max(ndims(B)-5, 0)))
-    trailing4 = CartesianIndex(ntuple(Returns(1), max(ndims(B)-4, 0)))
     trailing3 = CartesianIndex(ntuple(Returns(1), max(ndims(B)-3, 0)))
     trailing2 = CartesianIndex(ntuple(Returns(1), max(ndims(B)-2, 0)))
     i=0
@@ -419,9 +418,6 @@ function test_scalar_indexing(::Type{T}, shape, ::Type{TestAbstractArray}) where
     @test A[1] == B[1] == 1
     # Test multidimensional scalar indexed assignment
     C = T(Int, shape)
-    D1 = T(Int, shape)
-    D2 = T(Int, shape)
-    D3 = T(Int, shape)
     i=0
     for i5 = 1:size(B, 5)
         for i4 = 1:size(B, 4)
@@ -430,19 +426,12 @@ function test_scalar_indexing(::Type{T}, shape, ::Type{TestAbstractArray}) where
                     for i1 = 1:size(B, 1)
                         i += 1
                         C[i1,i2,i3,i4,i5,trailing5] = i
-                        # test general unsafe_setindex!
-                        Base.unsafe_setindex!(D1, i, i1,i2,i3,i4,i5,trailing5)
-                        # test for dropping trailing dims
-                        Base.unsafe_setindex!(D2, i, i1,i2,i3,i4,i5,trailing5, 1, 1, 1)
-                        # test for expanding index argument to appropriate dims
-                        Base.unsafe_setindex!(D3, i, i1,i2,i3,i4,trailing4)
                     end
                 end
             end
         end
     end
-    @test D1 == D2 == C == B == A
-    @test D3[:, :, :, :, 1, trailing5] == D2[:, :, :, :, 1, trailing5]
+    @test C == B == A
     # Test linear indexing and partial linear indexing
     C = T(Int, shape)
     fill!(C, 0)
@@ -493,8 +482,6 @@ function test_vector_indexing(::Type{T}, shape, ::Type{TestAbstractArray}) where
         N = prod(shape)
         A = reshape(Vector(1:N), shape)
         B = T(A)
-        trailing5 = CartesianIndex(ntuple(Returns(1), max(ndims(B)-5, 0)))
-        trailing4 = CartesianIndex(ntuple(Returns(1), max(ndims(B)-4, 0)))
         trailing3 = CartesianIndex(ntuple(Returns(1), max(ndims(B)-3, 0)))
         trailing2 = CartesianIndex(ntuple(Returns(1), max(ndims(B)-2, 0)))
         idxs = rand(1:N, 3, 3, 3)
@@ -665,7 +652,7 @@ function test_setindex!_internals(::Type{T}, shape, ::Type{TestAbstractArray}) w
     A = reshape(Vector(1:N), shape)
     B = T(A)
 
-    Base.unsafe_setindex!(B, 2, 1)
+    B[1] = 2
     @test B[1] == 2
 end
 
@@ -673,9 +660,7 @@ function test_setindex!_internals(::Type{TestAbstractArray})
     U = UnimplementedFastArray{Int, 2}()
     V = UnimplementedSlowArray{Int, 2}()
     @test_throws Base.CanonicalIndexError setindex!(U, 0, 1)
-    @test_throws Base.CanonicalIndexError Base.unsafe_setindex!(U, 0, 1)
     @test_throws Base.CanonicalIndexError setindex!(V, 0, 1, 1)
-    @test_throws Base.CanonicalIndexError Base.unsafe_setindex!(V, 0, 1, 1)
 end
 
 function test_get(::Type{TestAbstractArray})

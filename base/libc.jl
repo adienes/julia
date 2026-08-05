@@ -459,11 +459,9 @@ function getrandom!(A::Union{Array,Base.RefValue})
     Base.uv_error("getrandom", ret)
     return A
 end
-_make_uint64_seed() = getrandom!(Base.RefValue{UInt64}())[]
 
 # To limit dependency on rand functionality implemented in the Random module,
-# Libc.rand is used in Base (it also is independent from Random.seed, so is
-# only affected by `Libc.srand(seed)` calls)
+# Libc.rand is used in Base (it is independent from Random.seed)
 """
     rand([T::Type]=UInt32)
 
@@ -472,15 +470,6 @@ Generate a random number of type `T`. `T` can be `UInt32` or `Float64`.
 rand() = ccall(:jl_rand, UInt64, ()) % UInt32
 rand(::Type{UInt32}) = rand()
 rand(::Type{Float64}) = rand() * 2.0^-32
-
-"""
-    srand([seed])
-
-Set a value for the current global `seed`.
-"""
-function srand(seed::Integer=_make_uint64_seed())
-    ccall(:jl_srand, Cvoid, (UInt64,), seed % UInt64)
-end
 
 """
     mkfifo(path::AbstractString, [mode::Integer]) -> path
@@ -605,7 +594,6 @@ end
 
 getuid() = ccall(:jl_getuid, Culong, ())
 geteuid() = ccall(:jl_geteuid, Culong, ())
-getegid() = Sys.iswindows() ? Culong(-1) : ccall(:getegid, Culong, ())
 
 # Include dlopen()/dlpath() code
 include("libdl.jl")

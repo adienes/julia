@@ -228,7 +228,6 @@ function getdebugidx(debuginfo::DebugInfoStream, pc::Int)
 end
 
 has_prev_debuginfo(di, pc::Int) = prev_debuginfo(di, pc)[1] !== nothing
-has_edge_debuginfo(di, pc::Int) = edge_debuginfo(di, pc)[1] !== nothing
 
 "(debuginfo, nextpc) from the previous step in the compiler"
 function prev_debuginfo(di, pc::Int)
@@ -464,15 +463,6 @@ function add_flag(newinst::NewInstruction, newflag::UInt32)
         flag = newflag
     else
         flag |= newflag
-    end
-    return NewInstruction(newinst; flag)
-end
-function sub_flag(newinst::NewInstruction, newflag::UInt32)
-    flag = newinst.flag
-    if flag === nothing
-        flag = IR_FLAG_NULL
-    else
-        flag &= ~newflag
     end
     return NewInstruction(newinst; flag)
 end

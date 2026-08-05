@@ -142,7 +142,6 @@ const UTF8PROC_NLF2PS    = (1<<8)
 const UTF8PROC_NLF2LF    = (UTF8PROC_NLF2LS | UTF8PROC_NLF2PS)
 const UTF8PROC_STRIPCC   = (1<<9)
 const UTF8PROC_CASEFOLD  = (1<<10)
-const UTF8PROC_CHARBOUND = (1<<11)
 const UTF8PROC_LUMP      = (1<<12)
 const UTF8PROC_STRIPMARK = (1<<13)
 
@@ -459,21 +458,6 @@ function isuppercase(c::AbstractChar)
     ismalformed(c) ? false :
         !iszero(@assume_effects :foldable :nothrow @ccall utf8proc_isupper(unsafe_codepoint(c)::UInt32)::Cint)
 end
-
-"""
-    iscased(c::AbstractChar)::Bool
-
-Tests whether a character is cased, i.e. is lower-, upper- or title-cased.
-
-See also [`islowercase`](@ref), [`isuppercase`](@ref).
-"""
-function iscased(c::AbstractChar)
-    cat = category_code(c)
-    return cat == UTF8PROC_CATEGORY_LU ||
-           cat == UTF8PROC_CATEGORY_LT ||
-           cat == UTF8PROC_CATEGORY_LL
-end
-
 
 """
     isdigit(c::AbstractChar)::Bool
@@ -827,10 +811,6 @@ lowercasefirst(s::SubString{<:AnnotatedString}) = lowercasefirst(AnnotatedString
 
 ############################################################################
 # iterators for grapheme segmentation
-
-isgraphemebreak(c1::AbstractChar, c2::AbstractChar) =
-    ismalformed(c1) || ismalformed(c2) ||
-    ccall(:utf8proc_grapheme_break, Bool, (UInt32, UInt32), c1, c2)
 
 # Stateful grapheme break required by Unicode-9 rules: the string
 # must be processed in sequence, with state initialized to Ref{Int32}(0).

@@ -90,24 +90,6 @@ const COMPILE_MASK      =
       USE_OFFSET_LIMIT  |
       UTF
 
-# arguments to pcre2_set_newline
-const COMPILE_NEWLINE_MASK = (
-      NEWLINE_CR,
-      NEWLINE_LF,
-      NEWLINE_CRLF,
-      NEWLINE_ANY,
-      NEWLINE_ANYCRLF,
-      NEWLINE_NUL)
-
-# arguments to pcre2_set_compile_extra_options
-const COMPILE_EXTRA_MASK            =
-      EXTRA_ALLOW_SURROGATE_ESCAPES |
-      EXTRA_ALT_BSUX                |
-      EXTRA_BAD_ESCAPE_IS_LITERAL   |
-      EXTRA_ESCAPED_CR_IS_LF        |
-      EXTRA_MATCH_LINE              |
-      EXTRA_MATCH_WORD
-
 # arguments to match
 const EXECUTE_MASK      =
       # ANCHORED        |
@@ -180,12 +162,6 @@ free_match_data(match_data) =
 
 free_re(re) =
     ccall((:pcre2_code_free_8, PCRE_LIB), Cvoid, (Ptr{Cvoid},), re)
-
-free_jit_stack(stack) =
-    ccall((:pcre2_jit_stack_free_8, PCRE_LIB), Cvoid, (Ptr{Cvoid},), stack)
-
-free_match_context(context) =
-    ccall((:pcre2_match_context_free_8, PCRE_LIB), Cvoid, (Ptr{Cvoid},), context)
 
 function err_message(errno::Integer)
     buffer = Vector{UInt8}(undef, 1024)

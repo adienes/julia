@@ -342,21 +342,6 @@ macro _noub_meta()
         #=:consistent_overlay=#false,
         #=:nortcall=#false))
 end
-# can be used in place of `@assume_effects :notaskstate` (supposed to be used for bootstrapping)
-macro _notaskstate_meta()
-    return _is_internal(__module__) && Expr(:meta, Expr(:purity,
-        #=:consistent=#false,
-        #=:effect_free=#false,
-        #=:nothrow=#false,
-        #=:terminates_globally=#false,
-        #=:terminates_locally=#false,
-        #=:notaskstate=#true,
-        #=:inaccessiblememonly=#false,
-        #=:noub=#false,
-        #=:noub_if_noinbounds=#false,
-        #=:consistent_overlay=#false,
-        #=:nortcall=#false))
-end
 # can be used in place of `@assume_effects :noub_if_noinbounds` (supposed to be used for bootstrapping)
 macro _noub_if_noinbounds_meta()
     return _is_internal(__module__) && Expr(:meta, Expr(:purity,
@@ -665,37 +650,6 @@ function convert(::Type{T}, x::NTuple{N,Any}) where {N, T<:Tuple}
     end
     return ntuple(cvt1, Val(N))::NTuple{N,Any}
 end
-
-# optimizations?
-# converting to tuple types of fixed length
-#convert(::Type{T}, x::T) where {N, T<:NTuple{N,Any}} = x
-#convert(::Type{T}, x::NTuple{N,Any}) where {N, T<:NTuple{N,Any}} =
-#    ntuple(n -> convert(fieldtype(T, n), x[n]), Val(N))
-#convert(::Type{T}, x::Tuple{Vararg{Any}}) where {N, T<:NTuple{N,Any}} =
-#    throw(MethodError(convert, (T, x)))
-# converting to tuple types of indefinite length
-#convert(::Type{Tuple{Vararg{V}}}, x::Tuple{Vararg{V}}) where {V} = x
-#convert(::Type{NTuple{N, V}}, x::NTuple{N, V}) where {N, V} = x
-#function convert(T::Type{Tuple{Vararg{V}}}, x::Tuple) where {V}
-#    @isdefined(V) || (V = fieldtype(T, 1))
-#    return map(t -> convert(V, t), x)
-#end
-#function convert(T::Type{NTuple{N, V}}, x::NTuple{N, Any}) where {N, V}
-#    @isdefined(V) || (V = fieldtype(T, 1))
-#    return map(t -> convert(V, t), x)
-#end
-# short tuples
-#convert(::Type{Tuple{}}, ::Tuple{}) = ()
-#convert(::Type{Tuple{S}}, x::Tuple{S}) where {S} = x
-#convert(::Type{Tuple{S, T}}, x::Tuple{S, T}) where {S, T} = x
-#convert(::Type{Tuple{S, T, U}}, x::Tuple{S, T, U}) where {S, T, U} = x
-#convert(::Type{Tuple{S}}, x::Tuple{Any}) where {S} = (convert(S, x[1]),)
-#convert(::Type{Tuple{S, T}}, x::Tuple{Any, Any}) where {S, T} = (convert(S, x[1]), convert(T, x[2]),)
-#convert(::Type{Tuple{S, T, U}}, x::Tuple{Any, Any, Any}) where {S, T, U} = (convert(S, x[1]), convert(T, x[2]), convert(U, x[3]))
-#convert(::Type{Tuple{}}, x::Tuple) = _tuple_error(Tuple{}, x)
-#convert(::Type{Tuple{S}}, x::Tuple) = _tuple_error(Tuple{S}, x)
-#convert(::Type{Tuple{S, T}}, x::Tuple{Any, Any}) where {S, T} =_tuple_error(Tuple{S, T}, x)
-#convert(::Type{Tuple{S, T, U}}, x::Tuple{Any, Any, Any}) where {S, T, U} = _tuple_error(Tuple{S, T, U}, x)
 
 """
     oftype(x, y)

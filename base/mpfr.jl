@@ -41,9 +41,6 @@ else
     const libmpfr = "libmpfr.so.6"
 end
 
-version() = VersionNumber(unsafe_string(ccall((:mpfr_get_version,libmpfr), Ptr{Cchar}, ())))
-patches() = split(unsafe_string(ccall((:mpfr_get_patches,libmpfr), Ptr{Cchar}, ())),' ')
-
 function __init__()
     try
         # set exponent to full range by default
@@ -831,13 +828,6 @@ function sincos_fast(v::BigFloat)
 end
 sincos(v::BigFloat) = sincos_fast(v)
 
-# return log(2)
-function big_ln2()
-    c = BigFloat()
-    ccall((:mpfr_const_log2, libmpfr), Cint, (Ref{BigFloat}, MPFRRoundingMode), c, MPFR.rounding_raw(BigFloat))
-    return c
-end
-
 function ldexp(x::BigFloat, n::Clong)
     z = BigFloat()
     ccall((:mpfr_mul_2si, libmpfr), Int32, (Ref{BigFloat}, Ref{BigFloat}, Clong, MPFRRoundingMode), z, x, n, rounding_raw(BigFloat))
@@ -1282,13 +1272,9 @@ function show(io::IO, b::BigFloat)
 end
 
 # get/set exponent min/max
-get_emax() = ccall((:mpfr_get_emax, libmpfr), Clong, ())
-get_emax_min() = ccall((:mpfr_get_emax_min, libmpfr), Clong, ())
 get_emax_max() = ccall((:mpfr_get_emax_max, libmpfr), Clong, ())
 
-get_emin() = ccall((:mpfr_get_emin, libmpfr), Clong, ())
 get_emin_min() = ccall((:mpfr_get_emin_min, libmpfr), Clong, ())
-get_emin_max() = ccall((:mpfr_get_emin_max, libmpfr), Clong, ())
 
 check_exponent_err(ret) = ret == 0 || throw(ArgumentError("Invalid MPFR exponent range"))
 set_emax!(x) = check_exponent_err(ccall((:mpfr_set_emax, libmpfr), Cint, (Clong,), x))
@@ -1323,11 +1309,6 @@ end
 
 # flags
 clear_flags() = ccall((:mpfr_clear_flags, libmpfr), Cvoid, ())
-had_underflow() = ccall((:mpfr_underflow_p, libmpfr), Cint, ()) != 0
-had_overflow() = ccall((:mpfr_overflow_p, libmpfr), Cint, ()) != 0
-had_divbyzero() = ccall((:mpfr_divby0_p, libmpfr), Cint, ()) != 0
-had_nan() = ccall((:mpfr_nanflag_p, libmpfr), Cint, ()) != 0
-had_inexact_exception() = ccall((:mpfr_inexflag_p, libmpfr), Cint, ()) != 0
 had_range_exception() = ccall((:mpfr_erangeflag_p, libmpfr), Cint, ()) != 0
 
 end #module

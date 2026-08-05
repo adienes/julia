@@ -180,13 +180,6 @@ JL_DLLEXPORT jl_genericmemory_t *jl_new_genericmemory(jl_value_t *mtype, jl_valu
     return jl_alloc_genericmemory(mtype, jl_unbox_long(nel));
 }
 
-JL_DLLEXPORT jl_genericmemory_t *jl_pchar_to_genericmemory(const char *str, size_t len) JL_CANSAFEPOINT
-{
-    jl_genericmemory_t *m = jl_alloc_genericmemory(jl_memory_uint8_type, len);
-    memcpy(m->ptr, str, len);
-    return m;
-}
-
 JL_DLLEXPORT jl_value_t *jl_genericmemory_to_string(jl_genericmemory_t *m, size_t len)
 {
     assert(len <= m->length);
