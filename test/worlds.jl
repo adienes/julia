@@ -127,8 +127,11 @@ schedule(wc265_41332d)
 @test wc265 + 9 == fetch(wc265_41332b)
 @test wc265 + 11 == fetch(wc265_41332c)
 @test wc265 + 9 == fetch(wc265_41332d)
-chnls, tasks = Base.channeled_tasks(2, wfunc)
-t265 = tasks[1]
+chnls = [Channel(0), Channel(0)]
+t265 = Task(() -> wfunc(chnls...))
+foreach(c -> bind(c, t265), chnls)
+schedule(t265)
+yield()
 
 wc265 = get_world_counter()
 @test put_n_take!(get_world_counter, ()) == wc265

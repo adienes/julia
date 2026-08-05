@@ -331,29 +331,3 @@ function target!(ref::GitReference, new_oid::GitHash; msg::AbstractString="")
              ref_ptr_ptr, ref, Ref(new_oid), isempty(msg) ? C_NULL : msg)
     return GitReference(ref.owner, ref_ptr_ptr[])
 end
-
-function GitBranchIter(repo::GitRepo, flags::Cint=Cint(Consts.BRANCH_LOCAL))
-    ensure_initialized()
-    bi_ptr = Ref{Ptr{Cvoid}}(C_NULL)
-    @check ccall((:git_branch_iterator_new, libgit2), Cint,
-                  (Ptr{Ptr{Cvoid}}, Ptr{Cvoid}, Cint), bi_ptr, repo, flags)
-    return GitBranchIter(repo, bi_ptr[])
-end
-
-function Base.iterate(bi::GitBranchIter, state=nothing)
-    ensure_initialized()
-    ref_ptr_ptr = Ref{Ptr{Cvoid}}(C_NULL)
-    btype = Ref{Cint}()
-    err = ccall((:git_branch_next, libgit2), Cint,
-                 (Ptr{Ptr{Cvoid}}, Ptr{Cint}, Ptr{Cvoid}),
-                  ref_ptr_ptr, btype, bi)
-    if err == Cint(Error.GIT_OK)
-        return ((GitReference(bi.owner, ref_ptr_ptr[]), btype[]), nothing)
-    elseif err == Cint(Error.ITEROVER)
-        return nothing
-    else
-        throw(GitError(err))
-    end
-end
-
-Base.IteratorSize(::Type{GitBranchIter}) = Base.SizeUnknown()

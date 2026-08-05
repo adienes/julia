@@ -422,9 +422,6 @@ _promote_tuple_shape(a) = a
 # types skip these methods and fall back to the generic trait defaults (they
 # used to raise a TypeError from `_counttuple`)
 eltype(::Type{Zip{Is}}) where {N, Is<:Tuple{Vararg{Any, N}}} = TupleOrBottom(ntuple(n -> eltype(fieldtype(Is, n)), N)...)
-#eltype(::Type{Zip{Tuple{}}}) = Tuple{}
-#eltype(::Type{Zip{Tuple{A}}}) where {A} = Tuple{eltype(A)}
-#eltype(::Type{Zip{Tuple{A, B}}}) where {A, B} = Tuple{eltype(A), eltype(B)}
 
 @inline isdone(z::Zip) = _zip_any_isdone(z.is, Base.map(_ -> (), z.is))
 @inline isdone(z::Zip, ss) = _zip_any_isdone(z.is, Base.map(tuple, ss))

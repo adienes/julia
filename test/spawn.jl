@@ -737,7 +737,7 @@ end
 
 # uid/gid - exercise code path with current effective ids (doesn't test privilege change)
 if !Sys.iswindows()
-    @test success(setuid(setgid(`$(Base.julia_cmd()) -e "exit(0)"`, Libc.getegid()), Libc.geteuid()))
+    @test success(setuid(setgid(`$(Base.julia_cmd()) -e "exit(0)"`, ccall(:getegid, Culong, ())), Libc.geteuid()))
     # test show method for uid/gid
     cmd_gid = setgid(`echo test`, 1000)
     @test string(cmd_gid) == "setgid(`echo test`, 1000)"

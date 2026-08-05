@@ -3809,20 +3809,6 @@ f(x) = yt(x)
                 (call (core _typebody!) ,s (call (core svec) ,@types))
                 (return (null)))))))))
 
-;; better versions of above, but they get handled wrong in many places
-;; need to fix that in order to handle #265 fully (and use the definitions)
-
-;; template for generating a closure type with parameters
-;(define (type-for-closure-parameterized name P names fields types super)
-;  (let ((n (length P)))
-;        `((global ,name)
-;          (const ,name)
-;          ,@(map (lambda (p n) `(= ,p (call (core TypeVar) ',n (core Any)))) P names)
-;          (struct_type ,name (call (core svec) ,@P)
-;                       (call (core svec) ,@(map quotify fields))
-;                       ,super
-;                       (call (core svec) ,@types) (false) ,(length fields)))))
-
 ;; ... and without parameters
 ;(define (type-for-closure name fields super)
 ;  `((global ,name)
@@ -5770,8 +5756,3 @@ f(x) = yt(x)
                    ;   AST traversal being in program order.
                    (error (string (cadr e) (format-loc *current-desugar-loc*))))
                    (raise e)))))
-
-(define (julia-lower ex (file 'none) (line 0))
-  (julia-lower1
-   (julia-lower0
-    (julia-expand-macroscope ex) `(line ,line ,file)) file line))

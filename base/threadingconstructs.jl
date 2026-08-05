@@ -145,22 +145,6 @@ function threadpoolsize(pool::Symbol = :default)
 end
 
 """
-    threadpooltids(pool::Symbol)
-
-Return a vector of IDs of threads in the given pool.
-"""
-function threadpooltids(pool::Symbol)
-    ni = _nthreads_in_pool(Int8(0))
-    if pool === :interactive
-        return collect(1:ni)
-    elseif pool === :default
-        return collect(ni+1:ni+_nthreads_in_pool(Int8(1)))
-    else
-        error("invalid threadpool specified")
-    end
-end
-
-"""
     Threads.ngcthreads()::Int
 
 Return the number of GC threads currently configured.

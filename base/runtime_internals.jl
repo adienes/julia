@@ -1342,12 +1342,6 @@ function _fieldindex(@nospecialize(t), name::Symbol, err::Bool)
     return idx
 end
 
-function argument_datatype(@nospecialize t)
-    @_total_meta
-    @noinline
-    return ccall(:jl_argument_datatype, Any, (Any,), t)::Union{Nothing,DataType}
-end
-
 function argument_datatypename(@nospecialize t)
     @_total_meta
     @noinline

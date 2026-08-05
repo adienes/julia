@@ -1245,7 +1245,6 @@ _setlowerer!(lowerer) = setglobal!(Core, :_lower, lowerer)
 
 # support for deprecated uses of builtin functions
 _apply(x...) = _apply_iterate(Main.Base.iterate, x...)
-const _apply_pure = _apply
 const _call_latest = invokelatest
 const _call_in_world = invoke_in_world
 

@@ -1935,12 +1935,9 @@ if Sys.iswindows()
 const ENABLE_PROCESSED_OUTPUT            = UInt32(0x0001)
 const ENABLE_WRAP_AT_EOL_OUTPUT          = UInt32(0x0002)
 const ENABLE_VIRTUAL_TERMINAL_PROCESSING = UInt32(0x0004)
-const DISABLE_NEWLINE_AUTO_RETURN        = UInt32(0x0008)
-const ENABLE_LVB_GRID_WORLDWIDE          = UInt32(0x0010)
 
 #= libuv flags =#
 const UV_TTY_SUPPORTED = 0
-const UV_TTY_UNSUPPORTED = 1
 
 function _reset_console_mode(handle::Ptr{Cvoid})
     # Query libuv to see whether it expects the console to support virtual terminal sequences

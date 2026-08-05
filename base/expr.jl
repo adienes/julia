@@ -1118,7 +1118,6 @@ function pushmeta!(ex::Expr, tag::Union{Symbol,Expr})
 end
 
 popmeta!(body, sym) = _getmeta(body, sym, true)
-peekmeta(body, sym) = _getmeta(body, sym, false)
 
 function _getmeta(body::Expr, sym::Symbol, delete::Bool)
     body.head === :block || return false, []
@@ -1799,8 +1798,6 @@ function isa_ast_node(@nospecialize x)
            x isa UpsilonNode ||
            x isa Expr
 end
-
-is_self_quoting(@nospecialize(x)) = !isa_ast_node(x)
 
 """
     quoted(x)

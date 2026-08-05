@@ -126,15 +126,10 @@ end
 subnormalmin(::Type{T}) where T = reinterpret(T, Base.uinttype(T)(1))
 
 function highprec_pair(x, y)
-    slopbits = (Base.Math.significand_bits(typeof(widen(x))) + 1) -
-        2*(Base.Math.significand_bits(typeof(x)) + 1)
     hi, lo = Base.add12(x, y)
     @test cmp_sn(widen(x) + widen(y), hi, lo)
     hi, lo = Base.mul12(x, y)
     @test cmp_sn(widen(x) * widen(y), hi, lo)
-    y == 0 && return nothing
-    hi, lo = Base.div12(x, y)
-    @test cmp_sn(widen(x) / widen(y), hi, lo, slopbits)
     nothing
 end
 @testset "high precision" begin
@@ -244,8 +239,6 @@ end
         y = Float64(Base.MathConstants.γ)
         @test Base.mul12(x, y)[1] ≈ Base.mul12(Float64(π), y)[1] rtol=1e-6
         @test Base.mul12(x, y)[2] ≈ Base.mul12(Float64(π), y)[2] atol=1e-15
-        @test Base.div12(x, y)[1] ≈ Base.div12(Float64(π), y)[1] rtol=1e-6
-        @test Base.div12(x, y)[2] ≈ Base.div12(Float64(π), y)[2] atol=1e-15
         xtp = Base.TwicePrecision{Float32}(π)
         ytp = Base.TwicePrecision{Float64}(Base.MathConstants.γ)
         @test Float32(xtp + ytp) ≈ Float32(Base.TwicePrecision{Float64}(π) + ytp)

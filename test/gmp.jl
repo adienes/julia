@@ -524,14 +524,6 @@ end
 end
 
 @testset "modular invert" begin
-    # test invert is correct and does not mutate
-    a = BigInt(3)
-    b = BigInt(7)
-    i = BigInt(5)
-    @test Base.GMP.MPZ.invert(a, b) == i
-    @test a == BigInt(3)
-    @test b == BigInt(7)
-
     # test in place invert does mutate first argument
     a = BigInt(3)
     b = BigInt(7)
@@ -762,16 +754,6 @@ t = Rational{BigInt}(0, 1)
 
         Base.GMP.MPQ.add!(a, b, c)
         @test b == bb
-
-        @test Base.GMP.MPQ.set_z!(a, BigInt(0)) == 0
-        @test iszero(a)
-        @test Base.GMP.MPQ.set_z!(a, BigInt(3)) == 3
-        @test a == BigInt(3)
-
-        @test Base.GMP.MPQ.set_ui(1, 2)      == 1//2
-        @test Base.GMP.MPQ.set_ui(0, 1)      == 0//1
-        @test Base.GMP.MPQ.set_ui!(a, 1, 2)  == 1//2
-        @test a == 1//2
 
         @test Base.GMP.MPQ.set_si(1, 2)      == 1//2
         @test Base.GMP.MPQ.set_si(-1, 2)     == -1//2

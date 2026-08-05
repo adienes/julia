@@ -206,11 +206,6 @@ baremodule ReinferUtils end
 include(ReinferUtils, "reinfer.jl")
 include(ReinferUtils, "bindinginvalidations.jl")
 
-macro __SOURCE_FILE__()
-    __source__.file === nothing && return nothing
-    return QuoteNode(__source__.file::Symbol)
-end
-
 module IRShow end # relies on string and IO operations defined in Base
 baremodule TrimVerifier using Core end # relies on IRShow, so define this afterwards
 

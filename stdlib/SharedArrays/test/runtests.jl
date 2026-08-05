@@ -12,6 +12,25 @@ addprocs_with_testenv(4; rr_allowed=false)
 
 @everywhere using Test, SharedArrays
 
+# local test helpers, formerly SharedArrays.shmem_*
+function shmem_fill(v, dims; kwargs...)
+    SharedArray{typeof(v),length(dims)}(dims; init = S->fill!(S.loc_subarr_1d, v), kwargs...)
+end
+shmem_fill(v, I::Int...; kwargs...) = shmem_fill(v, I; kwargs...)
+
+function shmem_rand(TR::Union{DataType, UnitRange}, dims; kwargs...)
+    if isa(TR, UnitRange)
+        SharedArray{Int,length(dims)}(dims; init = S -> map!(x -> rand(TR), S.loc_subarr_1d, S.loc_subarr_1d), kwargs...)
+    else
+        SharedArray{TR,length(dims)}(dims; init = S -> map!(x -> rand(TR), S.loc_subarr_1d, S.loc_subarr_1d), kwargs...)
+    end
+end
+shmem_rand(TR::Union{DataType, UnitRange}, i::Int; kwargs...) = shmem_rand(TR, (i,); kwargs...)
+shmem_rand(TR::Union{DataType, UnitRange}, I::Int...; kwargs...) = shmem_rand(TR, I; kwargs...)
+
+shmem_rand(dims; kwargs...) = shmem_rand(Float64, dims; kwargs...)
+shmem_rand(I::Int...; kwargs...) = shmem_rand(I; kwargs...)
+
 id_me = myid()
 id_others = filter(x -> x != id_me, procs())
 id_other = id_others[rand(1:(nprocs()-1))]
@@ -44,7 +63,7 @@ function check_pids_all(S::SharedArray)
     @test all(pidtested)
 end
 
-d = SharedArrays.shmem_rand(1:100, dims)
+d = shmem_rand(1:100, dims)
 a = convert(Array, d)
 
 partsums = Vector{Int}(undef, length(procs(d)))
@@ -57,7 +76,7 @@ partsums = Vector{Int}(undef, length(procs(d)))
 end
 @test sum(a) == sum(partsums)
 
-d = SharedArrays.shmem_rand(dims)
+d = shmem_rand(dims)
 for p in procs(d)
     idxes_in_p = remotecall_fetch(p, d) do D
         parentindices(D.loc_subarr_1d)[1]
@@ -73,14 +92,14 @@ for p in procs(d)
     @test d[idxl] == rv
 end
 
-@test fill(1., 10, 10, 10) == SharedArrays.shmem_fill(1.0, (10,10,10))
-@test zeros(Int32, 10, 10, 10) == SharedArrays.shmem_fill(0, (10,10,10))
+@test fill(1., 10, 10, 10) == shmem_fill(1.0, (10,10,10))
+@test zeros(Int32, 10, 10, 10) == shmem_fill(0, (10,10,10))
 
-d = SharedArrays.shmem_rand(dims)
-s = SharedArrays.shmem_rand(dims)
+d = shmem_rand(dims)
+s = shmem_rand(dims)
 copyto!(s, d)
 @test s == d
-s = SharedArrays.shmem_rand(dims)
+s = shmem_rand(dims)
 copyto!(s, sdata(d))
 @test s == d
 a = rand(Float64, dims)
@@ -174,9 +193,9 @@ S = @inferred(SharedArray{Int}(1,2,3))
 
 # reshape
 
-d = SharedArrays.shmem_fill(1.0, (10,10,10))
+d = shmem_fill(1.0, (10,10,10))
 @test fill(1., 100, 10) == reshape(d,(100,10))
-d = SharedArrays.shmem_fill(1.0, (10,10,10))
+d = shmem_fill(1.0, (10,10,10))
 @test_throws DimensionMismatch reshape(d,(50,))
 # issue #40249, reshaping on another process
 let m = SharedArray{ComplexF64}(10, 20, 30)
@@ -186,18 +205,18 @@ let m = SharedArray{ComplexF64}(10, 20, 30)
 end
 
 # rand, randn
-d = SharedArrays.shmem_rand(dims)
+d = shmem_rand(dims)
 @test size(rand!(d)) == dims
-d = SharedArrays.shmem_fill(1.0, dims)
+d = shmem_fill(1.0, dims)
 @test size(randn!(d)) == dims
 
 # similar
-d = SharedArrays.shmem_rand(dims)
+d = shmem_rand(dims)
 @test size(similar(d, ComplexF64)) == dims
 @test size(similar(d, dims)) == dims
 
 # issue #6362
-d = SharedArrays.shmem_rand(dims)
+d = shmem_rand(dims)
 s = copy(sdata(d))
 ds = deepcopy(d)
 @test ds == d
@@ -242,8 +261,8 @@ map!(x->1, d, d)
 @test d[1,:] == fill(2, 10)
 
 # Boundary cases where length(S) <= length(pids)
-@test 2.0 == remotecall_fetch(D->D[2], id_other, SharedArrays.shmem_fill(2.0, 2; pids=[id_me, id_other]))
-@test 3.0 == remotecall_fetch(D->D[1], id_other, SharedArrays.shmem_fill(3.0, 1; pids=[id_me, id_other]))
+@test 2.0 == remotecall_fetch(D->D[2], id_other, shmem_fill(2.0, 2; pids=[id_me, id_other]))
+@test 3.0 == remotecall_fetch(D->D[1], id_other, shmem_fill(3.0, 1; pids=[id_me, id_other]))
 
 # Shared arrays of singleton immutables
 @everywhere struct ShmemFoo end

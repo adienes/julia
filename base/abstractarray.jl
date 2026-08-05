@@ -615,27 +615,6 @@ function isstored(A::AbstractArray{<:Any,N}, I::Vararg{Integer,N}) where {N}
     return true
 end
 
-# used to compute "end" for last index
-function trailingsize(A, n)
-    s = 1
-    for i=n:ndims(A)
-        s *= size(A,i)
-    end
-    return s
-end
-function trailingsize(inds::Indices, n)
-    s = 1
-    for i=n:length(inds)
-        s *= length(inds[i])
-    end
-    return s
-end
-# This version is type-stable even if inds is heterogeneous
-function trailingsize(inds::Indices)
-    @inline
-    prod(map(length, inds))
-end
-
 ## Bounds checking ##
 
 # The overall hierarchy is
@@ -1457,12 +1436,6 @@ function setindex!(A::AbstractArray, v, I...)
     error_if_canonical_setindex(IndexStyle(A), A, I...)
     _setindex!(IndexStyle(A), A, v, to_indices(A, I)...)
 end
-function unsafe_setindex!(A::AbstractArray, v, I...)
-    @inline
-    @inbounds r = setindex!(A, v, I...)
-    r
-end
-
 error_if_canonical_setindex(::IndexLinear, A::AbstractArray, ::Int) =
     throw(CanonicalIndexError("setindex!", typeof(A)))
 error_if_canonical_setindex(::IndexCartesian, A::AbstractArray{T,N}, ::Vararg{Int,N}) where {T,N} =

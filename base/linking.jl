@@ -115,19 +115,6 @@ function ld()
     `$(lld()) -flavor $flavor $default_args`
 end
 
-const WHOLE_ARCHIVE = if Sys.isapple()
-    "-all_load"
-else
-    "--whole-archive"
-end
-
-const NO_WHOLE_ARCHIVE = if Sys.isapple()
-    ""
-else
-    "--no-whole-archive"
-end
-
-# Prefer whole_archive to WHOLE_ARCHIVE
 whole_archive(paths::String; is_cc=false) = whole_archive([paths]; is_cc)
 function whole_archive(paths::Vector{String}; is_cc=false)
     cc_arg(a) = is_cc ? "-Wl,$a" : a

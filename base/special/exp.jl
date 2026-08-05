@@ -104,7 +104,6 @@ end
 # This only gains 8 bits since the least significant 4 bits of the exponent
 # of the small part are not the same for all table entries
 const JU_MASK = typemax(UInt64)>>12
-const JL_MASK = typemax(UInt64)>>8
 const JU_CONST = 0x3FF0000000000000
 const JL_CONST = 0x3C00000000000000
 

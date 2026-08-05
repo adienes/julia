@@ -333,32 +333,6 @@ function bind(c::Channel, task::Task)
     return c
 end
 
-"""
-    channeled_tasks(n::Int, funcs...; ctypes=fill(Any,n), csizes=fill(0,n))
-
-A convenience method to create `n` channels and bind them to tasks started
-from the provided functions in a single call. Each `func` must accept `n` arguments
-which are the created channels. Channel types and sizes may be specified via
-keyword arguments `ctypes` and `csizes` respectively. If unspecified, all channels are
-of type `Channel{Any}(0)`.
-
-Returns a tuple, `(Array{Channel}, Array{Task})`, of the created channels and tasks.
-"""
-function channeled_tasks(n::Int, funcs...; ctypes=fill(Any,n), csizes=fill(0,n))
-    @assert length(csizes) == n "length(csizes) != n"
-    @assert length(ctypes) == n "length(ctypes) != n"
-
-    chnls = map(i -> Channel{ctypes[i]}(csizes[i]), 1:n)
-    tasks = Task[ Task(() -> f(chnls...)) for f in funcs ]
-
-    # bind all tasks to all channels and schedule them
-    foreach(t -> foreach(c -> bind(c, t), chnls), tasks)
-    foreach(schedule, tasks)
-    yield() # Allow scheduled tasks to run
-
-    return (chnls, tasks)
-end
-
 function close_chnl_on_taskdone(t::Task, c::Channel)
     isopen(c) || return
     lock(c)

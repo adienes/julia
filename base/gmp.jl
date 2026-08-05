@@ -153,7 +153,6 @@ const bitcnt_t = Culong
 
 gmpz(op::Symbol) = Expr(:tuple, QuoteNode(Symbol(:__gmpz_, op)), GlobalRef(MPZ, :libgmp))
 
-init!(x::BigInt) = (ccall((:__gmpz_init, libgmp), Cvoid, (mpz_t,), x); x)
 init2!(x::BigInt, a) = (ccall((:__gmpz_init2, libgmp), Cvoid, (mpz_t, bitcnt_t), x, a); x)
 
 realloc2!(x, a) = (ccall((:__gmpz_realloc2, libgmp), Cvoid, (mpz_t, bitcnt_t), x, a); x)
@@ -164,7 +163,7 @@ sizeinbase(a::BigInt, b) = Int(ccall((:__gmpz_sizeinbase, libgmp), Csize_t, (mpz
 for (op, nbits) in (:add => :(BITS_PER_LIMB*(1 + max(abs(a.size), abs(b.size)))),
                     :sub => :(BITS_PER_LIMB*(1 + max(abs(a.size), abs(b.size)))),
                     :mul => 0, :fdiv_q => 0, :tdiv_q => 0, :cdiv_q => 0,
-                    :fdiv_r => 0, :tdiv_r => 0, :cdiv_r => 0,
+                    :fdiv_r => 0, :tdiv_r => 0,
                     :gcd => 0, :lcm => 0, :and => 0, :ior => 0, :xor => 0)
     op! = Symbol(op, :!)
     @eval begin
@@ -177,7 +176,6 @@ end
 invert!(x::BigInt, a::BigInt, b::BigInt) =
     ccall((:__gmpz_invert, libgmp), Cint, (mpz_t, mpz_t, mpz_t), x, a, b)
 invert!(x::BigInt, b::BigInt) = invert!(x, x, b)
-invert(a::BigInt, b::BigInt) = (ret=BigInt(); invert!(ret, a, b); ret)
 
 for op in (:add_ui, :sub_ui, :mul_ui, :mul_2exp, :fdiv_q_2exp, :pow_ui, :bin_ui)
     op! = Symbol(op, :!)
@@ -264,9 +262,6 @@ function export!(a::AbstractVector{T}, n::BigInt; order::Integer=-1, nails::Inte
     @assert count[] ≤ length(a) "count[] > length(a)"
     return a, Int(count[])
 end
-
-limbs_write!(x::BigInt, a) = ccall((:__gmpz_limbs_write, libgmp), Ptr{Limb}, (mpz_t, Clong), x, a)
-limbs_finish!(x::BigInt, a) = ccall((:__gmpz_limbs_finish, libgmp), Cvoid, (mpz_t, Clong), x, a)
 
 setbit!(x, a) = (ccall((:__gmpz_setbit, libgmp), Cvoid, (mpz_t, bitcnt_t), x, a); x)
 tstbit(a::BigInt, b) = ccall((:__gmpz_tstbit, libgmp), Cint, (mpz_t, bitcnt_t), a, b) % Bool
@@ -1007,27 +1002,21 @@ function Rational{BigInt}(num::BigInt, den::BigInt)
     return sync_rational!(xq)
 end
 
-# define set, set_ui, set_si, set_z, and their inplace versions
+# define set, set_si, and their inplace versions
 function set!(z::Rational{BigInt}, x::Rational{BigInt})
     zq = _MPQ(z)
     ccall((:__gmpq_set, libgmp), Cvoid, (mpq_t, mpq_t), zq, _MPQ(x))
     return sync_rational!(zq)
 end
 
-function set_z!(z::Rational{BigInt}, x::BigInt)
-    zq = _MPQ(z)
-    ccall((:__gmpq_set_z, libgmp), Cvoid, (mpq_t, MPZ.mpz_t), zq, x)
-    return sync_rational!(zq)
-end
-
-for (op, T) in ((:set, Rational{BigInt}), (:set_z, BigInt))
+for (op, T) in ((:set, Rational{BigInt}),)
     op! = Symbol(op, :!)
     @eval $op(a::$T) = $op!(unsafe_rational(BigInt(), BigInt()), a)
 end
 
-# note that rationals returned from set_ui and set_si are not checked,
-# set_ui(0, 0) will return 0//0 without errors, just like unsafe_rational
-for (op, T1, T2) in ((:set_ui, Culong, Culong), (:set_si, Clong, Culong))
+# note that rationals returned from set_si are not checked,
+# set_si(0, 0) will return 0//0 without errors, just like unsafe_rational
+for (op, T1, T2) in ((:set_si, Clong, Culong),)
     op! = Symbol(op, :!)
     @eval begin
         function $op!(z::Rational{BigInt}, a, b)

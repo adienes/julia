@@ -508,16 +508,6 @@ JL_DLLEXPORT jl_nullable_float64_t jl_try_substrtod(char *str, size_t offset, si
     return ret;
 }
 
-JL_DLLEXPORT int jl_substrtod(char *str, size_t offset, size_t len, double *out)
-{
-    jl_nullable_float64_t nd = jl_try_substrtod(str, offset, len);
-    if (0 != nd.hasvalue) {
-        *out = nd.value;
-        return 0;
-    }
-    return 1;
-}
-
 // MSVC pre-2013 did not define HUGE_VALF
 #ifndef HUGE_VALF
 #define HUGE_VALF (1e25f * 1e25f)
@@ -569,16 +559,6 @@ JL_DLLEXPORT jl_nullable_float32_t jl_try_substrtof(char *str, size_t offset, si
 
     jl_nullable_float32_t ret = {(uint8_t)hasvalue, out};
     return ret;
-}
-
-JL_DLLEXPORT int jl_substrtof(char *str, int offset, size_t len, float *out)
-{
-    jl_nullable_float32_t nf = jl_try_substrtof(str, offset, len);
-    if (0 != nf.hasvalue) {
-        *out = nf.value;
-        return 0;
-    }
-    return 1;
 }
 
 // showing --------------------------------------------------------------------

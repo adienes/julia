@@ -389,12 +389,6 @@ See also [`sinh`](@ref), [`asin`](@ref).
 """
 asinh(x::Number)
 
-
-# utility for converting NaN return to DomainError
-# the branch in nan_dom_err prevents its callers from inlining, so be sure to force it
-# until the heuristics can be improved
-@inline nan_dom_err(out, x) = isnan(out) & !isnan(x) ? throw(DomainError(x, "NaN result for non-NaN input.")) : out
-
 # functions that return NaN on non-NaN argument for domain error
 """
     sin(x::T) where {T <: Number} -> float(T)

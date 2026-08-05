@@ -295,88 +295,6 @@ end
 peel(obj::GitObject) = peel(GitObject, obj)
 
 """
-    LibGit2.GitDescribeResult(committish::GitObject; kwarg...)
-
-Produce a `GitDescribeResult` of the `committish` `GitObject`, which
-contains detailed information about it based on the keyword argument:
-
-  * `options::DescribeOptions=DescribeOptions()`
-
-A git description of a `committish` object looks for the tag (by default, annotated,
-although a search of all tags can be performed) which can be reached from `committish`
-which is most recent. If the tag is pointing to `committish`, then only the tag is
-included in the description. Otherwise, a suffix is included which contains the
-number of commits between `committish` and the most recent tag. If there is no such
-tag, the default behavior is for the description to fail, although this can be
-changed through `options`.
-
-Equivalent to `git describe <committish>`. See [`DescribeOptions`](@ref) for more
-information.
-"""
-function GitDescribeResult(committish::GitObject;
-                           options::DescribeOptions=DescribeOptions())
-    ensure_initialized()
-    result_ptr_ptr = Ref{Ptr{Cvoid}}(C_NULL)
-    @check ccall((:git_describe_commit, libgit2), Cint,
-                 (Ptr{Ptr{Cvoid}}, Ptr{Cvoid}, Ptr{DescribeOptions}),
-                 result_ptr_ptr, committish, Ref(options))
-    return GitDescribeResult(committish.owner, result_ptr_ptr[])
-end
-
-"""
-    LibGit2.GitDescribeResult(repo::GitRepo; kwarg...)
-
-Produce a `GitDescribeResult` of the repository `repo`'s working directory.
-The `GitDescribeResult` contains detailed information about the workdir based
-on the keyword argument:
-
-  * `options::DescribeOptions=DescribeOptions()`
-
-In this case, the description is run on HEAD, producing the most recent tag
-which is an ancestor of HEAD. Afterwards, a status check on
-the [`workdir`](@ref) is performed and if the `workdir` is dirty
-(see [`isdirty`](@ref)) the description is also considered dirty.
-
-Equivalent to `git describe`. See [`DescribeOptions`](@ref) for more
-information.
-"""
-function GitDescribeResult(repo::GitRepo; options::DescribeOptions=DescribeOptions())
-    ensure_initialized()
-    result_ptr_ptr = Ref{Ptr{Cvoid}}(C_NULL)
-    @assert repo.ptr != C_NULL
-    @check ccall((:git_describe_workdir, libgit2), Cint,
-                 (Ptr{Ptr{Cvoid}}, Ptr{Cvoid}, Ptr{DescribeOptions}),
-                 result_ptr_ptr, repo, Ref(options))
-    return GitDescribeResult(repo, result_ptr_ptr[])
-end
-
-"""
-    LibGit2.format(result::GitDescribeResult; kwarg...)::String
-
-Produce a formatted string based on a `GitDescribeResult`.
-Formatting options are controlled by the keyword argument:
-
-  * `options::DescribeFormatOptions=DescribeFormatOptions()`
-"""
-function format(result::GitDescribeResult; options::DescribeFormatOptions=DescribeFormatOptions())
-    ensure_initialized()
-    buf_ref = Ref(Buffer())
-    @check ccall((:git_describe_format, libgit2), Cint,
-                 (Ptr{Buffer}, Ptr{Cvoid}, Ptr{DescribeFormatOptions}),
-                 buf_ref, result, Ref(options))
-    buf = buf_ref[]
-    str = unsafe_string(buf.ptr, buf.size)
-    free(buf_ref)
-    return str
-end
-
-function Base.show(io::IO, result::GitDescribeResult)
-    fmt_desc = format(result)
-    println(io, "GitDescribeResult:")
-    println(io, fmt_desc)
-end
-
-"""
     checkout_tree(repo::GitRepo, obj::GitObject; options::CheckoutOptions = CheckoutOptions())
 
 Update the working tree and index of `repo` to match the tree pointed to by `obj`.
@@ -426,25 +344,6 @@ function checkout_head(repo::GitRepo; options::CheckoutOptions = CheckoutOptions
     @check ccall((:git_checkout_head, libgit2), Cint,
                  (Ptr{Cvoid}, Ptr{CheckoutOptions}),
                  repo, Ref(options))
-end
-
-"""
-    LibGit2.cherrypick(repo::GitRepo, commit::GitCommit; options::CherrypickOptions = CherrypickOptions())
-
-Cherrypick the commit `commit` and apply the changes in it to the current state of `repo`.
-The keyword argument `options` sets checkout and merge options for the cherrypick.
-
-!!! note
-    `cherrypick` will *apply* the changes in `commit` but not *commit* them, so `repo` will
-    be left in a dirty state. If you want to also commit the changes in `commit` you must
-    call [`commit`](@ref) yourself.
-"""
-function cherrypick(repo::GitRepo, commit::GitCommit; options::CherrypickOptions = CherrypickOptions())
-    ensure_initialized()
-    @assert repo.ptr != C_NULL
-    @check ccall((:git_cherrypick, libgit2), Cint,
-                 (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{CherrypickOptions}),
-                 repo, commit, Ref(options))
 end
 
 """Updates some entries, determined by the `pathspecs`, in the index from the target commit tree."""

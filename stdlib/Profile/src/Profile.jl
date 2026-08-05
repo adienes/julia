@@ -306,7 +306,7 @@ function print(io::IO,
         # partition the data per group in one pass, rather than rescanning the
         # whole buffer for every group
         blocks = collect_blocks(data)
-        # reverse-appearance order for tasks, matching `get_task_ids`, sorted for threads
+        # reverse-appearance order for tasks, sorted for threads
         taskids_of(bs) = unique(b[2] for b in Iterators.reverse(bs))
         threadids_of(bs) = sort!(unique(b[1] for b in bs))
         if groupby == [:task, :thread]
@@ -464,32 +464,6 @@ function group_data(data::Vector{T}, blocks::Vector{ProfileBlock}, pred::F) wher
         pos += length(r)
     end
     return out
-end
-
-function get_task_ids(data::Vector{<:Unsigned}, threadid = nothing)
-    taskids = UInt[]
-    for i in length(data):-1:1
-        if is_block_end(data, i)
-            if isnothing(threadid) || data[i - META_OFFSET_THREADID] == threadid
-                taskid = data[i - META_OFFSET_TASKID]
-                !in(taskid, taskids) && push!(taskids, taskid)
-            end
-        end
-    end
-    return taskids
-end
-
-function get_thread_ids(data::Vector{<:Unsigned}, taskid = nothing)
-    threadids = Int[]
-    for i in length(data):-1:1
-        if is_block_end(data, i)
-            if isnothing(taskid) || data[i - META_OFFSET_TASKID] == taskid
-                threadid = data[i - META_OFFSET_THREADID]
-                !in(threadid, threadids) && push!(threadids, threadid)
-            end
-        end
-    end
-    return sort(threadids)
 end
 
 function is_block_end(data, i)

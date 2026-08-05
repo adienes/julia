@@ -18,12 +18,6 @@
 extern "C" {
 #endif
 
-// Useful function in debugger to find page metadata.
-JL_DLLEXPORT jl_gc_pagemeta_t *jl_gc_page_metadata(void *data)
-{
-    return page_metadata(data);
-}
-
 // Find the memory block in the pool that owns the byte pointed to by p.
 // For end of object pointer (which is always the case for pointer to a
 // singleton object), this usually returns the same pointer which points to

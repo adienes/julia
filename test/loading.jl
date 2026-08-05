@@ -70,7 +70,6 @@ end
 ## Unit tests for safe file operations ##
 
 @test Base.isaccessiblefile("/root/path/doesn't/exist") == false
-@test Base.isaccessiblepath("/root/path/doesn't/exist") == false
 @test Base.isaccessibledir("/root/path/doesn't/exist") == false
 
 # Issue #5789 and PR #13542:

@@ -1189,10 +1189,6 @@ end
 
 ## Background lifecycle
 
-function is_precompiling_in_background()
-    @lock BG (BG.task !== nothing && !istaskdone(BG.task))
-end
-
 # Check if `pkg` is currently being precompiled by a background task.
 # This should be called while holding require_lock to avoid races.
 # Returns true if the package is pending.

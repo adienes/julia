@@ -847,17 +847,6 @@ function _lift_one_interp_helper(expr::Expr, in_quote_context::Bool, escs::Int, 
     expr
 end
 
-
-# add a wait-able object to the sync pool
-macro sync_add(expr)
-    var = esc(sync_varname)
-    quote
-        local ref = $(esc(expr))
-        put!($var, ref)
-        ref
-    end
-end
-
 function repl_backend_task()
     @isdefined(active_repl_backend) || return
     backend = active_repl_backend
@@ -1332,12 +1321,6 @@ function wait()
     end
     set_next_task(task)
     return try_yieldto(ensure_rescheduled)
-end
-
-if Sys.iswindows()
-    pause() = ccall(:Sleep, stdcall, Cvoid, (UInt32,), 0xffffffff)
-else
-    pause() = ccall(:pause, Cvoid, ())
 end
 
 # update the `running_time_ns` field of `t` to include the time since it last started running.

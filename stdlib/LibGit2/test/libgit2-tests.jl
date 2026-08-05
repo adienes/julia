@@ -123,11 +123,6 @@ end
     end
 end
 
-@testset "Trace" begin
-    code = "import LibGit2; LibGit2.trace_set(LibGit2.Consts.TRACE_DEBUG); exit(LibGit2.trace_set(0))"
-    run(`$(Base.julia_cmd()) --startup-file=no -e $code`)
-end
-
 # See #21872 and #21636
 LibGit2.version() >= v"0.26.0" && Sys.isunix() && @testset "Default config with symlink" begin
     with_libgit2_temp_home() do tmphome
@@ -935,9 +930,6 @@ mktempdir() do dir
                     @test err isa LibGit2.Error.GitError
                     @test err.code == LibGit2.Error.EINVALIDSPEC
                 end
-                branches = map(b->LibGit2.shortname(b[1]), LibGit2.GitBranchIter(repo))
-                @test default_branch in branches
-                @test test_branch in branches
             end
         end
 
@@ -1002,16 +994,6 @@ mktempdir() do dir
                 @test length(tags) == 1
                 @test tag2 ∈ tags
                 @test tag1 ∉ tags
-
-                # test git describe functions applied to these GitTags
-                description = LibGit2.GitDescribeResult(repo)
-                fmtted_description = LibGit2.format(description)
-                @test sprint(show, description) == "GitDescribeResult:\n$fmtted_description\n"
-                @test fmtted_description == "tag2"
-                description = LibGit2.GitDescribeResult(LibGit2.GitObject(repo, "HEAD"))
-                fmtted_description = LibGit2.format(description)
-                @test sprint(show, description) == "GitDescribeResult:\n$fmtted_description\n"
-                @test fmtted_description == "tag2"
             end
         end
 
@@ -1205,15 +1187,6 @@ mktempdir() do dir
             LibGit2.with(LibGit2.GitRepo(cache_repo)) do repo
                 diff_str = "diff --git a/test.txt b/test.txt\nindex 0000000..1111111 100644\n"
                 @test_throws LibGit2.GitError LibGit2.GitDiff(diff_str)
-
-                tree1 = LibGit2.GitTree(repo, "HEAD~1^{tree}")
-                tree2 = LibGit2.GitTree(repo, "HEAD^{tree}")
-                diff = LibGit2.diff_tree(repo, tree1, tree2)
-                idx = LibGit2.apply_to_tree(repo, tree1, diff)
-                @test idx isa LibGit2.GitIndex
-                oid = LibGit2.write_tree_to!(repo, idx)
-                @test oid isa LibGit2.GitHash
-                close(idx)
             end
         end
     end
@@ -1291,24 +1264,6 @@ mktempdir() do dir
             upst_ann = LibGit2.GitAnnotated(repo, fh[1])
             @test LibGit2.merge!(repo, [upst_ann], true)
             @test LibGit2.is_ancestor_of(string(oldhead), string(LibGit2.head_oid(repo)), repo)
-        end
-    end
-
-    @testset "Cherrypick" begin
-        LibGit2.with(setup_clone_repo(cache_repo, joinpath(dir, "Example.Cherrypick"))) do repo
-            # Create a commit on the new branch and cherry-pick it over to
-            # master. Since the cherry-pick does *not* make a new commit on
-            # master, we have to create our own commit of the dirty state.
-            oldhead = LibGit2.head_oid(repo)
-            LibGit2.branch!(repo, "branch/cherry_a")
-            cmt_oid = add_and_commit_file(repo, "file1", "111\n")
-            cmt = LibGit2.GitCommit(repo, cmt_oid)
-            # switch back, try to cherrypick
-            # from branch/cherry_a
-            LibGit2.branch!(repo, "master")
-            LibGit2.cherrypick(repo, cmt, options=LibGit2.CherrypickOptions())
-            cmt_oid2 = LibGit2.commit(repo, "add file1")
-            @test isempty(LibGit2.diff_files(repo, "master", "branch/cherry_a"))
         end
     end
 
@@ -1467,11 +1422,6 @@ mktempdir() do dir
                 tags = LibGit2.tag_list(repo)
                 @test length(tags) == 1
                 @test tag2 in tags
-
-                # all tag in place
-                branches = map(b->LibGit2.shortname(b[1]), LibGit2.GitBranchIter(repo))
-                @test default_branch in branches
-                @test test_branch in branches
 
                 # issue #16337
                 LibGit2.with(LibGit2.GitReference(repo, "refs/tags/$tag2")) do tag2ref

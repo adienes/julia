@@ -167,11 +167,6 @@ function correct_rounding_requires_increment(x, rounding_mode, sign_bit::Bool)
     end::Bool
 end
 
-to_fenv(::RoundingMode{:Nearest}) = JL_FE_TONEAREST
-to_fenv(::RoundingMode{:ToZero}) = JL_FE_TOWARDZERO
-to_fenv(::RoundingMode{:Up}) = JL_FE_UPWARD
-to_fenv(::RoundingMode{:Down}) = JL_FE_DOWNWARD
-
 function from_fenv(r::Integer)
     if r == JL_FE_TONEAREST
         return RoundNearest

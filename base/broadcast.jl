@@ -96,8 +96,6 @@ When there are multiple inputs to `broadcast`, `DefaultArrayStyle` "loses" to an
 struct DefaultArrayStyle{N} <: AbstractArrayStyle{N} end
 DefaultArrayStyle(::Val{N}) where N = DefaultArrayStyle{N}()
 DefaultArrayStyle{M}(::Val{N}) where {N,M} = DefaultArrayStyle{N}()
-const DefaultVectorStyle = DefaultArrayStyle{1}
-const DefaultMatrixStyle = DefaultArrayStyle{2}
 BroadcastStyle(::Type{<:AbstractArray{T,N}}) where {T,N} = DefaultArrayStyle{N}()
 BroadcastStyle(::Type{T}) where {T} = DefaultArrayStyle{ndims(T)}()
 
@@ -747,7 +745,6 @@ eltypes(::Tuple{}) = Tuple{}
 eltypes(t::Tuple{Any}) = Iterators.TupleOrBottom(_broadcast_getindex_eltype(t[1]))
 eltypes(t::Tuple{Any,Any}) = Iterators.TupleOrBottom(_broadcast_getindex_eltype(t[1]), _broadcast_getindex_eltype(t[2]))
 eltypes(t::Tuple) = (TT = eltypes(tail(t)); TT === Union{} ? Union{} : Iterators.TupleOrBottom(_broadcast_getindex_eltype(t[1]), TT.parameters...))
-# eltypes(t::Tuple) = Iterators.TupleOrBottom(ntuple(i -> _broadcast_getindex_eltype(t[i]), Val(length(t)))...)
 
 # Inferred eltype of result of broadcast(f, args...)
 function combine_eltypes(f, args::Tuple)
@@ -921,8 +918,6 @@ end
 @inline copy(bc::Broadcasted{<:AbstractArrayStyle{0}}) = bc[CartesianIndex()]
 copy(bc::Broadcasted{<:Union{Nothing,Unknown}}) =
     throw(ArgumentError("broadcasting requires an assigned BroadcastStyle"))
-
-const NonleafHandlingStyles = Union{DefaultArrayStyle,ArrayConflict}
 
 @inline function copy(bc::Broadcasted)
     ElType = combine_eltypes(bc.f, bc.args)
@@ -1191,7 +1186,6 @@ broadcasted(::DefaultArrayStyle{1}, ::typeof(*), r::LinRange, x::Number) = LinRa
 broadcasted(::DefaultArrayStyle{1}, ::typeof(*), r::OrdinalRange, x::AbstractFloat) =
     Base.range_start_step_length(first(r)*x, step(r)*x, length(r))
 
-#broadcasted(::DefaultArrayStyle{1}, ::typeof(/), r::AbstractRange, x::Number) = range(first(r)/x, last(r)/x, length=length(r))
 broadcasted(::DefaultArrayStyle{1}, ::typeof(/), r::AbstractRange, x::Number) = range(first(r)/x, step=step(r)/x, length=length(r))
 broadcasted(::DefaultArrayStyle{1}, ::typeof(/), r::StepRangeLen{T}, x::Number) where {T} =
     StepRangeLen{typeof(T(r.ref)/x)}(r.ref/x, r.step/x, length(r), r.offset)

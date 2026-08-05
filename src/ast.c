@@ -355,30 +355,6 @@ void jl_lisp_prompt(void)
     jl_ast_ctx_leave(ctx);
 }
 
-JL_DLLEXPORT void fl_show_profile(void) JL_CANSAFEPOINT
-{
-    jl_ast_context_t *ctx = jl_ast_ctx_enter(NULL);
-    fl_context_t *fl_ctx = &ctx->fl;
-    fl_applyn(fl_ctx, 0, symbol_value(symbol(fl_ctx, "show-profiles")));
-    jl_ast_ctx_leave(ctx);
-}
-
-JL_DLLEXPORT void fl_clear_profile(void) JL_CANSAFEPOINT
-{
-    jl_ast_context_t *ctx = jl_ast_ctx_enter(NULL);
-    fl_context_t *fl_ctx = &ctx->fl;
-    fl_applyn(fl_ctx, 0, symbol_value(symbol(fl_ctx, "clear-profiles")));
-    jl_ast_ctx_leave(ctx);
-}
-
-JL_DLLEXPORT void fl_profile(const char *fname) JL_CANSAFEPOINT
-{
-    jl_ast_context_t *ctx = jl_ast_ctx_enter(NULL);
-    fl_context_t *fl_ctx = &ctx->fl;
-    fl_applyn(fl_ctx, 1, symbol_value(symbol(fl_ctx, "profile-e")), symbol(fl_ctx, fname));
-    jl_ast_ctx_leave(ctx);
-}
-
 static jl_value_t *scm_to_julia(fl_context_t *fl_ctx, value_t e, jl_module_t *mod) JL_CANSAFEPOINT
 {
     jl_value_t *v = NULL;

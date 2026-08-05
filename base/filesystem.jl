@@ -50,11 +50,9 @@ const S_IFREG  = 0o100000  # regular file
 const S_IFIFO  = 0o010000  # fifo (named pipe)
 const S_IFLNK  = 0o120000  # symbolic link
 const S_IFSOCK = 0o140000  # socket file
-const S_IFMT   = 0o170000
 
 const S_ISUID = 0o4000  # set UID bit
 const S_ISGID = 0o2000  # set GID bit
-const S_ENFMT = S_ISGID # file locking enforcement
 const S_ISVTX = 0o1000  # sticky bit
 
 const S_IRUSR = 0o0400  # read by owner
@@ -164,9 +162,7 @@ include(string(Base.BUILDROOT, "file_constants.jl"))  # include($BUILDROOT/base/
 
 ## Operations with File (fd) objects ##
 
-abstract type AbstractFile <: IO end
-
-mutable struct File <: AbstractFile
+mutable struct File <: IO
     open::Bool
     handle::OS_HANDLE
     File(fd::OS_HANDLE) = new(true, fd)
@@ -214,22 +210,6 @@ function close(f::File)
 end
 
 closewrite(f::File) = nothing
-
-# sendfile is the most efficient way to copy from a file descriptor
-function sendfile(dst::File, src::File, src_offset::Int64, bytes::Int)
-    check_open(dst)
-    check_open(src)
-    while true
-        nsent = min(typemax(Cssize_t), bytes) # biggest allowed chunk
-        result = ccall(:jl_fs_sendfile, Int32, (OS_HANDLE, OS_HANDLE, Int64, Csize_t),
-                       src.handle, dst.handle, src_offset, nsent)
-        uv_error("sendfile", result)
-        bytes -= nsent
-        src_offset += nsent
-        bytes <= 0 && break
-    end
-    nothing
-end
 
 function unsafe_write(f::File, buf::Ptr{UInt8}, len::UInt, offset::Int64=Int64(-1))
     check_open(f)

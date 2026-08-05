@@ -23,8 +23,6 @@ const BitSignedSmall_types   = Int === Int64 ? ( Int8,  Int16,  Int32) : ( Int8,
 const BitUnsignedSmall_types = Int === Int64 ? (UInt8, UInt16, UInt32) : (UInt8, UInt16)
 const BitIntegerSmall_types  = (BitSignedSmall_types..., BitUnsignedSmall_types...)
 
-const BitSigned32      = Union{BitSigned32_types...}
-const BitUnsigned32    = Union{BitUnsigned32_types...}
 const BitInteger32     = Union{BitInteger32_types...}
 
 const BitSigned64      = Union{BitSigned64_types...}
@@ -38,9 +36,6 @@ const BitInteger       = Union{BitInteger_types...}
 const BitSignedSmall   = Union{BitSignedSmall_types...}
 const BitUnsignedSmall = Union{BitUnsignedSmall_types...}
 const BitIntegerSmall  = Union{BitIntegerSmall_types...}
-
-const BitSigned64T     = Union{Type{Int8}, Type{Int16}, Type{Int32}, Type{Int64}}
-const BitUnsigned64T   = Union{Type{UInt8}, Type{UInt16}, Type{UInt32}, Type{UInt64}}
 
 const BitIntegerType = Union{map(T->Type{T}, BitInteger_types)...}
 
@@ -94,7 +89,6 @@ signed(::Type{T}) where {T<:Signed} = T
 
 negate(x) = -x
 negate(x::Unsigned) = -convert(Signed, x)
-#widenegate(x) = -convert(widen(signed(typeof(x))), x)
 
 inv(x::Integer) = float(one(x)) / float(x)
 (/)(x::T, y::T) where {T<:Integer} = float(x) / float(y)
