@@ -275,7 +275,7 @@ Base.getindex(cache::InferenceCache, i::Int) = cache.results[i]
 
 # Get indices for a specific MethodInstance (returns empty vector if not found)
 function get_indices(cache::InferenceCache, mi::MethodInstance)
-    return get(cache.index, mi, Int[])
+    return get(Vector{Int}, cache.index, mi)
 end
 
 """
