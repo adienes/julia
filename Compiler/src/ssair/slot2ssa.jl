@@ -186,6 +186,14 @@ struct BlockLiveness
     live_in_bbs::Union{Vector{Int}, Nothing}
 end
 
+struct LivenessScratch
+    bb_defs::Vector{Int}
+    bb_uses::Vector{Int}
+    extra_liveins::BitSet
+    worklist::Vector{Int}
+end
+LivenessScratch() = LivenessScratch(Int[], Int[], BitSet(), Int[])
+
 struct IDFScratch
     heap::Vector{Tuple{Int, Int}}
     phiblocks::Vector{Int}
@@ -508,14 +516,25 @@ function domsort_ssa!(ir::IRCode, domtree::DomTree)
     return new_ir
 end
 
-compute_live_ins(cfg::CFG, slot::SlotInfo) = compute_live_ins(cfg, slot.defs, slot.uses)
+compute_live_ins(cfg::CFG, slot::SlotInfo) =
+    compute_live_ins(cfg, slot.defs, slot.uses, LivenessScratch())
+compute_live_ins(cfg::CFG, slot::SlotInfo, scratch::LivenessScratch) =
+    compute_live_ins(cfg, slot.defs, slot.uses, scratch)
 
-function compute_live_ins(cfg::CFG, defs::Vector{Int}, uses::Vector{Int})
+compute_live_ins(cfg::CFG, defs::Vector{Int}, uses::Vector{Int}) =
+    compute_live_ins(cfg, defs, uses, LivenessScratch())
+
+# The returned vectors borrow `scratch` and are valid only until its next use.
+function compute_live_ins(cfg::CFG, defs::Vector{Int}, uses::Vector{Int},
+                          scratch::LivenessScratch)
     # We remove from `uses` any block where all uses are dominated
     # by a def. This prevents insertion of dead phi nodes at the top
     # of such a block if that block happens to be in a loop
-    bb_defs = Int[] # blocks with a def
-    bb_uses = Int[] # blocks with a use that is not dominated by a def
+    (; bb_defs, bb_uses, extra_liveins, worklist) = scratch
+    empty!(bb_defs) # blocks with a def
+    empty!(bb_uses) # blocks with a use that is not dominated by a def
+    empty!(extra_liveins)
+    empty!(worklist)
 
     # We do a sorted joint iteration over the instructions listed
     # in defs and uses following a pattern similar to mergesort
@@ -533,8 +552,6 @@ function compute_live_ins(cfg::CFG, defs::Vector{Int}, uses::Vector{Int})
         last_block = block
     end
     # To obtain live ins from bb_uses, recursively add predecessors
-    extra_liveins = BitSet()
-    worklist = Int[]
     for bb in bb_uses
         append!(worklist, Iterators.filter(p->p != 0 && !(p in bb_defs), cfg.blocks[bb].preds))
     end
@@ -591,6 +608,7 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, sv::OptimizationState,
     for (; leave_block) in catch_entry_blocks
         new_phic_nodes[leave_block] = NewPhiCNode2[]
     end
+    liveness_scratch = nothing
     idf_scratch = nothing
     @zone "CC: IDF" for (idx, slot) in Iterators.enumerate(defuses)
         # No uses => no need for phi nodes
@@ -618,7 +636,9 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, sv::OptimizationState,
             continue
         end
 
-        @zone "CC: LIVENESS" (live = compute_live_ins(cfg, slot))
+        liveness_scratch === nothing && (liveness_scratch = LivenessScratch())
+        @zone "CC: LIVENESS" (live = compute_live_ins(
+            cfg, slot, liveness_scratch::LivenessScratch))
         for li in live.live_in_bbs
             push!(live_slots[li], idx)
             cidx = findfirst(x::TryCatchRegion->x.leave_block==li, catch_entry_blocks)
