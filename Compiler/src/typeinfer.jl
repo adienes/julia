@@ -872,24 +872,11 @@ function store_backedges(caller::CodeInstance, edges::SimpleVector)
     isa(get_ci_mi(caller).def, Method) || return # don't add backedges to toplevel method instance
 
     backedges = ForwardToBackedgeIterator(edges)
-    # `Compiler` is loaded before `Set` during bootstrap, so keep the signatures
-    # for each identity-keyed dependency in a small vector.
-    seen = IdDict{Any,Vector{Any}}()
+    # `Compiler` is loaded before `Set` during bootstrap. Store the first
+    # signature directly, and promote to a small vector only on a collision.
+    seen = IdDict{Any,Any}()
     for (invokesig, item) in backedges
-        if haskey(seen, item)
-            signatures = seen[item]
-            duplicate_found = false
-            for signature in signatures
-                if signature == invokesig
-                    duplicate_found = true
-                    break
-                end
-            end
-            duplicate_found && continue
-            push!(signatures, invokesig)
-        else
-            seen[item] = Any[invokesig]
-        end
+        record_invoke_edge!(seen, invokesig, item) || continue
         if item isa Core.Binding
             maybe_add_binding_backedge!(item, caller)
         elseif item isa MethodTable
