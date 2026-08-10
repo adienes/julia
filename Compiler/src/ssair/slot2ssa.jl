@@ -849,8 +849,11 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, sv::OptimizationState,
                 incoming_vals[i] = Pair{Any, Any}(stmt.val, idef)
             end
         end
+        firstsucc = true
         for succ in cfg.blocks[item].succs
-            push!(worklist, (succ, item, copy(incoming_vals)))
+            successor_vals = firstsucc ? incoming_vals : copy(incoming_vals)
+            firstsucc = false
+            push!(worklist, (succ, item, successor_vals))
         end
     end
     # Delete any instruction in unreachable blocks (except for terminators)
