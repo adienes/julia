@@ -213,12 +213,11 @@ const VarTable = Vector{VarState}
     BBEntryState
 
 Bundles the per-basic-block variable-type table ([`VarTable`](@ref)) and slot-alias table
-(`Vector{Int}`) into a single value. This ensures that both components are always present or
-absent together.
+into a single value. `aliases === nothing` represents an all-zero alias table.
 """
 struct BBEntryState
     vartable::VarTable
-    aliases::Vector{Int}
+    aliases::Union{Nothing,Vector{Int}}
 end
 
 struct StatementState
@@ -382,7 +381,7 @@ mutable struct InferenceState{I<:AbstractInterpreter}
         bb_saw_latestworld = Bool[false for _ = 1:length(cfg.blocks)]
         bb_vartable1 = VarTable(undef, nslots)
         bb_states = Union{Nothing,BBEntryState}[nothing for _ = 1:length(cfg.blocks)]
-        bb_states[1] = BBEntryState(bb_vartable1, zeros(Int, nslots))
+        bb_states[1] = BBEntryState(bb_vartable1, nothing)
         argtypes = result.argtypes
 
         argtypes = va_process_argtypes(typeinf_lattice(interp), argtypes, src.nargs, src.isva, mi)

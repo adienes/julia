@@ -266,12 +266,11 @@ function OptimizationState(mi::MethodInstance, src::CodeInfo, interp::AbstractIn
     inlining = InliningState(interp, opt_cache)
     cfg = compute_basic_blocks(src.code)
     unreachable = BitSet()
-    nbbstate = zeros(Int, nslots)
     bb_states = Union{BBEntryState,Nothing}[
         BBEntryState(VarState[
             VarState(slottypes[slot], typemin(Int), src.slotflags[slot] & SLOT_USEDUNDEF != 0)
             for slot = 1:nslots
-        ], nbbstate)
+        ], nothing)
         for _ = 1:length(cfg.blocks)]
     return OptimizationState(mi, src, nothing, stmt_info, mod, sptypes, slottypes, inlining, cfg, unreachable, bb_states, false)
 end

@@ -4604,6 +4604,15 @@ function intersect_alias_tables!(dest::Vector{Int}, src::Vector{Int})
     return changed
 end
 
+# Copy a nonempty alias table for storage at a basic-block entry. `nothing`
+# represents the common all-zero case without allocating a vector.
+function copy_slot_aliases(aliases::Vector{Int})
+    for alias in aliases
+        iszero(alias) || return copy(aliases)
+    end
+    return nothing
+end
+
 function update_bbstate!(
         𝕃ᵢ::AbstractLattice, vartable::VarTable, slot_aliases::Vector{Int}, bb::Int,
         saw_latestworld::Bool, frame::InferenceState
@@ -4613,14 +4622,17 @@ function update_bbstate!(
     if bbstate === nothing
         # if a basic block hasn't been analyzed yet,
         # we can update its state a bit more aggressively
-        frame.bb_states[bb] = BBEntryState(copy(vartable), copy(slot_aliases))
+        frame.bb_states[bb] = BBEntryState(copy(vartable), copy_slot_aliases(slot_aliases))
         return true
     else
         pc = first(frame.cfg.blocks[bb].stmts)
         # Minus sign marks this as a "virtual" PC so that it is
         # not confused with a real assignment at this PC.
         changed = stupdate!(𝕃ᵢ, bbstate.vartable, vartable, -pc)
-        changed |= intersect_alias_tables!(bbstate.aliases, slot_aliases)
+        aliases = bbstate.aliases
+        if aliases !== nothing
+            changed |= intersect_alias_tables!(aliases, slot_aliases)
+        end
         return changed
     end
 end
@@ -4768,7 +4780,7 @@ function typeinf_local(interp::AbstractInterpreter, frame::InferenceState, nextr
     end
     currstate = copy((states[currbb]::BBEntryState).vartable)
     currsaw_latestworld = saw_latestworld[currbb]
-    slot_aliases = copy((states[1]::BBEntryState).aliases)
+    slot_aliases = zeros(Int, length(currstate))
     while currbb <= nbbs
         delete!(W, currbb)
         bbstart = first(bbs[currbb].stmts)
@@ -5020,10 +5032,11 @@ end
 
 function init_slot_aliases!(slot_aliases::Vector{Int}, frame::InferenceState, bb::Int)
     entry = frame.bb_states[bb]
-    if entry !== nothing
-        copyto!(slot_aliases, entry.aliases)
-    else
+    aliases = entry === nothing ? nothing : entry.aliases
+    if aliases === nothing
         fill!(slot_aliases, 0)
+    else
+        copyto!(slot_aliases, aliases)
     end
 end
 
