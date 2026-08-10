@@ -556,13 +556,22 @@ function (::ComputeTryCatch{Handler})(code::Vector{Any}, bbs::Union{Vector{Basic
     # then we can find all `try`s by walking backwards from :enter statements,
     # and all `catch`es by looking at the statement after the :enter
     n = length(code)
+    first_enter = 0
+    for pc = 1:n
+        if isa(code[pc], EnterNode)
+            first_enter = pc
+            break
+        end
+    end
+    first_enter == 0 && return nothing
+
     ip = BitSet()
     ip.offset = 0 # for _bits_findnext
     push!(ip, n + 1)
     handler_info = nothing
 
     # start from all :enter statements and record the location of the try
-    for pc = 1:n
+    for pc = first_enter:n
         stmt = code[pc]
         if isa(stmt, EnterNode)
             (;handlers, handler_at) = handler_info =
