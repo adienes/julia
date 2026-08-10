@@ -109,13 +109,15 @@ mutable struct CallInferenceState
     all_effects::Effects
     conditionals::Union{Nothing,Tuple{Vector{Any},Vector{Any}}} # keeps refinement information of call argument types when the return type is boolean
     slotrefinements::Union{Nothing,Vector{Any}} # keeps refinement information on slot types obtained from call signature
+    gfresult::Union{Nothing,RefValue{CallMeta}} # assigned only if the initial pass suspends
 
     # some additional fields for untyped objects (just to avoid capturing)
     const func
     const matches::Union{MethodMatches,UnionSplitMethodMatches}
     function CallInferenceState(@nospecialize(func), matches::Union{MethodMatches,UnionSplitMethodMatches})
         return new(#=inferidx=#1, #=rettype=#Bottom, #=exctype=#Bottom, #=all_effects=#EFFECTS_TOTAL,
-            #=conditionals=#nothing, #=slotrefinements=#nothing, func, matches)
+            #=conditionals=#nothing, #=slotrefinements=#nothing, #=gfresult=#nothing,
+            func, matches)
     end
 end
 
@@ -164,8 +166,6 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         end
     end
 
-    # final result
-    gfresult = Future{CallMeta}()
     state = CallInferenceState(func, matches)
 
     # split the for loop off into a function, so that we can pause and restart it at will
@@ -362,11 +362,25 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
             infercalls2(interp, sv) || push!(sv.tasks, infercalls2)
         end
 
-        gfresult[] = CallMeta(state.rettype, state.exctype, state.all_effects, retinfo, state.slotrefinements)
+        local result = CallMeta(state.rettype, state.exctype, state.all_effects,
+            retinfo, state.slotrefinements)
+        local later = state.gfresult
+        if later === nothing
+            return result
+        end
+        @assert !isassigned(later)
+        later[] = result
         return true
     end # function infercalls
     # start making progress on the first call
-    infercalls(interp, sv) || push!(sv.tasks, infercalls)
+    result = infercalls(interp, sv)
+    result isa CallMeta && return Future(result)
+    @assert result === false
+
+    # Only a suspended call needs assign-once storage for its eventual result.
+    gfresult = Future{CallMeta}()
+    state.gfresult = something(gfresult.later)
+    push!(sv.tasks, infercalls)
     return gfresult
 end
 
