@@ -1435,7 +1435,8 @@ end
 function renumber_ssa2!(@nospecialize(stmt), ssanums::Vector{Any}, used_ssas::Vector{Int}, new_new_used_ssas::Vector{Int}, late_fixup::Vector{Int}, result_idx::Int, do_rename_ssa::Bool, mark_refined!::Union{Refiner, Nothing})
     urs = userefs(stmt)
     for op in urs
-        val = op[]
+        oldval = op[]
+        val = oldval
         if isa(val, OldSSAValue) || isa(val, NewSSAValue)
             push!(late_fixup, result_idx)
         end
@@ -1445,7 +1446,7 @@ function renumber_ssa2!(@nospecialize(stmt), ssanums::Vector{Any}, used_ssas::Ve
         if isa(val, OldSSAValue) || isa(val, NewSSAValue)
             push!(late_fixup, result_idx)
         end
-        op[] = val
+        val === oldval || (op[] = val)
     end
     return urs[]
 end
