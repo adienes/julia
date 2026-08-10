@@ -186,6 +186,15 @@ struct BlockLiveness
     live_in_bbs::Union{Vector{Int}, Nothing}
 end
 
+struct IDFScratch
+    heap::Vector{Tuple{Int, Int}}
+    phiblocks::Vector{Int}
+    processed::BitSet
+    visited::BitSet
+    worklist::Vector{Int}
+end
+IDFScratch() = IDFScratch(Tuple{Int, Int}[], Int[], BitSet(), BitSet(), Int[])
+
 """
     iterated_dominance_frontier(cfg::CFG, liveness::BlockLiveness, domtree::DomTree)
         -> phinodes::Vector{Int}
@@ -228,21 +237,29 @@ needs to make sure that we always visit `B` before `A`.
          Association for Computing Machinery, New York, NY, USA, 62–73.
          DOI: <https://doi.org/10.1145/199448.199464>.
 """
-function iterated_dominance_frontier(cfg::CFG, liveness::BlockLiveness, domtree::DomTree)
+iterated_dominance_frontier(cfg::CFG, liveness::BlockLiveness, domtree::DomTree) =
+    iterated_dominance_frontier(cfg, liveness, domtree, IDFScratch())
+
+function iterated_dominance_frontier(cfg::CFG, liveness::BlockLiveness, domtree::DomTree,
+                                     scratch::IDFScratch)
     defs = liveness.def_bbs
-    heap = Tuple{Int, Int}[(defs[i], domtree.nodes[defs[i]].level) for i in 1:length(defs)]
+    (; heap, phiblocks, processed, visited, worklist) = scratch
+    empty!(heap)
+    for def in defs
+        push!(heap, (def, domtree.nodes[def].level))
+    end
     heap_order = By(x -> -x[2])
     heapify!(heap, heap_order)
-    phiblocks = Int[]
+    empty!(phiblocks)
     # This bitset makes sure we only add a phi node to a given block once.
-    processed = BitSet()
+    empty!(processed)
     # This bitset implements the `key insight` mentioned above. In particular, it prevents
     # us from visiting a subtree that we have already visited before.
-    visited = BitSet()
+    empty!(visited)
     while !isempty(heap)
         # We pop from the end of the array - i.e. the element with the highest level.
         node, level = heappop!(heap, heap_order)
-        worklist = Int[]
+        empty!(worklist)
         push!(worklist, node)
         while !isempty(worklist)
             active = pop!(worklist)
@@ -574,6 +591,7 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, sv::OptimizationState,
     for (; leave_block) in catch_entry_blocks
         new_phic_nodes[leave_block] = NewPhiCNode2[]
     end
+    idf_scratch = nothing
     @zone "CC: IDF" for (idx, slot) in Iterators.enumerate(defuses)
         # No uses => no need for phi nodes
         isempty(slot.uses) && continue
@@ -636,7 +654,9 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, sv::OptimizationState,
                 end
             end
         end
-        phiblocks = iterated_dominance_frontier(cfg, live, domtree)
+        idf_scratch === nothing && (idf_scratch = IDFScratch())
+        phiblocks = iterated_dominance_frontier(cfg, live, domtree,
+                                                idf_scratch::IDFScratch)
         for block in phiblocks
             push!(phi_slots[block], idx)
             node = PhiNode()
