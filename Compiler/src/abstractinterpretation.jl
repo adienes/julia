@@ -5088,7 +5088,7 @@ function typeinf(interp::AbstractInterpreter, frame::InferenceState{I}) where {I
         while length(nextstates) < nextstateid
             push!(nextstates, CurrentState())
         end
-        if doworkloop(interp, callee)
+        if doworkloop(callee)
             # First drain the workloop. Note that since some scheduled work doesn't
             # affect the result (e.g. cfunction or abstract_call_method on
             # get_compileable_sig), but still must be finished up since it may see and

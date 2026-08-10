@@ -1513,7 +1513,7 @@ function Future{T}(f, prev::Future{S}, interp::AbstractInterpreter, sv::AbsIntSt
 end
 
 """
-    doworkloop(args...)
+    doworkloop(sv)
 
 Run a task inside the abstract interpreter, returning false if there are none.
 Tasks will be run in DFS post-order tree order, such that all child tasks will
@@ -1521,13 +1521,13 @@ be run in the order scheduled, prior to running any subsequent tasks. This
 allows tasks to generate more child tasks, which will be run before anything else.
 Each task will be run repeatedly when returning `false`, until it returns `true`.
 """
-function doworkloop(interp::AbstractInterpreter, sv::AbsIntState)
+function doworkloop(sv::AbsIntState)
     tasks = sv.tasks
     prev = length(tasks)
     prevcallstack = length(sv.callstack)
     prev == 0 && return false
     task = pop!(tasks)
-    completed = task(interp, sv)
+    completed = task(sv.interp, sv)
     tasks = sv.tasks # allow dropping gc root over the previous call
     completed isa Bool || throw(TypeError(:return, "", Bool, task)) # print the task on failure as part of the error message, instead of just "@ workloop:line"
     if !completed

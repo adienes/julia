@@ -159,7 +159,7 @@ let
 
     mresult = Compiler._schedule_edge_infer_task!(
         outer, child, child.result, child_mi.def, nothing, false, false)
-    @test Compiler.doworkloop(interp, outer)
+    @test Compiler.doworkloop(outer)
     @test isready(mresult)
     scheduled = mresult[]
     @test !scheduled.edgecycle
