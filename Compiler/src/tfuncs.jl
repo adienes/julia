@@ -3529,9 +3529,9 @@ function abstract_applicable(interp::AbstractInterpreter, argtypes::Vector{Any},
         if isa(matches, FailedMethodMatch)
             rt = Bool # too many matches to analyze
         else
-            (; valid_worlds, applicable) = matches
+            valid_worlds = matches.valid_worlds
             update_valid_age!(sv, get_inference_world(interp), valid_worlds)
-            napplicable = length(applicable)
+            napplicable = ntargets(matches)
             if napplicable == 0
                 rt = Const(false) # never any matches
             elseif !fully_covering(matches) || any_ambig(matches)

@@ -59,7 +59,6 @@ struct MethodMatchTarget
 end
 
 struct MethodMatches
-    applicable::Vector{MethodMatchTarget}
     info::MethodMatchInfo
     valid_worlds::WorldRange
 end
@@ -68,7 +67,7 @@ any_ambig(info::MethodMatchInfo) = any_ambig(info.results)
 any_ambig(m::MethodMatches) = any_ambig(m.info)
 fully_covering(info::MethodMatchInfo) = info.fullmatch
 fully_covering(m::MethodMatches) = fully_covering(m.info)
-multiple_methods(m::MethodMatches) = length(m.applicable) > 1
+multiple_methods(m::MethodMatches) = length(m.info.results) > 1
 
 struct UnionSplitMethodMatches
     applicable::Vector{MethodMatchTarget}
@@ -100,6 +99,15 @@ function nmatches(info::UnionSplitInfo)
     end
     return n
 end
+
+ntargets(m::MethodMatches) = length(m.info.results)
+ntargets(m::UnionSplitMethodMatches) = length(m.applicable)
+function gettarget(m::MethodMatches, idx::Int)
+    info = m.info
+    return MethodMatchTarget(info.results[idx], info.edges,
+        info.needs_mi_edges, info.call_results, idx)
+end
+gettarget(m::UnionSplitMethodMatches, idx::Int) = m.applicable[idx]
 
 # intermediate state for computing gfresult
 mutable struct CallInferenceState
@@ -244,7 +252,7 @@ function (task::GenericCallMethodTask)(interp, sv)
     (; frame, inferidx, mresult) = task
     (; state, arginfo, si) = frame
     @assert state.inferidx == inferidx
-    target = state.matches.applicable[inferidx]
+    target = gettarget(state.matches, inferidx)
     𝕃ₚ, 𝕃ᵢ = ipo_lattice(interp), typeinf_lattice(interp)
     return finish_generic_call_method(interp, sv, state, arginfo, si, target, mresult,
         𝕃ₚ, 𝕃ᵢ, partialorder(𝕃ₚ), join(𝕃ₚ), join(𝕃ᵢ))
@@ -269,11 +277,10 @@ end
 
 function infer_compilation_signatures(interp, sv, matches, arginfo::ArgInfo,
         current_world::UInt, seenall::Bool, inferidx::Int)
-    local applicable = matches.applicable
-    local napplicable = length(applicable)
+    local napplicable = ntargets(matches)
     local multiple_matches = multiple_methods(matches)
     while inferidx <= napplicable
-        (; match, call_results, edge_idx) = applicable[inferidx]
+        (; match, call_results, edge_idx) = gettarget(matches, inferidx)
         inferidx += 1
         local method = match.method
         local sig = match.spec_types
@@ -315,11 +322,10 @@ function infer_generic_call(interp, sv, state::CallInferenceState,
     ⊑ₚ, ⊔ₚ, ⊔ᵢ = partialorder(𝕃ₚ), join(𝕃ₚ), join(𝕃ᵢ)
     local argtypes = arginfo.argtypes
     local matches = state.matches
-    local applicable = matches.applicable
-    local napplicable = length(applicable)
+    local napplicable = ntargets(matches)
     local multiple_matches = multiple_methods(matches)
     while state.inferidx <= napplicable
-        local target = applicable[state.inferidx]
+        local target = gettarget(matches, state.inferidx)
         local match = target.match
         local method = match.method
         local sig = match.spec_types
@@ -366,7 +372,7 @@ function infer_generic_call(interp, sv, state::CallInferenceState,
         end
         local fargs = arginfo.fargs
         if sv isa InferenceState && fargs !== nothing
-            state.slotrefinements = collect_slot_refinements(𝕃ᵢ, applicable, argtypes, fargs, sv)
+            state.slotrefinements = collect_slot_refinements(𝕃ᵢ, matches, argtypes, fargs, sv)
         end
         state.rettype = from_interprocedural!(interp, state.rettype, sv, arginfo, state.conditionals, vtypes)
         if widen_call_result(interp, si, state, sv)
@@ -435,23 +441,23 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
     end
 
-    (; valid_worlds, applicable) = matches
+    valid_worlds = matches.valid_worlds
     update_valid_age!(sv, get_inference_world(interp), valid_worlds) # need to record the negative world now, since even if we don't generate any useful information, inlining might want to add an invoke edge and it won't have this information anymore
     # Concrete-only functions refuse to commit (and record no backedge) when any
     # applicable match has a non-concrete signature, regardless of scope. This is the
     # generalization of the top-level `!isdispatchtuple` bail below to a per-function opt-in.
     if is_concrete_only(func)
-        for i = 1:length(applicable)
-            if !isdispatchtuple(applicable[i].match.spec_types)
+        for i = 1:ntargets(matches)
+            if !isdispatchtuple(gettarget(matches, i).match.spec_types)
                 add_remark!(interp, sv, "Refusing to infer non-concrete call site for concrete-only function")
                 return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
             end
         end
     end
     if bail_out_toplevel_call(interp, sv)
-        local napplicable = length(applicable)
+        local napplicable = ntargets(matches)
         for i = 1:napplicable
-            local sig = applicable[i].match.spec_types
+            local sig = gettarget(matches, i).match.spec_types
             if !isdispatchtuple(sig)
                 # only infer fully concrete call sites in top-level expressions (ignoring even isa_compileable_sig matches)
                 add_remark!(interp, sv, "Refusing to infer non-concrete call site in top-level expression")
@@ -523,9 +529,7 @@ function find_simple_method_matches(interp::AbstractInterpreter, @nospecialize(a
     fullmatch = any(match::MethodMatch->match.fully_covers, matches)
     mt = Core.methodtable
     info = MethodMatchInfo(matches, mt, atype, fullmatch)
-    applicable = MethodMatchTarget[MethodMatchTarget(matches[idx], info.edges,
-        info.needs_mi_edges, info.call_results, idx) for idx = 1:length(matches)]
-    return MethodMatches(applicable, info, matches.valid_worlds)
+    return MethodMatches(info, matches.valid_worlds)
 end
 
 """
@@ -697,10 +701,12 @@ function conditional_argtype(𝕃ᵢ::AbstractLattice, @nospecialize(rt), @nospe
     end
 end
 
-function collect_slot_refinements(𝕃ᵢ::AbstractLattice, applicable::Vector{MethodMatchTarget},
+function collect_slot_refinements(𝕃ᵢ::AbstractLattice,
+    matches::Union{MethodMatches,UnionSplitMethodMatches},
     argtypes::Vector{Any}, fargs::Vector{Any}, sv::InferenceState)
     ⊏, ⊔ = strictpartialorder(𝕃ᵢ), join(𝕃ᵢ)
     slotrefinements = nothing
+    napplicable = ntargets(matches)
     for i = 1:length(fargs)
         fargᵢ = fargs[i]
         if fargᵢ isa SlotNumber
@@ -710,8 +716,8 @@ function collect_slot_refinements(𝕃ᵢ::AbstractLattice, applicable::Vector{M
                 argt = unwrapva(argt)
             end
             sigt = Bottom
-            for j = 1:length(applicable)
-                (;match) = applicable[j]
+            for j = 1:napplicable
+                (;match) = gettarget(matches, j)
                 valid_as_lattice(match.spec_types, true) || continue
                 sigt = sigt ⊔ fieldtype(match.spec_types, i)
             end
@@ -728,8 +734,8 @@ function collect_slot_refinements(𝕃ᵢ::AbstractLattice, applicable::Vector{M
                 argt = unwrapva(argt)
             end
             sigt = Bottom
-            for j = 1:length(applicable)
-                (;match) = applicable[j]
+            for j = 1:napplicable
+                (;match) = gettarget(matches, j)
                 valid_as_lattice(match.spec_types, true) || continue
                 sigt = sigt ⊔ fieldtype(match.spec_types, i)
             end
