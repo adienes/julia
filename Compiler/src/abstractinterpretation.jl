@@ -124,11 +124,305 @@ end
 widen_call_result(::AbstractInterpreter, si::StmtInfo, state::CallInferenceState, ::AbsIntState) =
     call_result_unused(si) && !(state.rettype === Bottom)
 
+# Restartable context for generic-call inference. This is constructed only if a
+# method result is pending; the synchronous path calls `infer_generic_call`
+# directly without allocating a callable closure or task wrapper.
+struct GenericCallInferenceTask
+    state::CallInferenceState
+    arginfo::ArgInfo
+    si::StmtInfo
+    vtypes::Union{VarTable,Nothing}
+    current_world::UInt
+end
+
+struct GenericCallMethodTask{F<:Future}
+    frame::GenericCallInferenceTask
+    inferidx::Int
+    mresult::F
+end
+
+struct CompileCallMethodTask{F<:Future}
+    mresult::F
+    sig::Any
+    valid_worlds::WorldRange
+    current_world::UInt
+end
+
+mutable struct CompileCallInferenceTask
+    inferidx::Int
+    matches::Union{MethodMatches,UnionSplitMethodMatches}
+    arginfo::ArgInfo
+    current_world::UInt
+    seenall::Bool
+end
+
+function finish_generic_call_method(interp, sv, state::CallInferenceState,
+        arginfo::ArgInfo, si::StmtInfo, target::MethodMatchTarget,
+        mresult::Future, 𝕃ₚ, 𝕃ᵢ, ⊑ₚ, ⊔ₚ, ⊔ᵢ)
+    local (; match, edges, needs_mi_edges, call_results, edge_idx) = target
+    local (; rt, exct, effects, edge, needs_mi_edge, call_result) = mresult[]
+    this_conditional = ignorelimited(rt)
+    this_rt = widenwrappedconditional(rt)
+    this_exct = exct
+    # try constant propagation with argtypes for this match
+    # this is in preparation for inlining, or improving the return result
+    local matches = state.matches
+    local argtypes = arginfo.argtypes
+    this_argtypes = isa(matches, MethodMatches) ? argtypes : matches.applicable_argtypes[state.inferidx]
+    this_arginfo = ArgInfo(arginfo.fargs, this_argtypes)
+    const_call_result = abstract_call_method_with_const_args(interp,
+        mresult[], state.func, this_arginfo, si, match, sv)
+    if const_call_result !== nothing
+        this_const_conditional = ignorelimited(const_call_result.rt)
+        this_const_rt = widenwrappedconditional(const_call_result.rt)
+        const_result = nothing
+        if this_const_rt ⊑ₚ this_rt
+            # As long as the const-prop result we have is not *worse* than
+            # what we found out on types, we'd like to use it. Even if the
+            # end result is exactly equivalent, it is likely that the IR
+            # we produced while constproping is better than that with
+            # generic types.
+            # Return type of const-prop' inference can be wider than that of non const-prop' inference
+            # e.g. in cases when there are cycles but cached result is still accurate
+            this_conditional = this_const_conditional
+            this_rt = this_const_rt
+            (; effects, const_result) = const_call_result
+        elseif is_better_effects(const_call_result.effects, effects)
+            (; effects, const_result) = const_call_result
+        else
+            add_remark!(interp, sv, "[constprop] Discarded because the result was wider than inference")
+        end
+        # Treat the exception type separately. Currently, constprop often cannot determine the exception type
+        # because consistent-cy does not apply to exceptions.
+        if const_call_result.exct ⋤ this_exct
+            this_exct = const_call_result.exct
+            (; const_result) = const_call_result
+        else
+            add_remark!(interp, sv, "[constprop] Discarded exception type because result was wider than inference")
+        end
+        if const_result !== nothing
+            update_valid_age!(sv, get_inference_world(interp),
+                proof_worlds(inference_proof(const_result)))
+            call_result = const_result
+        end
+    end
+
+    state.all_effects = merge_effects(state.all_effects, effects)
+    @assert !(this_conditional isa Conditional || this_rt isa MustAlias) "invalid lattice element returned from inter-procedural context"
+    if can_propagate_conditional(this_conditional, argtypes)
+        # The only case where we need to keep this in rt is where
+        # we can directly propagate the conditional to a slot argument
+        # that is not one of our arguments, otherwise we keep all the
+        # relevant information in `conditionals` below.
+        this_rt = this_conditional
+    end
+
+    state.rettype = state.rettype ⊔ₚ this_rt
+    state.exctype = state.exctype ⊔ₚ this_exct
+    if has_conditional(𝕃ₚ, sv) && this_conditional !== Bottom && is_lattice_bool(𝕃ₚ, state.rettype) && arginfo.fargs !== nothing
+        local conditionals = state.conditionals
+        if conditionals === nothing
+            conditionals = state.conditionals = (
+                Any[Bottom for _ in 1:length(argtypes)],
+                Any[Bottom for _ in 1:length(argtypes)])
+        end
+        for i = 1:length(argtypes)
+            cnd = conditional_argtype(𝕃ᵢ, this_conditional, match.spec_types, argtypes, i)
+            conditionals[1][i] = conditionals[1][i] ⊔ᵢ cnd.thentype
+            conditionals[2][i] = conditionals[2][i] ⊔ᵢ cnd.elsetype
+        end
+    end
+    edges[edge_idx] = edge
+    needs_mi_edges[edge_idx] = needs_mi_edge
+    call_results[edge_idx] = call_result
+
+    state.inferidx += 1
+    return true
+end
+
+function (task::GenericCallMethodTask)(interp, sv)
+    (; frame, inferidx, mresult) = task
+    (; state, arginfo, si) = frame
+    @assert state.inferidx == inferidx
+    target = state.matches.applicable[inferidx]
+    𝕃ₚ, 𝕃ᵢ = ipo_lattice(interp), typeinf_lattice(interp)
+    return finish_generic_call_method(interp, sv, state, arginfo, si, target, mresult,
+        𝕃ₚ, 𝕃ᵢ, partialorder(𝕃ₚ), join(𝕃ₚ), join(𝕃ᵢ))
+end
+
+function finish_compile_call_method(interp, mresult::Future,
+        @nospecialize(sig), valid_worlds::WorldRange, current_world::UInt)
+    local edge = mresult[].edge
+    if edge !== nothing
+        local mi = get_ci_mi(edge)
+        ccall(:jl_recache_method_by_type, Cvoid, (Any, Any, Any, UInt, UInt, UInt, UInt),
+            sig, mi, mi.specTypes, get_inference_world(interp),
+            first(valid_worlds), last(valid_worlds), current_world)
+    end
+    return true
+end
+
+function (task::CompileCallMethodTask)(interp, ::AbsIntState)
+    return finish_compile_call_method(interp, task.mresult, task.sig,
+        task.valid_worlds, task.current_world)
+end
+
+function infer_compilation_signatures(interp, sv, matches, arginfo::ArgInfo,
+        current_world::UInt, seenall::Bool, inferidx::Int)
+    local applicable = matches.applicable
+    local napplicable = length(applicable)
+    local multiple_matches = multiple_methods(matches)
+    while inferidx <= napplicable
+        (; match, call_results, edge_idx) = applicable[inferidx]
+        inferidx += 1
+        local method = match.method
+        local sig = match.spec_types
+        local mi = specialize_method(match; preexisting=true)
+        local call_result = call_results[edge_idx]
+        if (mi === nothing || !(call_result isa LocalInferenceResult) ||
+            !const_prop_methodinstance_heuristic(interp, call_result.result, mi, arginfo, sv))
+            csig = get_compileable_sig(method, sig, match.sparams)
+            if csig !== nothing && (!seenall || csig !== sig) # corresponds to whether the first look already looked at this, so repeating abstract_call_method is not useful
+                #println(sig, " changed to ", csig, " for ", method)
+                (_, sparams) = typeintersect_env(csig, method.sig)
+                mresult = abstract_call_method(interp, method, csig, sparams, multiple_matches, StmtInfo(false, false), sv)::Future
+                if isready(mresult)
+                    finish_compile_call_method(interp, mresult, sig,
+                        matches.valid_worlds, current_world)
+                else
+                    push!(sv.tasks, CompileCallMethodTask(mresult, sig,
+                        matches.valid_worlds, current_world))
+                    return inferidx
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+function (task::CompileCallInferenceTask)(interp, sv)
+    inferidx = infer_compilation_signatures(interp, sv, task.matches, task.arginfo,
+        task.current_world, task.seenall, task.inferidx)
+    inferidx === nothing && return true
+    task.inferidx = inferidx
+    return false
+end
+
+function infer_generic_call(interp, sv, state::CallInferenceState,
+        arginfo::ArgInfo, si::StmtInfo, vtypes::Union{VarTable,Nothing},
+        current_world::UInt, frame::Union{Nothing,GenericCallInferenceTask})
+    𝕃ₚ, 𝕃ᵢ = ipo_lattice(interp), typeinf_lattice(interp)
+    ⊑ₚ, ⊔ₚ, ⊔ᵢ = partialorder(𝕃ₚ), join(𝕃ₚ), join(𝕃ᵢ)
+    local argtypes = arginfo.argtypes
+    local matches = state.matches
+    local applicable = matches.applicable
+    local napplicable = length(applicable)
+    local multiple_matches = multiple_methods(matches)
+    while state.inferidx <= napplicable
+        local target = applicable[state.inferidx]
+        local match = target.match
+        local method = match.method
+        local sig = match.spec_types
+        if bail_out_call(interp, InferenceLoopState(state.rettype, state.all_effects), sv)
+            add_remark!(interp, sv, "Call inference reached maximally imprecise information: bailing on doing more abstract inference.")
+            break
+        end
+        # TODO: this is unmaintained now as it didn't seem to improve things, though it does avoid hard-coding the union split at the higher level,
+        # it also can hurt infer-ability of some constrained parameter types (e.g. quacks like a duck)
+        # sigtuple = unwrap_unionall(sig)::DataType
+        # splitunions = 1 < unionsplitcost(sigtuple.parameters) * napplicable <= InferenceParams(interp).max_union_splitting
+        #if splitunions
+        #    splitsigs = switchtupleunion(sig)
+        #    for sig_n in splitsigs
+        #        result = abstract_call_method(interp, method, sig_n, svec(), multiple_matches, si, sv)::Future
+        #        handle1(...)
+        #    end
+        #end
+        mresult = abstract_call_method(interp, method, sig, match.sparams, multiple_matches, si, sv)::Future
+        if isready(mresult)
+            finish_generic_call_method(interp, sv, state, arginfo, si, target, mresult,
+                𝕃ₚ, 𝕃ᵢ, ⊑ₚ, ⊔ₚ, ⊔ᵢ)
+            continue
+        end
+        if frame === nothing
+            frame = GenericCallInferenceTask(state, arginfo, si, vtypes, current_world)
+            gfresult = Future{CallMeta}()
+            state.gfresult = something(gfresult.later)
+            push!(sv.tasks, GenericCallMethodTask(frame, state.inferidx, mresult))
+            push!(sv.tasks, frame)
+            return gfresult
+        end
+        push!(sv.tasks, GenericCallMethodTask(frame, state.inferidx, mresult))
+        return false
+    end
+
+    seenall = state.inferidx > napplicable
+    retinfo = matches.info
+    if seenall # small optimization to skip some work that is already implied
+        if !fully_covering(matches) || any_ambig(matches)
+            # Account for the fact that we may encounter a MethodError with a non-covered or ambiguous signature.
+            state.all_effects = Effects(state.all_effects; nothrow=false)
+            state.exctype = state.exctype ⊔ₚ MethodError
+        end
+        local fargs = arginfo.fargs
+        if sv isa InferenceState && fargs !== nothing
+            state.slotrefinements = collect_slot_refinements(𝕃ᵢ, applicable, argtypes, fargs, sv)
+        end
+        state.rettype = from_interprocedural!(interp, state.rettype, sv, arginfo, state.conditionals, vtypes)
+        if widen_call_result(interp, si, state, sv)
+            add_remark!(interp, sv, "Call result type was widened")
+            # Encode the decision as a local `Any` in `state.rettype`, which flows into
+            # `ssavaluetypes[pc]` of the enclosing frame. Downstream `=== Any` gates
+            # (most notably the cycle backedge revisit filter in `update_cycle_worklists!`)
+            # then treat this call site as needing no further refinement. By default
+            # `Bottom` is excluded so that "always throws" remains observable.
+            state.rettype = Any
+        end
+        # if from_interprocedural added any pclimitations to the set inherited from the arguments,
+        if isa(sv, InferenceState)
+            # TODO (#48913) implement a proper recursion handling for irinterp:
+            # This works most of the time just because currently the `:terminate` condition often guarantees that
+            # irinterp doesn't fail into unresolved cycles, but it is not a good (or working) solution.
+            # We should revisit this once we have a better story for handling cycles in irinterp.
+            delete!(sv.pclimitations, sv) # remove self, if present
+        end
+    else
+        # there is unanalyzed candidate, widen type and effects to the top
+        state.rettype = state.exctype = Any
+        state.all_effects = Effects()
+    end
+
+    # Also consider inferring the compilation signature for this method, so
+    # it is available to the compiler in case it ends up needing it for the invoke.
+    if (isa(sv, InferenceState) && infer_compilation_signature(interp) &&
+        (!is_removable_if_unused(state.all_effects) || !call_result_unused(si)))
+        inferidx = infer_compilation_signatures(interp, sv, matches, arginfo,
+            current_world, seenall, 1)
+        if inferidx !== nothing
+            push!(sv.tasks, CompileCallInferenceTask(inferidx, matches, arginfo,
+                current_world, seenall))
+        end
+    end
+
+    local result = CallMeta(state.rettype, state.exctype, state.all_effects,
+        retinfo, state.slotrefinements)
+    local later = state.gfresult
+    if later === nothing
+        return result
+    end
+    @assert !isassigned(later)
+    later[] = result
+    return true
+end
+
+function (frame::GenericCallInferenceTask)(interp, sv)
+    return infer_generic_call(interp, sv, frame.state, frame.arginfo, frame.si,
+        frame.vtypes, frame.current_world, frame)::Bool
+end
+
 function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(func),
                                   arginfo::ArgInfo, si::StmtInfo, @nospecialize(atype),
                                   vtypes::Union{VarTable,Nothing}, sv::AbsIntState, max_methods::Int)
-    𝕃ₚ, 𝕃ᵢ = ipo_lattice(interp), typeinf_lattice(interp)
-    ⊑ₚ, ⊔ₚ, ⊔ᵢ  = partialorder(𝕃ₚ), join(𝕃ₚ), join(𝕃ᵢ)
     argtypes = arginfo.argtypes
     if si.saw_latestworld
         add_remark!(interp, sv, "Cannot infer call, because we previously saw :latestworld")
@@ -167,221 +461,9 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     end
 
     state = CallInferenceState(func, matches)
-
-    # split the for loop off into a function, so that we can pause and restart it at will
-    function infercalls(interp, sv)
-        local napplicable = length(applicable)
-        local multiple_matches = multiple_methods(matches)
-        while state.inferidx <= napplicable
-            (; match, edges, needs_mi_edges, call_results, edge_idx) = applicable[state.inferidx]
-            local method = match.method
-            local sig = match.spec_types
-            if bail_out_call(interp, InferenceLoopState(state.rettype, state.all_effects), sv)
-                add_remark!(interp, sv, "Call inference reached maximally imprecise information: bailing on doing more abstract inference.")
-                break
-            end
-            # TODO: this is unmaintained now as it didn't seem to improve things, though it does avoid hard-coding the union split at the higher level,
-            # it also can hurt infer-ability of some constrained parameter types (e.g. quacks like a duck)
-            # sigtuple = unwrap_unionall(sig)::DataType
-            # splitunions = 1 < unionsplitcost(sigtuple.parameters) * napplicable <= InferenceParams(interp).max_union_splitting
-            #if splitunions
-            #    splitsigs = switchtupleunion(sig)
-            #    for sig_n in splitsigs
-            #        result = abstract_call_method(interp, method, sig_n, svec(), multiple_matches, si, sv)::Future
-            #        handle1(...)
-            #    end
-            #end
-            mresult = abstract_call_method(interp, method, sig, match.sparams, multiple_matches, si, sv)::Future
-            function handle1(interp, sv)
-                local (; rt, exct, effects, edge, needs_mi_edge, call_result) = mresult[]
-                this_conditional = ignorelimited(rt)
-                this_rt = widenwrappedconditional(rt)
-                this_exct = exct
-                # try constant propagation with argtypes for this match
-                # this is in preparation for inlining, or improving the return result
-                local matches = state.matches
-                this_argtypes = isa(matches, MethodMatches) ? argtypes : matches.applicable_argtypes[state.inferidx]
-                this_arginfo = ArgInfo(arginfo.fargs, this_argtypes)
-                const_call_result = abstract_call_method_with_const_args(interp,
-                    mresult[], state.func, this_arginfo, si, match, sv)
-                if const_call_result !== nothing
-                    this_const_conditional = ignorelimited(const_call_result.rt)
-                    this_const_rt = widenwrappedconditional(const_call_result.rt)
-                    const_result = nothing
-                    if this_const_rt ⊑ₚ this_rt
-                        # As long as the const-prop result we have is not *worse* than
-                        # what we found out on types, we'd like to use it. Even if the
-                        # end result is exactly equivalent, it is likely that the IR
-                        # we produced while constproping is better than that with
-                        # generic types.
-                        # Return type of const-prop' inference can be wider than that of non const-prop' inference
-                        # e.g. in cases when there are cycles but cached result is still accurate
-                        this_conditional = this_const_conditional
-                        this_rt = this_const_rt
-                        (; effects, const_result) = const_call_result
-                    elseif is_better_effects(const_call_result.effects, effects)
-                        (; effects, const_result) = const_call_result
-                    else
-                        add_remark!(interp, sv, "[constprop] Discarded because the result was wider than inference")
-                    end
-                    # Treat the exception type separately. Currently, constprop often cannot determine the exception type
-                    # because consistent-cy does not apply to exceptions.
-                    if const_call_result.exct ⋤ this_exct
-                        this_exct = const_call_result.exct
-                        (; const_result) = const_call_result
-                    else
-                        add_remark!(interp, sv, "[constprop] Discarded exception type because result was wider than inference")
-                    end
-                    if const_result !== nothing
-                        update_valid_age!(sv, get_inference_world(interp),
-                            proof_worlds(inference_proof(const_result)))
-                        call_result = const_result
-                    end
-                end
-
-                state.all_effects = merge_effects(state.all_effects, effects)
-                @assert !(this_conditional isa Conditional || this_rt isa MustAlias) "invalid lattice element returned from inter-procedural context"
-                if can_propagate_conditional(this_conditional, argtypes)
-                    # The only case where we need to keep this in rt is where
-                    # we can directly propagate the conditional to a slot argument
-                    # that is not one of our arguments, otherwise we keep all the
-                    # relevant information in `conditionals` below.
-                    this_rt = this_conditional
-                end
-
-                state.rettype = state.rettype ⊔ₚ this_rt
-                state.exctype = state.exctype ⊔ₚ this_exct
-                if has_conditional(𝕃ₚ, sv) && this_conditional !== Bottom && is_lattice_bool(𝕃ₚ, state.rettype) && arginfo.fargs !== nothing
-                    local conditionals = state.conditionals
-                    if conditionals === nothing
-                        conditionals = state.conditionals = (
-                            Any[Bottom for _ in 1:length(argtypes)],
-                            Any[Bottom for _ in 1:length(argtypes)])
-                    end
-                    for i = 1:length(argtypes)
-                        cnd = conditional_argtype(𝕃ᵢ, this_conditional, match.spec_types, argtypes, i)
-                        conditionals[1][i] = conditionals[1][i] ⊔ᵢ cnd.thentype
-                        conditionals[2][i] = conditionals[2][i] ⊔ᵢ cnd.elsetype
-                    end
-                end
-                edges[edge_idx] = edge
-                needs_mi_edges[edge_idx] = needs_mi_edge
-                call_results[edge_idx] = call_result
-
-                state.inferidx += 1
-                return true
-            end # function handle1
-            if isready(mresult) && handle1(interp, sv)
-                continue
-            else
-                push!(sv.tasks, handle1)
-                return false
-            end
-        end # while
-
-        seenall = state.inferidx > napplicable
-        retinfo = state.matches.info
-        if seenall # small optimization to skip some work that is already implied
-            if !fully_covering(state.matches) || any_ambig(state.matches)
-                # Account for the fact that we may encounter a MethodError with a non-covered or ambiguous signature.
-                state.all_effects = Effects(state.all_effects; nothrow=false)
-                state.exctype = state.exctype ⊔ₚ MethodError
-            end
-            local fargs = arginfo.fargs
-            if sv isa InferenceState && fargs !== nothing
-                state.slotrefinements = collect_slot_refinements(𝕃ᵢ, applicable, argtypes, fargs, sv)
-            end
-            state.rettype = from_interprocedural!(interp, state.rettype, sv, arginfo, state.conditionals, vtypes)
-            if widen_call_result(interp, si, state, sv)
-                add_remark!(interp, sv, "Call result type was widened")
-                # Encode the decision as a local `Any` in `state.rettype`, which flows into
-                # `ssavaluetypes[pc]` of the enclosing frame. Downstream `=== Any` gates
-                # (most notably the cycle backedge revisit filter in `update_cycle_worklists!`)
-                # then treat this call site as needing no further refinement. By default
-                # `Bottom` is excluded so that "always throws" remains observable.
-                state.rettype = Any
-            end
-            # if from_interprocedural added any pclimitations to the set inherited from the arguments,
-            if isa(sv, InferenceState)
-                # TODO (#48913) implement a proper recursion handling for irinterp:
-                # This works most of the time just because currently the `:terminate` condition often guarantees that
-                # irinterp doesn't fail into unresolved cycles, but it is not a good (or working) solution.
-                # We should revisit this once we have a better story for handling cycles in irinterp.
-                delete!(sv.pclimitations, sv) # remove self, if present
-            end
-        else
-            # there is unanalyzed candidate, widen type and effects to the top
-            state.rettype = state.exctype = Any
-            state.all_effects = Effects()
-        end
-
-        # Also consider inferring the compilation signature for this method, so
-        # it is available to the compiler in case it ends up needing it for the invoke.
-        if (isa(sv, InferenceState) && infer_compilation_signature(interp) &&
-            (!is_removable_if_unused(state.all_effects) || !call_result_unused(si)))
-            inferidx = SafeBox{Int}(1)
-            function infercalls2(interp, sv)
-                local napplicable = length(applicable)
-                local multiple_matches = multiple_methods(matches)
-                while inferidx[] <= napplicable
-                    (; match, call_results, edge_idx) = applicable[inferidx[]]
-                    inferidx[] += 1
-                    local method = match.method
-                    local sig = match.spec_types
-                    local mi = specialize_method(match; preexisting=true)
-                    local call_result = call_results[edge_idx]
-                    if (mi === nothing || !(call_result isa LocalInferenceResult) ||
-                        !const_prop_methodinstance_heuristic(interp, call_result.result, mi, arginfo, sv))
-                        csig = get_compileable_sig(method, sig, match.sparams)
-                        if csig !== nothing && (!seenall || csig !== sig) # corresponds to whether the first look already looked at this, so repeating abstract_call_method is not useful
-                            #println(sig, " changed to ", csig, " for ", method)
-                            (_, sparams) = typeintersect_env(csig, method.sig)
-                            mresult = abstract_call_method(interp, method, csig, sparams, multiple_matches, StmtInfo(false, false), sv)::Future
-                            function infercalls3(interp, sv)
-                                local edge = mresult[].edge
-                                if edge !== nothing
-                                    local sig = match.spec_types
-                                    local mi = get_ci_mi(edge)
-                                    local vw = matches.valid_worlds
-                                    ccall(:jl_recache_method_by_type, Cvoid, (Any, Any, Any, UInt, UInt, UInt, UInt),
-                                            sig, mi, mi.specTypes, get_inference_world(interp),
-                                            first(vw), last(vw), current_world)
-                                end
-                                return true
-                            end
-                            if !isready(mresult) || !infercalls3(interp, sv)
-                                push!(sv.tasks, infercalls3)
-                                return false # wait for mresult Future to resolve off the callstack before continuing
-                            end
-                        end
-                    end
-                end
-                return true
-            end
-            # start making progress on the first call
-            infercalls2(interp, sv) || push!(sv.tasks, infercalls2)
-        end
-
-        local result = CallMeta(state.rettype, state.exctype, state.all_effects,
-            retinfo, state.slotrefinements)
-        local later = state.gfresult
-        if later === nothing
-            return result
-        end
-        @assert !isassigned(later)
-        later[] = result
-        return true
-    end # function infercalls
-    # start making progress on the first call
-    result = infercalls(interp, sv)
+    result = infer_generic_call(interp, sv, state, arginfo, si, vtypes, current_world, nothing)
     result isa CallMeta && return Future(result)
-    @assert result === false
-
-    # Only a suspended call needs assign-once storage for its eventual result.
-    gfresult = Future{CallMeta}()
-    state.gfresult = something(gfresult.later)
-    push!(sv.tasks, infercalls)
-    return gfresult
+    return result::Future{CallMeta}
 end
 
 function find_method_matches(interp::AbstractInterpreter, argtypes::Vector{Any}, @nospecialize(atype);
