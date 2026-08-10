@@ -283,6 +283,7 @@ function OptimizationState(mi::MethodInstance, interp::AbstractInterpreter)
 end
 
 function argextype end # imported by EscapeAnalysis
+function argextype_singleton end # imported by EscapeAnalysis
 function argextype_widened end # imported by EscapeAnalysis
 function try_compute_field end # imported by EscapeAnalysis
 
@@ -413,8 +414,7 @@ function stmt_effect_flags(𝕃ₒ::AbstractLattice, @nospecialize(stmt), @nospe
             return (true, nothrow, nothrow)
         end
         if head === :call
-            f = argextype(args[1], src)
-            f = singleton_type(f)
+            f = argextype_singleton(args[1], src)
             f === nothing && return (false, false, false)
             if f === Intrinsics.llvmcall
                 # TODO: these are not yet linearized
@@ -560,6 +560,19 @@ end
 @inline argextype_widened(@nospecialize(x), ir::IRCode) = argextype_widened(x, ir, ir.sptypes)
 @inline argextype_widened(@nospecialize(x), compact::IncrementalCompact) =
     argextype_widened(x, compact, compact.ir.sptypes)
+
+# `singleton_type(argextype(x, src, ...))` without the throwaway `Const` for
+# GlobalRef args.
+@inline function argextype_singleton(@nospecialize(x),
+        src::Union{IRCode,IncrementalCompact,CodeInfo}, sptypes::Vector{VarState})
+    isa(x, GlobalRef) && return globalref_singleton(x, src)
+    return singleton_type(argextype(x, src, sptypes))
+end
+@inline argextype_singleton(@nospecialize(x), ir::IRCode) =
+    argextype_singleton(x, ir, ir.sptypes)
+@inline argextype_singleton(@nospecialize(x), compact::IncrementalCompact) =
+    argextype_singleton(x, compact, compact.ir.sptypes)
+
 function abstract_eval_ssavalue(s::SSAValue, src::CodeInfo)
     ssavaluetypes = src.ssavaluetypes
     if ssavaluetypes isa Int
@@ -748,8 +761,7 @@ end
 
 function iscall_with_boundscheck(@nospecialize(stmt), sv::PostOptAnalysisState)
     isexpr(stmt, :call) || return false
-    ft = argextype(stmt.args[1], sv.ir)
-    f = singleton_type(ft)
+    f = argextype_singleton(stmt.args[1], sv.ir)
     f === nothing && return false
     if f === getfield
         nargs = 4
@@ -1391,16 +1403,21 @@ function statement_cost(ex::Expr, line::Int, src::Union{CodeInfo, IRCode}, sptyp
         return 0
     elseif head === :call
         farg = ex.args[1]
-        ftyp = argextype(farg, src, sptypes)
-        if ftyp === IntrinsicFunction && farg isa SSAValue
-            # if this comes from code that was already inlined into another function,
-            # Consts have been widened. try to recover in simple cases.
-            farg = isa(src, CodeInfo) ? src.code[farg.id] : src[farg][:stmt]
-            if isa(farg, GlobalRef) || isa(farg, QuoteNode) || isa(farg, IntrinsicFunction) || isexpr(farg, :static_parameter)
-                ftyp = argextype(farg, src, sptypes)
+        if farg isa GlobalRef
+            f = globalref_singleton(farg, src)
+        else
+            ftyp = argextype(farg, src, sptypes)
+            if ftyp === IntrinsicFunction && farg isa SSAValue
+                # if this comes from code that was already inlined into another function,
+                # Consts have been widened. try to recover in simple cases.
+                farg = isa(src, CodeInfo) ? src.code[farg.id] : src[farg][:stmt]
+                if !(farg isa GlobalRef) &&
+                   (isa(farg, QuoteNode) || isa(farg, IntrinsicFunction) || isexpr(farg, :static_parameter))
+                    ftyp = argextype(farg, src, sptypes)
+                end
             end
+            f = farg isa GlobalRef ? globalref_singleton(farg, src) : singleton_type(ftyp)
         end
-        f = singleton_type(ftyp)
         if isa(f, IntrinsicFunction)
             iidx = Int(reinterpret(Int32, f::IntrinsicFunction)) + 1
             if isassigned(T_IFUNC, iidx)
