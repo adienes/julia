@@ -95,6 +95,15 @@ function DFSTree(n_blocks::Int)
                    Vector{Tuple{BBNumber, PreNumber, Bool}}())
 end
 
+function DFSTree(::UndefInitializer, n_blocks::Int)
+    return DFSTree(Vector{PreNumber}(undef, n_blocks),
+                   Vector{BBNumber}(undef, n_blocks),
+                   Vector{PostNumber}(undef, n_blocks),
+                   Vector{BBNumber}(undef, n_blocks),
+                   Vector{PreNumber}(undef, n_blocks),
+                   Vector{Tuple{BBNumber, PreNumber, Bool}}())
+end
+
 copy(D::DFSTree) = DFSTree(copy(D.to_pre),
                            copy(D.from_pre),
                            copy(D.to_post),
@@ -198,7 +207,8 @@ function DFS!(D::DFSTree, blocks::Vector{BasicBlock}, is_post_dominator::Bool)
     return D
 end
 
-DFS(blocks::Vector{BasicBlock}, is_post_dominator::Bool=false) = DFS!(DFSTree(0), blocks, is_post_dominator)
+DFS(blocks::Vector{BasicBlock}, is_post_dominator::Bool=false) =
+    DFS!(DFSTree(undef, length(blocks)), blocks, is_post_dominator)
 
 """
 Keeps the per-BB state of the Semi NCA algorithm. In the original formulation,
