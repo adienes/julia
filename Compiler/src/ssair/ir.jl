@@ -411,18 +411,32 @@ struct NewNodeInfo
     # Place the new instruction after this instruction (but in the same BB if this is an implicit terminator)
     attach_after::Bool
 end
-struct NewNodeStream
+mutable struct NewNodeStream
     stmts::InstructionStream
     info::Vector{NewNodeInfo}
 end
-NewNodeStream(len::Int=0) = NewNodeStream(InstructionStream(len), fill(NewNodeInfo(0, false), len))
+const EMPTY_NEW_NODE_STMTS = InstructionStream(
+    Any[], Any[], CallInfo[], Int32[], UInt32[])
+const EMPTY_NEW_NODE_INFO = NewNodeInfo[]
+function NewNodeStream(len::Int=0)
+    len == 0 && return NewNodeStream(EMPTY_NEW_NODE_STMTS, EMPTY_NEW_NODE_INFO)
+    return NewNodeStream(InstructionStream(len), fill(NewNodeInfo(0, false), len))
+end
 length(new::NewNodeStream) = length(new.stmts)
 isempty(new::NewNodeStream) = isempty(new.stmts)
 function add_inst!(new::NewNodeStream, pos::Int, attach_after::Bool)
+    if new.stmts === EMPTY_NEW_NODE_STMTS
+        @assert new.info === EMPTY_NEW_NODE_INFO
+        stmts = InstructionStream()
+        info = NewNodeInfo[]
+        new.stmts = stmts
+        new.info = info
+    end
     push!(new.info, NewNodeInfo(pos, attach_after))
     return Instruction(new.stmts)
 end
-copy(nns::NewNodeStream) = NewNodeStream(copy(nns.stmts), copy(nns.info))
+copy(nns::NewNodeStream) = isempty(nns) ? NewNodeStream() :
+    NewNodeStream(copy(nns.stmts), copy(nns.info))
 
 struct NewInstruction
     stmt::Any
