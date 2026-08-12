@@ -682,8 +682,8 @@ function is_relevant_expr(e::Expr)
                       :new_opaque_closure)
 end
 
-@noinline function _useref_setindex!(@nospecialize(stmt), op::Int, @nospecialize(v))
-    if isa(stmt, Expr) && stmt.head === :(=)
+@inline function _useref_setindex_expr!(stmt::Expr, op::Int, @nospecialize(v))
+    if stmt.head === :(=)
         rhs = stmt.args[2]
         if isa(rhs, Expr)
             if is_relevant_expr(rhs)
@@ -694,10 +694,15 @@ end
         end
         op == 1 || throw(BoundsError())
         stmt.args[2] = v
-    elseif isa(stmt, Expr) # @assert is_relevant_expr(stmt)
+    else # @assert is_relevant_expr(stmt)
         op > length(stmt.args) && throw(BoundsError())
         stmt.args[op] = v
-    elseif isa(stmt, GotoIfNot)
+    end
+    return stmt
+end
+
+@noinline function _useref_setindex_nonexpr!(@nospecialize(stmt), op::Int, @nospecialize(v))
+    if isa(stmt, GotoIfNot)
         op == 1 || throw(BoundsError())
         stmt = GotoIfNot(v, stmt.dest)
     elseif isa(stmt, ReturnNode)
@@ -729,8 +734,20 @@ end
     return stmt
 end
 
+@noinline function _useref_setindex!(@nospecialize(stmt), op::Int, @nospecialize(v))
+    if isa(stmt, Expr)
+        return _useref_setindex_expr!(stmt, op, v)
+    end
+    return _useref_setindex_nonexpr!(stmt, op, v)
+end
+
 @inline function setindex!(x::UseRef, @nospecialize(v))
-    x.urs.stmt = _useref_setindex!(x.urs.stmt, x.op, v)
+    stmt = x.urs.stmt
+    if isa(stmt, Expr)
+        _useref_setindex_expr!(stmt, x.op, v)
+    else
+        x.urs.stmt = _useref_setindex_nonexpr!(stmt, x.op, v)
+    end
     return x
 end
 
