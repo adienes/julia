@@ -669,7 +669,27 @@ end
         return OOB_TOKEN
     end
 end
-@inline getindex(x::UseRef) = _useref_getindex(x.urs.stmt, x.op)
+@inline function _useref_getindex_expr(stmt::Expr, op::Int)
+    if stmt.head === :(=)
+        rhs = stmt.args[2]
+        if isa(rhs, Expr) && is_relevant_expr(rhs)
+            op > length(rhs.args) && return OOB_TOKEN
+            return rhs.args[op]
+        end
+        return op == 1 ? rhs : OOB_TOKEN
+    else # @assert is_relevant_expr(stmt)
+        op > length(stmt.args) && return OOB_TOKEN
+        return stmt.args[op]
+    end
+end
+
+@inline function getindex(x::UseRef)
+    stmt = x.urs.stmt
+    if isa(stmt, Expr)
+        return _useref_getindex_expr(stmt, x.op)
+    end
+    return _useref_getindex(stmt, x.op)
+end
 
 function is_relevant_expr(e::Expr)
     return e.head in (:call, :invoke, :invoke_modify,
