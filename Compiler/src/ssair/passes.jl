@@ -411,7 +411,7 @@ const LiftedDefs = IdDict{Any, Bool}
 function lift_leaves(compact::IncrementalCompact, field::Int,
                      leaves::Vector{Any}, 𝕃ₒ::AbstractLattice)
     # For every leaf, the lifted value
-    lifted_leaves = LiftedLeaves()
+    lifted_leaves = nothing
     maybe_undef = false
     for i = 1:length(leaves)
         leaf = leaves[i]
@@ -419,7 +419,8 @@ function lift_leaves(compact::IncrementalCompact, field::Int,
         if isa(leaf, AnySSAValue)
             (def, leaf) = walk_to_def(compact, leaf)
             if is_known_call(def, tuple, compact) && 1 ≤ field < length(def.args)
-                lift_arg!(compact, leaf, cache_key, def, 1+field, lifted_leaves)
+                lifted_leaves === nothing && (lifted_leaves = LiftedLeaves())
+                lift_arg!(compact, leaf, cache_key, def, 1+field, lifted_leaves::LiftedLeaves)
                 continue
             elseif isexpr(def, :new)
                 typ = unwrap_unionall(widenconst(types(compact)[leaf]))
@@ -436,12 +437,14 @@ function lift_leaves(compact::IncrementalCompact, field::Int,
                         # On this branch, this will be a guaranteed UndefRefError.
                         # We use the regular undef mechanic to lift this to a boolean slot
                         maybe_undef = true
-                        lifted_leaves[cache_key] = nothing
+                        lifted_leaves === nothing && (lifted_leaves = LiftedLeaves())
+                        (lifted_leaves::LiftedLeaves)[cache_key] = nothing
                         continue
                     end
                     return nothing
                 end
-                lift_arg!(compact, leaf, cache_key, def, 1+field, lifted_leaves)
+                lifted_leaves === nothing && (lifted_leaves = LiftedLeaves())
+                lift_arg!(compact, leaf, cache_key, def, 1+field, lifted_leaves::LiftedLeaves)
                 continue
             # NOTE we can enable this, but most `:splatnew` expressions are transformed into
             #      `:new` expressions by the inliner
@@ -461,7 +464,8 @@ function lift_leaves(compact::IncrementalCompact, field::Int,
                 end
                 ocdef, _ = walk_to_def(compact, ocleaf)
                 if isexpr(ocdef, :new_opaque_closure) && isa(field, Int) && 1 ≤ field ≤ length(ocdef.args)-5
-                    lift_arg!(compact, leaf, cache_key, ocdef, 5+field, lifted_leaves)
+                    lifted_leaves === nothing && (lifted_leaves = LiftedLeaves())
+                    lift_arg!(compact, leaf, cache_key, ocdef, 5+field, lifted_leaves::LiftedLeaves)
                     continue
                 end
                 return nothing
@@ -496,9 +500,11 @@ function lift_leaves(compact::IncrementalCompact, field::Int,
         isdefined(leaf, field) || return nothing
         val = getfield(leaf, field)
         is_inlineable_constant(val) || return nothing
-        lifted_leaves[cache_key] = LiftedValue(quoted(val))
+        lifted_leaves === nothing && (lifted_leaves = LiftedLeaves())
+        (lifted_leaves::LiftedLeaves)[cache_key] = LiftedValue(quoted(val))
     end
-    return lifted_leaves, maybe_undef
+    lifted_leaves === nothing && (lifted_leaves = LiftedLeaves())
+    return lifted_leaves::LiftedLeaves, maybe_undef
 end
 
 function lift_arg!(
