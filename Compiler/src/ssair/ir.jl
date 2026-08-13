@@ -787,9 +787,27 @@ end
     end
 end
 
+@inline function _advance_expr(stmt::Expr, op::Int)
+    args = if stmt.head === :(=)
+        rhs = stmt.args[2]
+        if isa(rhs, Expr) && is_relevant_expr(rhs)
+            rhs.args
+        else
+            return iszero(op) ? 1 : nothing
+        end
+    else # @assert is_relevant_expr(stmt)
+        stmt.args
+    end
+    op += 1
+    op > length(args) && return nothing
+    checkbounds(args, op)
+    return op
+end
+
 @inline function iterate(it::UseRefIterator, op::Int=0)
     it.relevant || return nothing
-    op = _advance(it.stmt, op)
+    stmt = it.stmt
+    op = isa(stmt, Expr) ? _advance_expr(stmt, op) : _advance(stmt, op)
     op === nothing && return nothing
     return (UseRef(it, op), op)
 end
