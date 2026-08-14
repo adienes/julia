@@ -197,7 +197,10 @@ Float64
 """
 function promote_typejoin(@nospecialize(a), @nospecialize(b))
     c = typejoin(_promote_typesubtract(a), _promote_typesubtract(b))
-    return Union{a, b, c}
+    # the arguments are always types, so the `Union` is too; inference alone can
+    # only conclude `Union{Type,TypeVar}` here, since a `Union` of a lone
+    # `TypeVar` argument would collapse to the `TypeVar` itself
+    return Union{a, b, c}::Type
 end
 _promote_typesubtract(@nospecialize(a)) =
     a === Any ? a :
