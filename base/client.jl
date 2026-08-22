@@ -69,7 +69,8 @@ function repl_cmd(cmd::AbstractCmd, out)
         cd(dir)
         println(out, pwd())
     else
-        if !Sys.iswindows()
+        # A shell wrapper can alter or strip non-default process settings.
+        if !Sys.iswindows() && !has_nondefault_cmd_flags(cmd)
             shell = shell_split(get(ENV, "JULIA_SHELL", get(ENV, "SHELL", "/bin/sh")))
             shell_escape_cmd = shell_escape_posixly(cmd)
             cmd = `$shell -c $shell_escape_cmd`

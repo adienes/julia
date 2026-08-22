@@ -594,6 +594,24 @@ withenv("OLDPWD" => nothing) do
     end
 end
 
+# Cmd environments bypass the shell wrapper in shell mode (#51020)
+if !Sys.iswindows()
+    shell_mode_env_value = "/tmp/julia-51020"
+    shell_mode_env_code = "print(ENV[\"DYLD_FALLBACK_LIBRARY_PATH\"])"
+    shell_mode_env_cmd = Cmd(
+        `$(Base.julia_cmd()) --startup-file=no -e $shell_mode_env_code`,
+        env=("DYLD_FALLBACK_LIBRARY_PATH" => shell_mode_env_value,))
+    withenv("JULIA_SHELL" => something(Sys.which("false"))) do
+        mktemp() do _, output
+            redirect_stdout(output) do
+                shell_mode_run("\$shell_mode_env_cmd")
+            end
+            seekstart(output)
+            @test read(output, String) == shell_mode_env_value
+        end
+    end
+end
+
 # Pipeline and redirection operators in backtick command literals
 (!Sys.iswindows() || havebb) &&
 mktempdir() do dir
