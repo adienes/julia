@@ -1843,9 +1843,13 @@ function apply_type_nothrow(𝕃::AbstractLattice, argtypes::Vector{Any}, @nospe
     else
         return false
     end
-    # We know the apply_type is well formed. Otherwise our rt would have been
-    # Bottom (or Type).
-    (headtype === Union) && return true
+    if headtype === Union
+        # the union is valid as long as all components are Types or TypeVars
+        for i = 2:length(argtypes)
+            ⊑(𝕃, widenconditional(argtypes[i]), Union{Type,TypeVar}) || return false
+        end
+        return true
+    end
     headtype === TypeEq && return typeeq_apply_type_nothrow(𝕃, argtypes)
     headtype === Core.TypeEgal && return typeegal_apply_type_nothrow(𝕃, argtypes)
     isa(rt, Const) && return true
@@ -1922,37 +1926,42 @@ function apply_type_tfunc(𝕃::AbstractLattice, argtypes::Vector{Any};
     end
     largs = length(argtypes)
     if largs > 1 && isvarargtype(argtypes[end])
-        return isvarargtype(headtype) ? TypeofVararg : Type
+        isvarargtype(headtype) && return TypeofVararg
+        # a `Union` head can collapse to a bare `TypeVar` (`Union{T}` is `T`), which
+        # is not a `Type`, so the result cannot be pinned down to `Type` here
+        headtype === Union && return Union{Type, TypeVar}
+        return Type
     end
     if headtype === Union
         largs == 1 && return Const(Bottom)
         hasnonType = false
+        mayTypeVar = false # could the result collapse to a bare TypeVar (e.g. Union{Union{}, T})?
         for i = 2:largs
             ai = argtypes[i]
             if isa(ai, Const)
                 if !isa(ai.val, Type)
-                    if isa(ai.val, TypeVar)
-                        hasnonType = true
-                    else
-                        return Bottom
-                    end
+                    isa(ai.val, TypeVar) || return Bottom
+                    mayTypeVar = true
                 end
-            else
-                if !(isTypeEq(ai) || (isTypeEgal(ai) && type_parameter(ai) isa Type))
-                    if !isa(ai, Type) || hasintersect(ai, Type) || hasintersect(ai, TypeVar)
-                        hasnonType = true
-                    else
-                        return Bottom
-                    end
+            elseif isa(ai, PartialTypeVar)
+                mayTypeVar = true
+            elseif !(isTypeEq(ai) || (isTypeEgal(ai) && type_parameter(ai) isa Type))
+                maytv = !isa(ai, Type) || hasintersect(ai, TypeVar)
+                if maytv || hasintersect(ai, Type)
+                    hasnonType = true
+                    mayTypeVar |= maytv
+                else
+                    return Bottom
                 end
             end
         end
         if largs == 2 # Union{T} --> T
             return tmeet(widenconst(argtypes[2]), Union{Type,TypeVar})
         end
-        hasnonType && return Type
+        hasnonType && return mayTypeVar ? Union{Type,TypeVar} : Type
         ty = Union{}
         allconst = true
+        hassymbolictv = false
         for i = 2:largs
             ai = argtypes[i]
             if isTypeEgal(ai)
@@ -1963,12 +1972,26 @@ function apply_type_tfunc(𝕃::AbstractLattice, argtypes::Vector{Any};
                 # way datatype instantiation does (`Union{S}` is `S` itself), so
                 # an `==`-only argument leaves the result only `==`-certain
                 allconst = false
+                hassymbolictv |= isa(aty, TypeVar)
+            elseif isa(ai, PartialTypeVar)
+                # the bounds of this TypeVar are known precisely, but the runtime
+                # TypeVar object is created fresh, so its identity is not constant
+                aty = ai.tv
+                allconst = false
             else
                 aty = (ai::Const).val
             end
             ty = Union{ty, aty}
         end
-        return allconst ? Const(ty) : Type{ty}
+        allconst && return Const(ty)
+        isa(ty, Type) && return Type{ty}
+        # the union collapsed to a bare TypeVar (e.g. Union{Union{}, T}); if it is a
+        # TypeVar value from a Const/PartialTypeVar component (tracked by `mayTypeVar`),
+        # the runtime result is the TypeVar object itself, whereas a symbolic TypeVar
+        # from a `Type{B}` component stands for a type equal to it
+        mayTypeVar || return Type{ty}
+        hassymbolictv && return Union{Type,TypeVar}
+        return TypeVar
     end
     if headtype === TypeEq
         return typeeq_apply_type_tfunc(𝕃, argtypes)

@@ -4459,6 +4459,14 @@ const DenseIdx = Union{IntRange,Integer}
 
 # Non uniformity in expressions with PartialTypeVar
 @test Compiler.:⊑(Compiler.PartialTypeVar(TypeVar(:N), true, true), TypeVar)
+# a PartialTypeVar is a runtime TypeVar object, so it is below any wider type too
+let ptv = Compiler.PartialTypeVar(TypeVar(:N), true, true)
+    @test Compiler.:⊑(ptv, Union{Type,TypeVar})
+    @test Compiler.:⊑(ptv, Any)
+    @test !Compiler.:⊑(ptv, Type)
+    @test !Compiler.:⊑(ptv, Union{})
+    @test !Compiler.:⊑(ptv, Compiler.PartialTypeVar(TypeVar(:N), true, true))
+end
 let N = TypeVar(:N)
     𝕃 = Compiler.SimpleInferenceLattice.instance
     argtypes = Any[Compiler.Const(NTuple),
@@ -7513,6 +7521,45 @@ let apply_type_tfunc = Compiler.apply_type_tfunc
     𝕃 = Compiler.fallback_lattice
     Const = Core.Const
     @test apply_type_tfunc(𝕃, Any[Const(Vector), Union{Type{Int},Type{Nothing}}]) == Union{Core.TypeEgal{Vector{Int}},Core.TypeEgal{Vector{Nothing}}}
+end
+
+# issue #53917: `Union` head `apply_type_tfunc` precision for `PartialTypeVar` components,
+# so that kwarg types like `Union{Nothing,<:Integer}` are not rebuilt on every call
+let apply_type_tfunc = Compiler.apply_type_tfunc
+    apply_type_nothrow = Compiler.apply_type_nothrow
+    𝕃 = Compiler.fallback_lattice
+    Const = Core.Const
+    tv = TypeVar(:T, Union{}, Integer)
+    ptv = Compiler.PartialTypeVar(tv, true, true)
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), ptv]) == Type{Union{Nothing,tv}}
+    @test apply_type_nothrow(𝕃, Any[Const(Union), Const(Nothing), ptv], Type{Union{Nothing,tv}})
+    # the union may collapse to the bare TypeVar object, which is not a `Type`
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Union{}), ptv]) === TypeVar
+    # unknown components may turn out to be TypeVars at runtime
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), Any]) == Union{Type,TypeVar}
+    @test !apply_type_nothrow(𝕃, Any[Const(Union), Const(Nothing), Any], Union{Type,TypeVar})
+    # a `Const` TypeVar has known object identity, so the union folds to a `Const`
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), Const(tv)]) === Const(Union{Nothing,tv})
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Union{}), Const(tv)]) === Const(tv)
+    @test apply_type_nothrow(𝕃, Any[Const(Union), Const(Nothing), Const(tv)], Const(Union{Nothing,tv}))
+    # but mixed with unknown components, the result may still be a bare TypeVar
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Type, Const(tv)]) == Union{Type,TypeVar}
+    # a symbolic TypeVar from a `Type{B}` component stands for a type equal to it,
+    # so the collapsed result is a `Type`, not the TypeVar object
+    B = TypeVar(:B, Union{}, Integer)
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Union{}), Type{B}]) === Type{B}
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), Type{B}]) === Type{Union{Nothing,B}}
+    # a `Union` head with a trailing vararg can still collapse to a bare TypeVar, so it
+    # must not be pinned down to `Type` (the non-vararg path widens likewise)
+    @test apply_type_tfunc(𝕃, Any[Const(Union), Const(Nothing), Vararg{Any}]) == Union{Type,TypeVar}
+    @test apply_type_tfunc(𝕃, Any[Const(Vector), Vararg{Any}]) === Type
+end
+issue53917(v; y::Union{Nothing,<:Integer}=nothing) = isnothing(y) ? v[1] : v[y]
+let src = code_typed1(Core.kwcall, (NamedTuple{(:y,),Tuple{Int}}, typeof(issue53917), Vector{Int}))
+    # the `isa` check against the kwarg type should fold away, leaving no
+    # runtime TypeVar/UnionAll construction in the keyword sorter
+    @test count(iscall((src, Core._typevar)), src.code) == 0
+    @test count(stmt -> Meta.isexpr(stmt, :foreigncall), src.code) == 0
 end
 
 @test Base.infer_return_type((Bool,Int,)) do b, y
