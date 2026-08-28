@@ -214,6 +214,7 @@ end
 function cfg_inline_unionsplit!(ir::IRCode, idx::Int, union_split::UnionSplit,
                                 state::CFGInliningState, params::OptimizationParams)
     (; handled_all_cases, fully_covered, #=atype,=# cases, bbs) = union_split
+    nn = 0
     inline_into_block!(state, block_for_inst(ir, idx))
     from_bbs = Int[]
     delete!(state.split_targets, length(state.new_cfg_blocks))
@@ -228,6 +229,7 @@ function cfg_inline_unionsplit!(ir::IRCode, idx::Int, union_split::UnionSplit,
         push!(state.new_cfg_blocks[cond_bb].succs, cond_bb+1)
         case = cases[i].item
         if isa(case, InliningTodo)
+            nn += length(case.ir.stmts) + length(case.ir.new_nodes)
             if !case.linear_inline_eligible
                 cfg_inline_item!(ir, idx, case, state, true)
             end
@@ -254,6 +256,7 @@ function cfg_inline_unionsplit!(ir::IRCode, idx::Int, union_split::UnionSplit,
     for bb in from_bbs
         push!(state.new_cfg_blocks[bb].succs, join_bb)
     end
+    return nn
 end
 
 function finish_cfg_inline!(state::CFGInliningState)
@@ -619,11 +622,13 @@ function batch_inline!(ir::IRCode, todo::Vector{Pair{Int,Any}}, propagate_inboun
     params = OptimizationParams(interp)
     # Compute the new CFG first (modulo statement ranges, which will be computed below)
     state = CFGInliningState(ir)
+    nn = 0
     for (idx, item) in todo
         if isa(item, UnionSplit)
-            cfg_inline_unionsplit!(ir, idx, item, state, params)
+            nn += cfg_inline_unionsplit!(ir, idx, item, state, params)
         else
             item = item::InliningTodo
+            nn += length(item.ir.stmts) + length(item.ir.new_nodes)
             # A linear inline does not modify the CFG
             item.linear_inline_eligible && continue
             cfg_inline_item!(ir, idx, item, state, false)
@@ -635,12 +640,6 @@ function batch_inline!(ir::IRCode, todo::Vector{Pair{Int,Any}}, propagate_inboun
 
     let compact = IncrementalCompact(ir, CFGTransformState!(state.new_cfg_blocks, false))
         # This needs to be a minimum and is more of a size hint
-        nn = 0
-        for (_, item) in todo
-            if isa(item, InliningTodo)
-                nn += (length(item.ir.stmts) + length(item.ir.new_nodes))
-            end
-        end
         nnewnodes = length(compact.result) + nn
         resize!(compact, nnewnodes)
         (inline_idx, item) = popfirst!(todo)

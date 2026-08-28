@@ -411,18 +411,32 @@ struct NewNodeInfo
     # Place the new instruction after this instruction (but in the same BB if this is an implicit terminator)
     attach_after::Bool
 end
-struct NewNodeStream
+mutable struct NewNodeStream
     stmts::InstructionStream
     info::Vector{NewNodeInfo}
 end
-NewNodeStream(len::Int=0) = NewNodeStream(InstructionStream(len), fill(NewNodeInfo(0, false), len))
+const EMPTY_NEW_NODE_STMTS = InstructionStream(
+    Any[], Any[], CallInfo[], Int32[], UInt32[])
+const EMPTY_NEW_NODE_INFO = NewNodeInfo[]
+function NewNodeStream(len::Int=0)
+    len == 0 && return NewNodeStream(EMPTY_NEW_NODE_STMTS, EMPTY_NEW_NODE_INFO)
+    return NewNodeStream(InstructionStream(len), fill(NewNodeInfo(0, false), len))
+end
 length(new::NewNodeStream) = length(new.stmts)
 isempty(new::NewNodeStream) = isempty(new.stmts)
 function add_inst!(new::NewNodeStream, pos::Int, attach_after::Bool)
+    if new.stmts === EMPTY_NEW_NODE_STMTS
+        @assert new.info === EMPTY_NEW_NODE_INFO
+        stmts = InstructionStream()
+        info = NewNodeInfo[]
+        new.stmts = stmts
+        new.info = info
+    end
     push!(new.info, NewNodeInfo(pos, attach_after))
     return Instruction(new.stmts)
 end
-copy(nns::NewNodeStream) = NewNodeStream(copy(nns.stmts), copy(nns.info))
+copy(nns::NewNodeStream) = isempty(nns) ? NewNodeStream() :
+    NewNodeStream(copy(nns.stmts), copy(nns.info))
 
 struct NewInstruction
     stmt::Any
@@ -655,7 +669,27 @@ end
         return OOB_TOKEN
     end
 end
-@inline getindex(x::UseRef) = _useref_getindex(x.urs.stmt, x.op)
+@inline function _useref_getindex_expr(stmt::Expr, op::Int)
+    if stmt.head === :(=)
+        rhs = stmt.args[2]
+        if isa(rhs, Expr) && is_relevant_expr(rhs)
+            op > length(rhs.args) && return OOB_TOKEN
+            return rhs.args[op]
+        end
+        return op == 1 ? rhs : OOB_TOKEN
+    else # @assert is_relevant_expr(stmt)
+        op > length(stmt.args) && return OOB_TOKEN
+        return stmt.args[op]
+    end
+end
+
+@inline function getindex(x::UseRef)
+    stmt = x.urs.stmt
+    if isa(stmt, Expr)
+        return _useref_getindex_expr(stmt, x.op)
+    end
+    return _useref_getindex(stmt, x.op)
+end
 
 function is_relevant_expr(e::Expr)
     return e.head in (:call, :invoke, :invoke_modify,
@@ -668,8 +702,8 @@ function is_relevant_expr(e::Expr)
                       :new_opaque_closure)
 end
 
-@noinline function _useref_setindex!(@nospecialize(stmt), op::Int, @nospecialize(v))
-    if isa(stmt, Expr) && stmt.head === :(=)
+@inline function _useref_setindex_expr!(stmt::Expr, op::Int, @nospecialize(v))
+    if stmt.head === :(=)
         rhs = stmt.args[2]
         if isa(rhs, Expr)
             if is_relevant_expr(rhs)
@@ -680,10 +714,15 @@ end
         end
         op == 1 || throw(BoundsError())
         stmt.args[2] = v
-    elseif isa(stmt, Expr) # @assert is_relevant_expr(stmt)
+    else # @assert is_relevant_expr(stmt)
         op > length(stmt.args) && throw(BoundsError())
         stmt.args[op] = v
-    elseif isa(stmt, GotoIfNot)
+    end
+    return stmt
+end
+
+@noinline function _useref_setindex_nonexpr!(@nospecialize(stmt), op::Int, @nospecialize(v))
+    if isa(stmt, GotoIfNot)
         op == 1 || throw(BoundsError())
         stmt = GotoIfNot(v, stmt.dest)
     elseif isa(stmt, ReturnNode)
@@ -715,8 +754,20 @@ end
     return stmt
 end
 
+@noinline function _useref_setindex!(@nospecialize(stmt), op::Int, @nospecialize(v))
+    if isa(stmt, Expr)
+        return _useref_setindex_expr!(stmt, op, v)
+    end
+    return _useref_setindex_nonexpr!(stmt, op, v)
+end
+
 @inline function setindex!(x::UseRef, @nospecialize(v))
-    x.urs.stmt = _useref_setindex!(x.urs.stmt, x.op, v)
+    stmt = x.urs.stmt
+    if isa(stmt, Expr)
+        _useref_setindex_expr!(stmt, x.op, v)
+    else
+        x.urs.stmt = _useref_setindex_nonexpr!(stmt, x.op, v)
+    end
     return x
 end
 
@@ -736,9 +787,27 @@ end
     end
 end
 
+@inline function _advance_expr(stmt::Expr, op::Int)
+    args = if stmt.head === :(=)
+        rhs = stmt.args[2]
+        if isa(rhs, Expr) && is_relevant_expr(rhs)
+            rhs.args
+        else
+            return iszero(op) ? 1 : nothing
+        end
+    else # @assert is_relevant_expr(stmt)
+        stmt.args
+    end
+    op += 1
+    op > length(args) && return nothing
+    checkbounds(args, op)
+    return op
+end
+
 @inline function iterate(it::UseRefIterator, op::Int=0)
     it.relevant || return nothing
-    op = _advance(it.stmt, op)
+    stmt = it.stmt
+    op = isa(stmt, Expr) ? _advance_expr(stmt, op) : _advance(stmt, op)
     op === nothing && return nothing
     return (UseRef(it, op), op)
 end
@@ -1435,7 +1504,8 @@ end
 function renumber_ssa2!(@nospecialize(stmt), ssanums::Vector{Any}, used_ssas::Vector{Int}, new_new_used_ssas::Vector{Int}, late_fixup::Vector{Int}, result_idx::Int, do_rename_ssa::Bool, mark_refined!::Union{Refiner, Nothing})
     urs = userefs(stmt)
     for op in urs
-        val = op[]
+        oldval = op[]
+        val = oldval
         if isa(val, OldSSAValue) || isa(val, NewSSAValue)
             push!(late_fixup, result_idx)
         end
@@ -1445,7 +1515,7 @@ function renumber_ssa2!(@nospecialize(stmt), ssanums::Vector{Any}, used_ssas::Ve
         if isa(val, OldSSAValue) || isa(val, NewSSAValue)
             push!(late_fixup, result_idx)
         end
-        op[] = val
+        val === oldval || (op[] = val)
     end
     return urs[]
 end

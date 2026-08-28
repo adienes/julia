@@ -177,7 +177,7 @@ function reprocess_instruction!(interp::AbstractInterpreter, inst::Instruction, 
             while true
                 if length(irsv.callstack) > irsv.frameid
                     typeinf(interp, irsv.callstack[irsv.frameid + 1])
-                elseif !doworkloop(interp, irsv)
+                elseif !doworkloop(irsv)
                     break
                 end
             end

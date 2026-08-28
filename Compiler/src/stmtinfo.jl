@@ -59,20 +59,29 @@ inference_proof(result::ConcreteResult) =
     result.proof === nothing ? result.edge::CodeInstance : result.proof
 inference_proof(result::SemiConcreteResult) = something(result.proof, result.edge)
 
-function record_invoke_edge!(invokes::IdDict{Any,Vector{Any}},
+function record_invoke_edge!(invokes::IdDict{Any,Any},
                              @nospecialize(signature), @nospecialize(target))
-    signatures = get!(Vector{Any}, invokes, target)
-    for previous in signatures
-        previous == signature && return false
+    if !haskey(invokes, target)
+        invokes[target] = signature
+        return true
     end
-    push!(signatures, signature)
+    previous = invokes[target]
+    if previous isa Vector{Any}
+        for previous_signature in previous
+            previous_signature == signature && return false
+        end
+        push!(previous, signature)
+    else
+        previous == signature && return false
+        invokes[target] = Any[previous, signature]
+    end
     return true
 end
 
-function _materialize_inference_edges!(edges::Vector{Any}, source,
+function _materialize_inference_edges!(edges::Vector{Any}, source::Union{Vector{Any},SimpleVector},
                                        seen_proofs::IdSet{LocalInferenceProof},
                                        standalone::IdSet{Any},
-                                       invokes::IdDict{Any,Vector{Any}})
+                                       invokes::IdDict{Any,Any})
     i = 1
     while i <= length(source)
         edge = source[i]
@@ -117,7 +126,7 @@ function _materialize_inference_edges!(edges::Vector{Any}, source,
     return nothing
 end
 
-function materialize_inference_edges(source)
+function materialize_inference_edges(source::Union{Vector{Any},SimpleVector})
     has_local_proof = false
     for edge in source
         if edge isa LocalInferenceProof
@@ -131,7 +140,7 @@ function materialize_inference_edges(source)
     edges = Any[]
     sizehint!(edges, length(source))
     _materialize_inference_edges!(edges, source,
-        IdSet{LocalInferenceProof}(), IdSet{Any}(), IdDict{Any,Vector{Any}}())
+        IdSet{LocalInferenceProof}(), IdSet{Any}(), IdDict{Any,Any}())
     return Core.svec(edges...)
 end
 

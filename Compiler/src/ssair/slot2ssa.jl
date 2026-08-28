@@ -186,6 +186,23 @@ struct BlockLiveness
     live_in_bbs::Union{Vector{Int}, Nothing}
 end
 
+struct LivenessScratch
+    bb_defs::Vector{Int}
+    bb_uses::Vector{Int}
+    extra_liveins::BitSet
+    worklist::Vector{Int}
+end
+LivenessScratch() = LivenessScratch(Int[], Int[], BitSet(), Int[])
+
+struct IDFScratch
+    heap::Vector{Tuple{Int, Int}}
+    phiblocks::Vector{Int}
+    processed::BitSet
+    visited::BitSet
+    worklist::Vector{Int}
+end
+IDFScratch() = IDFScratch(Tuple{Int, Int}[], Int[], BitSet(), BitSet(), Int[])
+
 """
     iterated_dominance_frontier(cfg::CFG, liveness::BlockLiveness, domtree::DomTree)
         -> phinodes::Vector{Int}
@@ -228,21 +245,29 @@ needs to make sure that we always visit `B` before `A`.
          Association for Computing Machinery, New York, NY, USA, 62–73.
          DOI: <https://doi.org/10.1145/199448.199464>.
 """
-function iterated_dominance_frontier(cfg::CFG, liveness::BlockLiveness, domtree::DomTree)
+iterated_dominance_frontier(cfg::CFG, liveness::BlockLiveness, domtree::DomTree) =
+    iterated_dominance_frontier(cfg, liveness, domtree, IDFScratch())
+
+function iterated_dominance_frontier(cfg::CFG, liveness::BlockLiveness, domtree::DomTree,
+                                     scratch::IDFScratch)
     defs = liveness.def_bbs
-    heap = Tuple{Int, Int}[(defs[i], domtree.nodes[defs[i]].level) for i in 1:length(defs)]
+    (; heap, phiblocks, processed, visited, worklist) = scratch
+    empty!(heap)
+    for def in defs
+        push!(heap, (def, domtree.nodes[def].level))
+    end
     heap_order = By(x -> -x[2])
     heapify!(heap, heap_order)
-    phiblocks = Int[]
+    empty!(phiblocks)
     # This bitset makes sure we only add a phi node to a given block once.
-    processed = BitSet()
+    empty!(processed)
     # This bitset implements the `key insight` mentioned above. In particular, it prevents
     # us from visiting a subtree that we have already visited before.
-    visited = BitSet()
+    empty!(visited)
     while !isempty(heap)
         # We pop from the end of the array - i.e. the element with the highest level.
         node, level = heappop!(heap, heap_order)
-        worklist = Int[]
+        empty!(worklist)
         push!(worklist, node)
         while !isempty(worklist)
             active = pop!(worklist)
@@ -491,14 +516,25 @@ function domsort_ssa!(ir::IRCode, domtree::DomTree)
     return new_ir
 end
 
-compute_live_ins(cfg::CFG, slot::SlotInfo) = compute_live_ins(cfg, slot.defs, slot.uses)
+compute_live_ins(cfg::CFG, slot::SlotInfo) =
+    compute_live_ins(cfg, slot.defs, slot.uses, LivenessScratch())
+compute_live_ins(cfg::CFG, slot::SlotInfo, scratch::LivenessScratch) =
+    compute_live_ins(cfg, slot.defs, slot.uses, scratch)
 
-function compute_live_ins(cfg::CFG, defs::Vector{Int}, uses::Vector{Int})
+compute_live_ins(cfg::CFG, defs::Vector{Int}, uses::Vector{Int}) =
+    compute_live_ins(cfg, defs, uses, LivenessScratch())
+
+# The returned vectors borrow `scratch` and are valid only until its next use.
+function compute_live_ins(cfg::CFG, defs::Vector{Int}, uses::Vector{Int},
+                          scratch::LivenessScratch)
     # We remove from `uses` any block where all uses are dominated
     # by a def. This prevents insertion of dead phi nodes at the top
     # of such a block if that block happens to be in a loop
-    bb_defs = Int[] # blocks with a def
-    bb_uses = Int[] # blocks with a use that is not dominated by a def
+    (; bb_defs, bb_uses, extra_liveins, worklist) = scratch
+    empty!(bb_defs) # blocks with a def
+    empty!(bb_uses) # blocks with a use that is not dominated by a def
+    empty!(extra_liveins)
+    empty!(worklist)
 
     # We do a sorted joint iteration over the instructions listed
     # in defs and uses following a pattern similar to mergesort
@@ -516,8 +552,6 @@ function compute_live_ins(cfg::CFG, defs::Vector{Int}, uses::Vector{Int})
         last_block = block
     end
     # To obtain live ins from bb_uses, recursively add predecessors
-    extra_liveins = BitSet()
-    worklist = Int[]
     for bb in bb_uses
         append!(worklist, Iterators.filter(p->p != 0 && !(p in bb_defs), cfg.blocks[bb].preds))
     end
@@ -574,6 +608,8 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, sv::OptimizationState,
     for (; leave_block) in catch_entry_blocks
         new_phic_nodes[leave_block] = NewPhiCNode2[]
     end
+    liveness_scratch = nothing
+    idf_scratch = nothing
     @zone "CC: IDF" for (idx, slot) in Iterators.enumerate(defuses)
         # No uses => no need for phi nodes
         isempty(slot.uses) && continue
@@ -600,7 +636,9 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, sv::OptimizationState,
             continue
         end
 
-        @zone "CC: LIVENESS" (live = compute_live_ins(cfg, slot))
+        liveness_scratch === nothing && (liveness_scratch = LivenessScratch())
+        @zone "CC: LIVENESS" (live = compute_live_ins(
+            cfg, slot, liveness_scratch::LivenessScratch))
         for li in live.live_in_bbs
             push!(live_slots[li], idx)
             cidx = findfirst(x::TryCatchRegion->x.leave_block==li, catch_entry_blocks)
@@ -636,7 +674,9 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, sv::OptimizationState,
                 end
             end
         end
-        phiblocks = iterated_dominance_frontier(cfg, live, domtree)
+        idf_scratch === nothing && (idf_scratch = IDFScratch())
+        phiblocks = iterated_dominance_frontier(cfg, live, domtree,
+                                                idf_scratch::IDFScratch)
         for block in phiblocks
             push!(phi_slots[block], idx)
             node = PhiNode()
@@ -829,8 +869,11 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, sv::OptimizationState,
                 incoming_vals[i] = Pair{Any, Any}(stmt.val, idef)
             end
         end
+        firstsucc = true
         for succ in cfg.blocks[item].succs
-            push!(worklist, (succ, item, copy(incoming_vals)))
+            successor_vals = firstsucc ? incoming_vals : copy(incoming_vals)
+            firstsucc = false
+            push!(worklist, (succ, item, successor_vals))
         end
     end
     # Delete any instruction in unreachable blocks (except for terminators)

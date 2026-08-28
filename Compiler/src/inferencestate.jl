@@ -213,12 +213,11 @@ const VarTable = Vector{VarState}
     BBEntryState
 
 Bundles the per-basic-block variable-type table ([`VarTable`](@ref)) and slot-alias table
-(`Vector{Int}`) into a single value. This ensures that both components are always present or
-absent together.
+into a single value. `aliases === nothing` represents an all-zero alias table.
 """
 struct BBEntryState
     vartable::VarTable
-    aliases::Vector{Int}
+    aliases::Union{Nothing,Vector{Int}}
 end
 
 struct StatementState
@@ -382,7 +381,7 @@ mutable struct InferenceState{I<:AbstractInterpreter}
         bb_saw_latestworld = Bool[false for _ = 1:length(cfg.blocks)]
         bb_vartable1 = VarTable(undef, nslots)
         bb_states = Union{Nothing,BBEntryState}[nothing for _ = 1:length(cfg.blocks)]
-        bb_states[1] = BBEntryState(bb_vartable1, zeros(Int, nslots))
+        bb_states[1] = BBEntryState(bb_vartable1, nothing)
         argtypes = result.argtypes
 
         argtypes = va_process_argtypes(typeinf_lattice(interp), argtypes, src.nargs, src.isva, mi)
@@ -556,13 +555,22 @@ function (::ComputeTryCatch{Handler})(code::Vector{Any}, bbs::Union{Vector{Basic
     # then we can find all `try`s by walking backwards from :enter statements,
     # and all `catch`es by looking at the statement after the :enter
     n = length(code)
+    first_enter = 0
+    for pc = 1:n
+        if isa(code[pc], EnterNode)
+            first_enter = pc
+            break
+        end
+    end
+    first_enter == 0 && return nothing
+
     ip = BitSet()
     ip.offset = 0 # for _bits_findnext
     push!(ip, n + 1)
     handler_info = nothing
 
     # start from all :enter statements and record the location of the try
-    for pc = 1:n
+    for pc = first_enter:n
         stmt = code[pc]
         if isa(stmt, EnterNode)
             (;handlers, handler_at) = handler_info =
@@ -1515,7 +1523,7 @@ function Future{T}(f, prev::Future{S}, interp::AbstractInterpreter, sv::AbsIntSt
 end
 
 """
-    doworkloop(args...)
+    doworkloop(sv)
 
 Run a task inside the abstract interpreter, returning false if there are none.
 Tasks will be run in DFS post-order tree order, such that all child tasks will
@@ -1523,13 +1531,13 @@ be run in the order scheduled, prior to running any subsequent tasks. This
 allows tasks to generate more child tasks, which will be run before anything else.
 Each task will be run repeatedly when returning `false`, until it returns `true`.
 """
-function doworkloop(interp::AbstractInterpreter, sv::AbsIntState)
+function doworkloop(sv::AbsIntState)
     tasks = sv.tasks
     prev = length(tasks)
     prevcallstack = length(sv.callstack)
     prev == 0 && return false
     task = pop!(tasks)
-    completed = task(interp, sv)
+    completed = task(sv.interp, sv)
     tasks = sv.tasks # allow dropping gc root over the previous call
     completed isa Bool || throw(TypeError(:return, "", Bool, task)) # print the task on failure as part of the error message, instead of just "@ workloop:line"
     if !completed

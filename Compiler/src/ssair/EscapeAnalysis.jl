@@ -26,7 +26,7 @@ using Base:       # Base definitions
     !, !==, &, *, +, -, :, <, <<, >, |, ∈, ∉, ∩, ∪, ≠, ≤, ≥, ⊆
 using ..Compiler: # Compiler specific definitions
     AbstractLattice, Compiler, IRCode, IR_FLAG_NOTHROW,
-    argextype, argextype_widened, fieldcount_noerror, has_flag, intrinsic_nothrow,
+    argextype, argextype_singleton, argextype_widened, fieldcount_noerror, has_flag, intrinsic_nothrow,
     is_meta_expr_head, is_identity_free_argtype, isexpr, setfield!_nothrow, singleton_type,
     try_compute_field, try_compute_fieldidx
 
@@ -1090,8 +1090,7 @@ function escape_gc_preserve!(astate::AnalysisState, pc::Int, args::Vector{Any})
 end
 
 function escape_call!(astate::AnalysisState, pc::Int, args::Vector{Any})
-    ft = argextype(first(args), astate.ir)
-    f = singleton_type(ft)
+    f = argextype_singleton(first(args), astate.ir)
     if f isa IntrinsicFunction
         if is_nothrow(astate.ir, pc)
             add_liveness_changes!(astate, pc, args, 2)
