@@ -1022,6 +1022,18 @@ function show_unionaliases(io::IO, x::Union)
 end
 
 function show(io::IO, ::MIME"text/plain", @nospecialize(x::Type))
+    if x isa Core.TypeEgal
+        # the compact `Core.Typeof(X)` spelling, with the canonical kind name
+        # spelled out alongside, mirroring the `Type{X} (alias for TypeEq{X})`
+        # display of the equality kind
+        show(IOContext(io, :compact => true), x)
+        if !(get(io, :compact, false)::Bool)
+            printstyled(io, " (alias for "; color = :light_black)
+            printstyled(IOContext(io, :compact => false), x, color = :light_black)
+            printstyled(io, ")"; color = :light_black)
+        end
+        return
+    end
     if !print_without_params(x)
         if make_typealias(x, io) !== nothing || (unwrap_unionall(x) isa Union && x <: make_typealiases(x)[2])
             show(IOContext(io, :compact => true), x)
@@ -1046,10 +1058,22 @@ function show(io::IO, ::MIME"text/plain", @nospecialize(x::Type))
     end
 end
 
+# Unlike `TypeEq`, the egality kind has no user-level braces syntax; its familiar
+# spelling is the constructor call `Core.Typeof(X)`, which round-trips
+# (`Core.Typeof(X) === Core.TypeEgal{X}` for any closed `X`) analogously to
+# `typeof(sin)` for function singleton types. Normal (compact) printing uses that
+# spelling; non-compact contexts (e.g. the REPL's `text/plain` display) show the
+# canonical kind name `Core.TypeEgal{X}` instead.
 function show_typeegal(io::IO, @nospecialize(x::Core.TypeEgal))
-    print(io, "Core.TypeEgal{")
-    show(io, type_parameter(x))
-    print(io, "}")
+    if get(io, :compact, true)::Bool
+        print(io, "Core.Typeof(")
+        show(io, type_parameter(x))
+        print(io, ")")
+    else
+        print(io, "Core.TypeEgal{")
+        show(io, type_parameter(x))
+        print(io, "}")
+    end
 end
 function show(io::IO, @nospecialize(x::Core.AnyType))
     if x isa Core.TypeofBottom
@@ -2627,6 +2651,12 @@ function print_within_stacktrace(io, s...; color=:normal, bold=false)
     end
 end
 
+# Display a `Core.TypeEgal{X}` argument (the `Core.Typeof` of a closed type) in
+# call position with the `Type{X}` spelling of the method signatures a user
+# would write to accept it — the same identification `descend_params` makes in
+# errorshow.jl. Outside call display the kind shows as `Core.Typeof(X)`.
+argtype_for_display(@nospecialize t) = t isa Core.TypeEgal ? Type{type_parameter(t)} : t
+
 function show_tuple_as_call(out::IO, name::Symbol, sig::Type;
                             demangle=false, kwargs=nothing, argnames=nothing,
                             qualified=false, hasfirst=true)
@@ -2660,7 +2690,7 @@ function show_tuple_as_call(out::IO, name::Symbol, sig::Type;
             print_within_stacktrace(io, argnames[i]; color=:light_black)
         end
         print(io, "::")
-        print_type_bicolor(env_io, sig[i]; use_color = get(io, :backtrace, false)::Bool)
+        print_type_bicolor(env_io, argtype_for_display(sig[i]); use_color = get(io, :backtrace, false)::Bool)
     end
     if kwargs !== nothing
         print(io, "; ")
@@ -2674,7 +2704,7 @@ function show_tuple_as_call(out::IO, name::Symbol, sig::Type;
                 print(io, "...")
             else
                 print(io, "::")
-                print_type_bicolor(io, t; use_color = get(io, :backtrace, false)::Bool)
+                print_type_bicolor(io, argtype_for_display(t); use_color = get(io, :backtrace, false)::Bool)
             end
         end
     end
