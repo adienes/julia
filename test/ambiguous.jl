@@ -165,6 +165,15 @@ end
 @test isempty(detect_unbound_args(UnboundAmbig55868))
 @test isempty(detect_ambiguities(UnboundAmbig55868))
 
+# An uninhabited Complex parameter must not create a false ambiguity.
+module Ambig63037
+f(::String, ::Number) = 1
+f(x::T, y::Complex{T}) where T = 2
+g(::Missing, ::Number) = 1
+g(x::T, y::Complex{T}) where T>:Int8 = 2
+end
+@test isempty(detect_ambiguities(Ambig63037))
+
 # Test that Core and Base are free of ambiguities
 # not using isempty so this prints more information when it fails
 @testset "detect_ambiguities" begin
