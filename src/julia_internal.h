@@ -999,6 +999,8 @@ JL_DLLEXPORT int jl_type_mappable_to_c(jl_value_t *ty) JL_CANSAFEPOINT;
 jl_svec_t *jl_outer_unionall_vars(jl_value_t *u) JL_CANSAFEPOINT;
 jl_value_t *jl_type_intersection_env_s(jl_value_t *a, jl_value_t *b, jl_svec_t **penv, int *issubty) JL_CANSAFEPOINT;
 jl_value_t *jl_type_intersection_env(jl_value_t *a, jl_value_t *b, jl_svec_t **penv) JL_CANSAFEPOINT;
+jl_value_t *jl_widen_intersection_bound(jl_value_t *t) JL_CANSAFEPOINT;
+jl_value_t *jl_export_intersection_type(jl_value_t *t) JL_CANSAFEPOINT;
 int jl_subtype_matching(jl_value_t *a, jl_value_t *b, jl_svec_t **penv) JL_CANSAFEPOINT;
 JL_DLLEXPORT int jl_types_struct_equiv(jl_value_t *a, jl_value_t *b) JL_NOTSAFEPOINT;
 // specificity comparison assuming !(a <: b) and !(b <: a)
