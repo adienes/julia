@@ -713,160 +713,71 @@ STATIC_INLINE void merge_vararg_unions(jl_value_t **temp, size_t nt) JL_CANSAFEP
     }
 }
 
-JL_DLLEXPORT jl_value_t *jl_type_union(jl_value_t **ts, size_t n)
+static jl_value_t *type_union(jl_value_t **ts, size_t n, int isUnion) JL_CANSAFEPOINT
 {
-    if (n == 0)
-        return (jl_value_t*)jl_bottom_type;
-    size_t i;
-    for (i = 0; i < n; i++) {
-        jl_value_t *pi = ts[i];
-        // reject the internal `Intersect` meet node (see #61917): it must not
-        // be embedded into a user-visible `Union`.
-        if (!(jl_is_type(pi) || jl_is_typevar(pi)))
-            jl_type_error("Union", (jl_value_t*)jl_type_type, pi);
+    assert(isUnion || n == 2);
+    if (isUnion) {
+        for (size_t i = 0; i < n; i++) {
+            if (!(jl_is_type(ts[i]) || jl_is_typevar(ts[i])))
+                jl_type_error("Union", (jl_value_t*)jl_type_type, ts[i]);
+        }
     }
+    if (n == 0)
+        return jl_bottom_type;
     if (n == 1)
         return ts[0];
-
-    size_t nt = count_union_components(ts, n, 1);
+    size_t split = count_union_components(ts, isUnion ? n : 1, 1);
+    size_t nt = isUnion ? split : split + count_union_components(ts + 1, 1, 1), count = 0;
     jl_value_t **temp;
     JL_GC_PUSHARGS(temp, nt+1);
-    size_t count = 0;
     flatten_type_union(ts, n, temp, &count, 1);
     assert(count == nt);
-    size_t j;
-    for (i = 0; i < nt; i++) {
-        int has_free = temp[i] != NULL && jl_has_free_typevars(temp[i]);
-        for (j = 0; j < nt; j++) {
-            if (j != i && temp[i] && temp[j]) {
-                int has_free2 = has_free | (jl_has_free_typevars(temp[j]) << 1);
-                if (simple_subtype(temp[i], temp[j], has_free2, 1))
-                    temp[i] = NULL;
+    size_t left = split, right = nt - split;
+    for (size_t i = 0; i < nt; i++) {
+        if (temp[i] == NULL) continue;
+        int has_free = jl_has_free_typevars(temp[i]);
+        for (size_t j = i + 1; j < nt; j++) {
+            if (temp[j] == NULL) continue;
+            int has_free2 = has_free | (jl_has_free_typevars(temp[j]) << 1);
+            if (simple_subtype(temp[i], temp[j], has_free2, isUnion)) {
+                temp[i] = NULL;
+                if (i < split) left--; else right--;
+                break;
+            }
+            if (simple_subtype(temp[j], temp[i], ((has_free2 & 2) >> 1) | ((has_free2 & 1) << 1), isUnion)) {
+                temp[j] = NULL;
+                if (j < split) left--; else right--;
             }
         }
     }
-    isort_union(temp, nt);
-    merge_vararg_unions(temp, nt);
-    jl_value_t **ptu = &temp[nt];
-    *ptu = jl_bottom_type;
-    int k;
-    for (k = (int)nt-1; k >= 0; --k) {
-        if (temp[k] != NULL) {
-            if (*ptu == jl_bottom_type)
-                *ptu = temp[k];
-            else
-                *ptu = jl_new_struct(jl_uniontype_type, temp[k], *ptu);
+    jl_value_t *result;
+    if (!isUnion && left == split && right == 0)
+        result = ts[0];
+    else if (!isUnion && left == 0 && right == nt - split)
+        result = ts[1];
+    else {
+        isort_union(temp, nt);
+        merge_vararg_unions(temp, nt);
+        temp[nt] = jl_bottom_type;
+        for (size_t i = nt; i-- > 0; ) {
+            if (temp[i] != NULL)
+                temp[nt] = temp[nt] == jl_bottom_type ? temp[i] : jl_new_struct(jl_uniontype_type, temp[i], temp[nt]);
         }
+        result = temp[nt];
     }
-    assert(*ptu != NULL);
-    jl_value_t *tu = *ptu;
     JL_GC_POP();
-    return tu;
+    return result;
 }
 
-static int simple_subtype2(jl_value_t *a, jl_value_t *b, int hasfree, int isUnion) JL_CANSAFEPOINT
+JL_DLLEXPORT jl_value_t *jl_type_union(jl_value_t **ts, size_t n)
 {
-    assert(hasfree == (jl_has_free_typevars(a) | (jl_has_free_typevars(b) << 1)));
-    int subab = 0, subba = 0;
-    if (jl_egal(a, b)) {
-        subab = subba = 1;
-    }
-    else if (a == jl_bottom_type || b == (jl_value_t*)jl_any_type) {
-        subab = 1;
-    }
-    else if (b == jl_bottom_type || a == (jl_value_t*)jl_any_type) {
-        subba = 1;
-    }
-    else if (hasfree != 0) {
-        subab = simple_subtype(a, b, hasfree, isUnion);
-        subba = simple_subtype(b, a, ((hasfree & 2) >> 1) | ((hasfree & 1) << 1), isUnion);
-    }
-    else if (jl_is_typeeq(a) && jl_is_typeeq(b) &&
-             jl_typeof(jl_typeeq_T(a)) != jl_typeof(jl_typeeq_T(b))) {
-        // issue #24521: don't merge Type{T} where typeof(T) varies
-    }
-    else if (jl_typeof(a) == jl_typeof(b) && jl_types_struct_equiv(a, b)) {
-        subab = subba = 1;
-    }
-    else {
-        subab = jl_subtype(a, b);
-        subba = jl_subtype(b, a);
-    }
-    return subab | (subba<<1);
+    return type_union(ts, n, 1);
 }
 
 jl_value_t *simple_union(jl_value_t *a, jl_value_t *b)
 {
-    size_t nta = count_union_components(&a, 1, 1);
-    size_t ntb = count_union_components(&b, 1, 1);
-    size_t nt = nta + ntb;
-    jl_value_t **temp;
-    JL_GC_PUSHARGS(temp, nt+1);
-    size_t count = 0;
-    flatten_type_union(&a, 1, temp, &count, 1);
-    flatten_type_union(&b, 1, temp, &count, 1);
-    assert(count == nt);
-    size_t i, j;
-    size_t ra = nta, rb = ntb;
-    // first remove cross-redundancy and check if `a >: b` or `a <: b`.
-    for (i = 0; i < nta; i++) {
-        if (temp[i] == NULL) continue;
-        int has_free = jl_has_free_typevars(temp[i]);
-        for (j = nta; j < nt; j++) {
-            if (temp[j] == NULL) continue;
-            int has_free2 = has_free | (jl_has_free_typevars(temp[j]) << 1);
-            int subs = simple_subtype2(temp[i], temp[j], has_free2, 0);
-            int subab = subs & 1, subba = subs >> 1;
-            if (subab) {
-                temp[i] = NULL;
-                if (!subba) ra = 0;
-                count--;
-                break;
-            }
-            else if (subba) {
-                temp[j] = NULL;
-                rb = 0;
-                count--;
-            }
-        }
-    }
-    if (count == ra) {
-        JL_GC_POP();
-        return a;
-    }
-    if (count == rb) {
-        JL_GC_POP();
-        return b;
-    }
-    // then remove self-redundancy
-    for (i = 0; i < nt; i++) {
-        int has_free = temp[i] != NULL && jl_has_free_typevars(temp[i]);
-        size_t jmin = i < nta ? 0 : nta;
-        size_t jmax = i < nta ? nta : nt;
-        for (j = jmin; j < jmax; j++) {
-            if (j != i && temp[i] && temp[j]) {
-                int has_free2 = has_free | (jl_has_free_typevars(temp[j]) << 1);
-                if (simple_subtype(temp[i], temp[j], has_free2, 0))
-                    temp[i] = NULL;
-            }
-        }
-    }
-    isort_union(temp, nt);
-    merge_vararg_unions(temp, nt);
-    temp[nt] = jl_bottom_type;
-    size_t k;
-    for (k = nt; k-- > 0; ) {
-        if (temp[k] != NULL) {
-            if (temp[nt] == jl_bottom_type)
-                temp[nt] = temp[k];
-            else
-                temp[nt] = jl_new_struct(jl_uniontype_type, temp[k], temp[nt]);
-        }
-    }
-    assert(temp[nt] != NULL);
-    jl_value_t *tu = temp[nt];
-    JL_GC_POP();
-    return tu;
+    jl_value_t *ts[2] = { a, b };
+    return type_union(ts, 2, 0);
 }
 
 jl_value_t *simple_intersect(jl_value_t *a, jl_value_t *b, int overesi)
@@ -911,8 +822,8 @@ jl_value_t *simple_intersect(jl_value_t *a, jl_value_t *b, int overesi)
         for (j = nta; j < nt; j++) {
             if (temp[j] == NULL) continue;
             int has_free2 = has_free | (jl_has_free_typevars(temp[j]) << 1);
-            int subs = simple_subtype2(temp[i], temp[j], has_free2, 0);
-            int subab = subs & 1, subba = subs >> 1;
+            int subab = simple_subtype(temp[i], temp[j], has_free2, 0);
+            int subba = simple_subtype(temp[j], temp[i], ((has_free2 & 2) >> 1) | ((has_free2 & 1) << 1), 0);
             if (subba && !subab) {
                 stemp[i] = -1;
                 if (stemp[j] >= 0) stemp[j] = 2;
@@ -921,7 +832,7 @@ jl_value_t *simple_intersect(jl_value_t *a, jl_value_t *b, int overesi)
                 stemp[j] = -1;
                 if (stemp[i] >= 0) stemp[i] = 2;
             }
-            else if (subs) {
+            else if (subab || subba) {
                 if (stemp[i] == 0) stemp[i] = 1;
                 if (stemp[j] == 0) stemp[j] = 1;
             }
