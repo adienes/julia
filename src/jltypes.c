@@ -1023,11 +1023,7 @@ JL_DLLEXPORT jl_value_t *jl_type_unionall(jl_tvar_t *v, jl_value_t *body)
     if (body == (jl_value_t*)v)
         return v->ub;
     // where var doesn't occur in body just return body
-    if (jl_is_typeeq(body) && v->ub != (jl_value_t*)jl_any_type) {
-        if (!jl_has_typevar(body, v))
-            return body;
-    }
-    else if (!jl_has_typevar(body, v))
+    if (!jl_has_typevar(body, v))
         return body;
     //if (v->lb == v->ub)  // TODO maybe
     //    return jl_substitute_var(body, v, v->ub);
@@ -3078,17 +3074,14 @@ static jl_value_t *inst_type_w_(jl_value_t *t, jl_typeenv_t *env, jl_typestack_t
             if (newbody == NULL) {
                 t = NULL;
             }
-            else if (!jl_has_typevar(newbody, (jl_tvar_t *)var) && jl_has_typevar(ua->body, ua->var)) {
-                // inner instantiation made a typevar disappear, e.g.
-                // NTuple{0,T} => Tuple{}; drop the now-vacuous UnionAll
-                // However, if the original body was degenerate and didn't have the typevar (special
-                // case in method signature creation, then we don't normalize it here either to avoid
-                // confusing subtyping).
-                t = newbody;
-            }
             else if (newbody != ua->body || var != (jl_value_t*)ua->var) {
-                // if t's parameters are not bound in the environment, return it uncopied (#9378)
-                t = jl_new_struct(jl_unionall_type, var, newbody);
+                // Inner instantiation can make a typevar disappear, e.g.
+                // NTuple{0,T} => Tuple{}. Preserve an originally vacuous UnionAll,
+                // which method signature creation may use without normalization.
+                if (!jl_has_typevar(newbody, (jl_tvar_t*)var) && jl_has_typevar(ua->body, ua->var))
+                    t = newbody;
+                else
+                    t = jl_new_struct(jl_unionall_type, var, newbody);
             }
         }
         JL_GC_POP();
