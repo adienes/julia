@@ -927,8 +927,8 @@ static int env_unchanged(jl_stenv_t *e, jl_savedenv_t *se) JL_NOTSAFEPOINT
     return 1;
 }
 
-static int push_consistency_scope(jl_stenv_t *e, int8_t *saved) JL_NOTSAFEPOINT;
-static void pop_consistency_scope(jl_stenv_t *e, const int8_t *saved, int nsaved) JL_NOTSAFEPOINT;
+static int push_covariance_scope(jl_stenv_t *e, int8_t *saved, int forall_only) JL_NOTSAFEPOINT;
+static void pop_covariance_scope(jl_stenv_t *e, const int8_t *saved, int nsaved, int forall_only) JL_NOTSAFEPOINT;
 
 // subtype for variable bounds consistency check. needs its own forall/exists environment.
 static int subtype_ccheck(jl_value_t *x, jl_value_t *y, jl_stenv_t *e) JL_CANSAFEPOINT
@@ -953,7 +953,7 @@ static int subtype_ccheck(jl_value_t *x, jl_value_t *y, jl_stenv_t *e) JL_CANSAF
     // counter. Save & reset the counters, then fold the local max into
     // cov_diag on exit.
     int8_t *saved_cov = (int8_t*)alloca(current_env_length(e));
-    int nsaved_cov = push_consistency_scope(e, saved_cov);
+    int nsaved_cov = push_covariance_scope(e, saved_cov, 0);
     // A check on a closed x-term checks an actual value of the query, so bounds
     // recorded inside keep the current certainty channel; descent into that
     // value is structural (`value_descent`), so it also preserves identity
@@ -979,7 +979,7 @@ static int subtype_ccheck(jl_value_t *x, jl_value_t *y, jl_stenv_t *e) JL_CANSAF
     e->bound_channel = saved_channel;
     e->spell_channel = saved_spell;
     e->value_descent = saved_descent;
-    pop_consistency_scope(e, saved_cov, nsaved_cov);
+    pop_covariance_scope(e, saved_cov, nsaved_cov, 0);
     pop_unionstate(&e->Lunions, &oldLunions);
     return sub;
 }
@@ -1021,70 +1021,29 @@ static void record_var_occurrence(jl_varbinding_t *vb, jl_stenv_t *e, jl_param_p
     }
 }
 
-// Scope the diagonal-rule's covariance counter to the surrounding
-// covariant-position context, so that occurrences inside a consistency check
-// (`subtype_ccheck` / `intersect_aside`) of a typevar's bound do not
-// contaminate the outer covariance count. Covariant positions in covariant
-// position tuples within the same scope still accumulate as before.
-//
-// `push_consistency_scope` saves the current `occurs_cov` of every live var
-// into `saved` and resets it to 0; `pop_consistency_scope` folds the in-scope
-// value into `cov_diag` (via max) and restores `occurs_cov` from `saved`.
-// The diagonal-rule test then becomes `max(occurs_cov, cov_diag) > 1`: a
-// variable is diagonal iff it occurred >= 2 times in some single scope (the
-// outer scope or any consistency check), rather than summed across all
-// consistency checks.
-static int push_consistency_scope(jl_stenv_t *e, int8_t *saved) JL_NOTSAFEPOINT
+// Scope covariance counts to one consistency check. Occurrences within this
+// scope contribute to cov_diag, but do not add to the enclosing occurs_cov.
+// When expanding a universal variable's bound, scope only universal variables;
+// existential variables continue accumulating occurrences in the enclosing scope.
+static int push_covariance_scope(jl_stenv_t *e, int8_t *saved, int forall_only) JL_NOTSAFEPOINT
 {
     jl_varbinding_t *v = e->vars;
     int i = 0;
     while (v != NULL) {
         saved[i++] = v->occurs_cov;
-        v->occurs_cov = 0;
-        v = v->prev;
-    }
-    return i;
-}
-
-static void pop_consistency_scope(jl_stenv_t *e, const int8_t *saved, int nsaved) JL_NOTSAFEPOINT
-{
-    jl_varbinding_t *v = e->vars;
-    int i = 0;
-    while (v != NULL && i < nsaved) {
-        if (v->occurs_cov > v->cov_diag)
-            v->cov_diag = v->occurs_cov;
-        v->occurs_cov = saved[i++];
-        v = v->prev;
-    }
-}
-
-// When expanding a universal variable's declared upper/lower bound during
-// `var_lt` / `var_gt`, occurrences contributed by the expanded bound (which
-// can only mention forall-side vars) must not combine with occurrences in the
-// enclosing tuple body. We push a separate evidence frame for forall vars
-// only: their counts are reset before the recursive subtype call and folded
-// into `cov_diag` afterward, while exists-side vars continue accumulating in
-// the current scope (their occurrences in the call's right-hand structure are
-// still part of the surrounding pattern).
-static int push_forall_bound_scope(jl_stenv_t *e, int8_t *saved) JL_NOTSAFEPOINT
-{
-    jl_varbinding_t *v = e->vars;
-    int i = 0;
-    while (v != NULL) {
-        saved[i++] = v->occurs_cov;
-        if (!v->existential)
+        if (!forall_only || !v->existential)
             v->occurs_cov = 0;
         v = v->prev;
     }
     return i;
 }
 
-static void pop_forall_bound_scope(jl_stenv_t *e, const int8_t *saved, int nsaved) JL_NOTSAFEPOINT
+static void pop_covariance_scope(jl_stenv_t *e, const int8_t *saved, int nsaved, int forall_only) JL_NOTSAFEPOINT
 {
     jl_varbinding_t *v = e->vars;
     int i = 0;
     while (v != NULL && i < nsaved) {
-        if (!v->existential) {
+        if (!forall_only || !v->existential) {
             if (v->occurs_cov > v->cov_diag)
                 v->cov_diag = v->occurs_cov;
             v->occurs_cov = saved[i];
@@ -1330,9 +1289,9 @@ static int var_relation(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int R, jl_pa
         return 0;
     if (!bb->existential) {
         int8_t *saved_fb = (int8_t*)alloca(current_env_length(e));
-        int nsaved_fb = push_forall_bound_scope(e, saved_fb);
+        int nsaved_fb = push_covariance_scope(e, saved_fb, 1);
         int valid = R ? subtype_left_var(a, bb->lb, e, param) : subtype_left_var(bb->ub, a, e, param);
-        pop_forall_bound_scope(e, saved_fb, nsaved_fb);
+        pop_covariance_scope(e, saved_fb, nsaved_fb, 1);
         return valid;
     }
     return R ? var_gt(b, a, e, bb, 0) : var_lt(a, e, bb, 0);
@@ -4432,7 +4391,7 @@ static jl_value_t *intersect_aside(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, 
     // counter. Save & reset the counters before any env truncation so all
     // vars are captured, and restore after the env is put back.
     int8_t *saved_cov = (int8_t*)alloca(current_env_length(e));
-    int nsaved_cov = push_consistency_scope(e, saved_cov);
+    int nsaved_cov = push_covariance_scope(e, saved_cov, 0);
 
     jl_varbinding_t *vars = NULL;
     jl_varbinding_t *bbprev = NULL;
@@ -4458,7 +4417,7 @@ static jl_value_t *intersect_aside(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, 
     if (bbprev) e->vars->prev = bbprev;
     if (vars) e->vars = vars;
 
-    pop_consistency_scope(e, saved_cov, nsaved_cov);
+    pop_covariance_scope(e, saved_cov, nsaved_cov, 0);
     return res;
 }
 
