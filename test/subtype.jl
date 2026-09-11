@@ -2990,6 +2990,21 @@ end
         @test typeintersect(B, A) == I
     end
 
+    # Matching a nominal supertype must preserve its quantified parameter bounds.
+    let A = Ref{S} where S<:(Union{Nothing, AbstractVector{R}} where Int8<:R<:Number),
+        B = Ref{Union{Nothing, Vector{T}}} where T,
+        I = Ref{Union{Nothing, Vector{T}}} where Int8<:T<:Number
+        @test typeintersect(A, B) == I
+        @test typeintersect(B, A) == I
+    end
+
+    # The inferred parameter bound can make a shared covariant slot disjoint.
+    let A = Tuple{Ref{S}, S} where S<:(Union{Nothing, AbstractVector{R}} where R<:Number),
+        B = Tuple{Ref{Union{Nothing, Vector{T}}}, T} where T
+        @test typeintersect(A, B) == Union{}
+        @test typeintersect(B, A) == Union{}
+    end
+
     # A tuple bound constrains each independent parameter inside the union.
     let A = Tuple{Ref{S}, Ref{Int8}} where S<:Union{Missing, Tuple{Int8, Int8}},
         B = Tuple{Ref{Union{Missing, Tuple{T, U}}}, Ref{T}} where {T, U},
@@ -3872,6 +3887,9 @@ end
     # union construction must not absorb `Type{T}` into a kind
     @test Union{Type{Int},DataType} isa Union
     @test (Union{Type{Vector{T}},DataType} where T) isa UnionAll
+    # Normalizing an open nominal parameter must preserve its quantified family.
+    @test (Union{Ref{Type{Vector{T}}}, Ref{S} where S<:DataType} where T) ==
+        Union{Ref{Type{Vector{T}}} where T, Ref{S} where S<:DataType}
     # dispatch: methods on `Type{Int}` still beat methods on kinds
     @test Base.morespecific(Tuple{Type{Int}}, Tuple{DataType})
     # the equal spellings from the original #33136 report behave alike, also on
