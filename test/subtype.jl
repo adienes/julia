@@ -2517,9 +2517,9 @@ T46784{B<:Val, M<:AbstractMatrix} = Tuple{<:Union{B, <:Val{<:B}}, M, Union{Abstr
 let S = Tuple{Type{T},Array{Union{T,Missing},N}} where {T,N},
     T = Tuple{Type{T},Array{Union{T,Nothing},N}} where {T,N}
     I = typeintersect(S, T)
-    @test I == typeintersect(T, S) != Union{}
-    @test_broken I <: S
-    @test_broken I <: T
+    @test I == typeintersect(T, S) == Tuple{Type{T},Array{T,N}} where {T>:Union{Missing,Nothing},N}
+    @test I <: S
+    @test I <: T
 end
 
 #issue 46736
@@ -2728,6 +2728,19 @@ end
         @test typeintersect(B, A) == I
     end
 
+    # A kind bound must preserve the narrower type-object intersection in each slot.
+    let A = Tuple{X, X, Ref{U}} where {U, T<:U, X<:T},
+        B = Tuple{Type{Int}, Type{Int}, Ref{DataType}}
+        @test typeintersect(A, B) == B
+    end
+
+    # A pinned outer bound must exclude incompatible type objects.
+    let A = Tuple{X, X, Ref{U}} where {U, X<:U},
+        B = Tuple{Type{Int}, Type{Int}, Ref{Type{Float64}}}
+        @test typeintersect(A, B) == Union{}
+        @test typeintersect(B, A) == Union{}
+    end
+
     let A = Tuple{Int, Vector{S}} where S<:(Union{Nothing, U} where U<:Tuple{Int, Int}),
         B = Tuple{T, Vector{Union{Nothing, Tuple{T, T}}}} where T,
         I = Tuple{Int, Vector{Union{Nothing, Tuple{Int, Int}}}}
@@ -2854,6 +2867,14 @@ end
         @test typeintersect(B, A) == I
     end
 
+    # A dependent bound must use the outer variable's range, not its earlier tuple slot.
+    let A = Tuple{Int8, Vector{S}} where S<:Union{Missing, Tuple{Int, Int}},
+        B = Tuple{T, Vector{Union{Missing, Tuple{U, U}}}} where {T, U<:T},
+        I = Tuple{Int8, Vector{Union{Missing, Tuple{U, U}}}} where U<:Int
+        @test typeintersect(A, B) == I
+        @test typeintersect(B, A) == I
+    end
+
     let A = Ref{Type{Int}}, B = Ref{T} where T<:DataType
         @test typeintersect(A, B) == Union{}
         @test typeintersect(B, A) == Union{}
@@ -2887,6 +2908,113 @@ end
         W = Pair{Int8, Tuple{Ref{Int8}, Int8}}
         @test W <: typeintersect(A, B) <: I
         @test W <: typeintersect(B, A) <: I
+    end
+
+    # A covariant slot must not replace the variable's admissible interval.
+    let A = Tuple{T, Ref{S}, Ref{R}, Int} where {T, S>:Tuple{T}, R<:Tuple{T}},
+        B = Tuple{Int8, Ref{Tuple{Number}}, Ref{Tuple{Int}}, Integer},
+        I = Tuple{Int8, Ref{Tuple{Number}}, Ref{Tuple{Int}}, Int}
+        @test typeintersect(A, B) == I
+        @test typeintersect(B, A) == I
+    end
+
+    # Resolving a transitive bound must replay the narrower covariant slot.
+    let A = Tuple{T, Ref{S}, Ref{R}, Int} where {P<:Integer, T<:P, S>:Tuple{T}, R<:Tuple{T}},
+        B = Tuple{Int8, Ref{Tuple{Number}}, Ref{Tuple{Integer}}, Integer},
+        I = Tuple{Int8, Ref{Tuple{Number}}, Ref{Tuple{Integer}}, Int}
+        @test typeintersect(A, B) == I
+        @test typeintersect(B, A) == I
+    end
+
+    # An inner union bound must retain its constraint on the outer parameter.
+    let A = Pair{P, Ref{Union{Missing, Int8}}} where P,
+        B = Pair{T, S} where {T, S<:(Ref{U} where U<:Union{Missing, T})},
+        I = Pair{P, Ref{Union{Missing, Int8}}} where P>:Int8
+        @test typeintersect(A, B) == I
+        @test typeintersect(B, A) == I
+    end
+
+    # A local parameter must stay shared with an outer invariant binding (#21410).
+    let A = Tuple{Ref, Pair{Ref{T}, Ref{T}} where T<:Number},
+        B = Tuple{V, Pair{V, E}} where {V, E},
+        I = Tuple{Ref{T}, Pair{Ref{T}, Ref{T}}} where T<:Number
+        @test typeintersect(A, B) == I
+    end
+
+    # Replaying an equality must retain the kind restriction on a captured parameter.
+    let A = Tuple{Ref{S}, Ref{Int8}} where S<:Union{Missing, Tuple{Int8, DataType}},
+        B = Tuple{Ref{Union{Missing, Tuple{T, U}}}, Ref{T}} where {T, U<:Type{Int}},
+        W = Tuple{Ref{Union{Missing, Tuple{Int8, Core.TypeEgal{Int}}}}, Ref{Int8}}
+        @test W <: typeintersect(A, B) <: A
+        @test W <: typeintersect(B, A) <: A
+    end
+
+    # Equating a union family must preserve all admissible parameter values.
+    let A = Tuple{Ref{Union{Missing, T}}, Missing} where T>:Missing,
+        B = Tuple{Ref{S}, S} where S<:Union{Missing, Int8},
+        I = Tuple{Ref{S}, Missing} where Missing<:S<:Union{Missing, Int8}
+        @test typeintersect(A, B) == I
+        @test typeintersect(B, A) == I
+    end
+
+    # A computed concrete tuple slot constrains its shared invariant parameter.
+    let A = Tuple{Ref{S}, Number} where S<:Union{Missing, Int},
+        B = Tuple{Ref{Union{Missing, T}}, T} where T,
+        I = Tuple{Ref{Union{Missing, Int}}, Int}
+        @test typeintersect(A, B) == I
+        @test typeintersect(B, A) == I
+    end
+
+    # Pinning a union parameter preserves the range of its transitive upper bound.
+    let A = Tuple{Ref{Union{Int, X}}, Ref{X}, U} where {U<:Number, T<:U, X<:T},
+        B = Tuple{Ref{Union{Int, Int8}}, Ref{Int8}, Any},
+        I = Tuple{Ref{Union{Int, Int8}}, Ref{Int8}, Number},
+        W = Tuple{Ref{Union{Int, Int8}}, Ref{Int8}, Float64}
+        @test W <: typeintersect(A, B) <: I
+        @test W <: typeintersect(B, A) <: I
+    end
+
+    # Inner bound constraints must allow a valid outer binding.
+    let P = Core.TypeEgal{Int},
+        A = Tuple{Tuple{Ref{S}, Ref{U}}, Ref{U}} where {U, S<:Union{Missing, Tuple{Type{Int}, DataType}}},
+        B = Tuple{(Tuple{Ref{Union{Missing, Tuple{T, T}}}, Ref{T}} where T), Ref{P}},
+        I = Tuple{Tuple{Ref{Union{Missing, Tuple{P, P}}}, Ref{P}}, Ref{P}}
+        @test typeintersect(A, B) == I
+        @test typeintersect(B, A) == I
+    end
+
+    # A tuple bound constrains each independent parameter inside the union.
+    let A = Tuple{Ref{S}, Ref{Int8}} where S<:Union{Missing, Tuple{Int8, Int8}},
+        B = Tuple{Ref{Union{Missing, Tuple{T, U}}}, Ref{T}} where {T, U},
+        I = Tuple{Ref{Union{Missing, Tuple{Int8, U}}}, Ref{Int8}} where U<:Int8,
+        W = Tuple{Ref{Union{Missing, Tuple{Int8, Int8}}}, Ref{Int8}}
+        @test W <: typeintersect(A, B) <: I
+        @test W <: typeintersect(B, A) <: I
+    end
+
+    # A repeated inner variable can equal two parameters fixed by later slots.
+    let P = Core.TypeEgal{Int},
+        A = Tuple{Ref{S}, Ref{S}, Ref{P}, Ref{P}} where S<:Union{Missing, Tuple{Type{Int}, DataType}},
+        B = Tuple{(Ref{Union{Missing, Tuple{T, T}}} where T), Ref{Union{Missing, Tuple{U, V}}}, Ref{U}, Ref{V}} where {U, V},
+        I = Tuple{Ref{Union{Missing, Tuple{P, P}}}, Ref{Union{Missing, Tuple{P, P}}}, Ref{P}, Ref{P}}
+        @test typeintersect(A, B) == I
+        @test typeintersect(B, A) == I
+    end
+
+    # Captured parameters must retain their common range across invariant slots.
+    let A = Tuple{Ref{S}, Ref{S}} where S<:Union{Missing, Tuple{Integer, Integer}},
+        B = Tuple{(Ref{Union{Missing, Tuple{T, T}}} where T), Ref{Union{Missing, Tuple{U, V}}}} where {U, V},
+        I = Tuple{Ref{Union{Missing, Tuple{U, U}}}, Ref{Union{Missing, Tuple{U, U}}}} where U<:Integer
+        @test typeintersect(A, B) == I
+        @test typeintersect(B, A) == I
+    end
+
+    # A later covariant intersection must preserve the union parameter's family.
+    let A = Tuple{Ref{Union{Missing, T}}, Int8, T} where T>:Missing,
+        B = Tuple{Ref{S}, S, Integer} where S<:Union{Missing, Integer},
+        I = Tuple{Ref{Union{Missing, S}}, Int8, S} where Int8<:S<:Integer
+        @test I <: typeintersect(A, B) <: B
+        @test I <: typeintersect(B, A) <: B
     end
 end
 

@@ -45,17 +45,6 @@ static int typeenv_has(jl_typeenv_t *env, jl_tvar_t *v) JL_NOTSAFEPOINT
     return 0;
 }
 
-static int typeenv_has_ne(jl_typeenv_t *env, jl_tvar_t *v) JL_NOTSAFEPOINT
-{
-    while (env != NULL) {
-        if (env->var == v)
-            return env->val != (jl_value_t*)v; // consider it actually not present if it is bound to itself unchanging
-        env = env->prev;
-    }
-    return 0;
-}
-
-
 static int layout_uses_free_typevars(jl_value_t *v, jl_typeenv_t *env) JL_CANSAFEPOINT
 {
     while (1) {
@@ -265,94 +254,77 @@ JL_DLLEXPORT jl_array_t *jl_find_free_typevars(jl_value_t *v)
     return out;
 }
 
-// test whether a type has vars bound by the given environment
-int jl_has_bound_typevars(jl_value_t *v, jl_typeenv_t *env) JL_NOTSAFEPOINT
+// Free occurrences, restricted by position or required in every union alternative.
+enum { TVAR_ANY, TVAR_CONSTRUCTOR, TVAR_INVARIANT, TVAR_ALWAYS_COV, TVAR_ALWAYS_COV_INSIDE };
+
+static int has_typevar(jl_value_t *v, jl_tvar_t *var, int position) JL_NOTSAFEPOINT
 {
-    while (1) {
-        if (jl_is_typevar(v)) {
-            return typeenv_has_ne(env, (jl_tvar_t*)v);
-        }
-        if (jl_is_typeapp(v)) {
-            jl_typeapp_t *ta = (jl_typeapp_t*)v;
-            if (jl_has_bound_typevars(ta->head, env))
-                return 1;
-            v = ta->param;
-            continue;
-        }
-        while (jl_is_unionall(v)) {
-            jl_unionall_t *ua = (jl_unionall_t*)v;
-            if (ua->var->lb != jl_bottom_type && jl_has_bound_typevars(ua->var->lb, env))
-                return 1;
-            if (ua->var->ub != (jl_value_t*)jl_any_type && jl_has_bound_typevars(ua->var->ub, env))
-                return 1;
-            // Temporarily remove this var from env if necessary
-            // Note that te might be bound more than once in the env, so
-            // we remove it by setting it to itself in a new env.
-            if (typeenv_has_ne(env, ua->var)) {
-                jl_typeenv_t *newenv = (jl_typeenv_t*)alloca(sizeof(jl_typeenv_t));
-                newenv->var = ua->var;
-                newenv->val = (jl_value_t*)ua->var;
-                newenv->prev = env;
-                env = newenv;
-            }
-            v = ua->body;
-        }
-        // After unwrapping UnionAll, body might be TypeApp or TypeVar;
-        // restart the loop so those checks at the top fire.
-        if (jl_is_typeapp(v) || jl_is_typevar(v))
-            continue;
-        if (jl_is_datatype(v)) {
-            if (!((jl_datatype_t*)v)->hasfreetypevars)
-                return 0;
-            size_t i;
-            for (i = 0; i < jl_nparams(v); i++) {
-                if (jl_has_bound_typevars(jl_tparam(v, i), env))
-                    return 1;
-            }
+    int always_covariant = position >= TVAR_ALWAYS_COV;
+    if (v == (jl_value_t*)var)
+        return position == TVAR_ANY || position == TVAR_ALWAYS_COV_INSIDE;
+    if (jl_is_uniontype(v) || jl_is_intersecttype(v)) {
+        if (always_covariant && jl_is_intersecttype(v))
             return 0;
-        }
-        else if (jl_is_uniontype(v) || jl_is_intersecttype(v)) {
-            if (jl_has_bound_typevars(((jl_uniontype_t*)v)->a, env))
-                return 1;
-           v = ((jl_uniontype_t*)v)->b;
-        }
-        else if (jl_is_some_Type(v)) {
-            v = jl_some_Type_T(v);
-        }
-        else if (jl_is_vararg(v)) {
-            jl_vararg_t *vm = (jl_vararg_t *)v;
-            if (!vm->T)
-                return 0;
-            if (vm->N) {
-                if (jl_has_bound_typevars(vm->N, env))
-                    return 1;
-            }
-            v = vm->T;
-        }
-        else {
+        int occurs = has_typevar(((jl_uniontype_t*)v)->a, var, position);
+        if (always_covariant ? !occurs : occurs)
+            return occurs;
+        return has_typevar(((jl_uniontype_t*)v)->b, var, position);
+    }
+    if (jl_is_unionall(v)) {
+        jl_unionall_t *u = (jl_unionall_t*)v;
+        return (!always_covariant && has_typevar(u->var->lb, var, position)) ||
+            has_typevar(u->var->ub, var, always_covariant ? TVAR_ALWAYS_COV : position) ||
+            (u->var != var && has_typevar(u->body, var, position));
+    }
+    if (jl_is_vararg(v)) {
+        jl_vararg_t *vm = (jl_vararg_t*)v;
+        return vm->T && (has_typevar(vm->T, var, position == TVAR_CONSTRUCTOR ? TVAR_ANY : position) ||
+            (!always_covariant && vm->N && has_typevar(vm->N, var, TVAR_ANY)));
+    }
+    if (jl_is_some_Type(v))
+        return !always_covariant && has_typevar(jl_some_Type_T(v), var, TVAR_ANY);
+    if (jl_is_typeapp(v)) {
+        jl_typeapp_t *app = (jl_typeapp_t*)v;
+        return !always_covariant && (has_typevar(app->head, var, position) || has_typevar(app->param, var, position));
+    }
+    if (jl_is_datatype(v) && ((jl_datatype_t*)v)->hasfreetypevars) {
+        int tuple = jl_is_tuple_type(v);
+        if (always_covariant && !tuple)
             return 0;
+        int nested = always_covariant ? TVAR_ALWAYS_COV_INSIDE :
+            tuple && position == TVAR_INVARIANT ? TVAR_INVARIANT : TVAR_ANY;
+        for (size_t i = 0; i < jl_nparams(v); i++) {
+            if (has_typevar(jl_tparam(v,i), var, nested))
+                return 1;
         }
     }
+    return 0;
 }
 
-JL_DLLEXPORT int jl_has_typevar(jl_value_t *t, jl_tvar_t *v) JL_NOTSAFEPOINT
+JL_DLLEXPORT int jl_has_typevar(jl_value_t *v, jl_tvar_t *var) JL_NOTSAFEPOINT
 {
-    jl_typeenv_t env = { v, NULL, NULL };
-    return jl_has_bound_typevars(t, &env);
+    return has_typevar(v, var, TVAR_ANY);
 }
 
-static int _jl_has_typevar_from_ua(jl_value_t *t, jl_unionall_t *ua, jl_typeenv_t *prev)
+int jl_has_typevar_inside(jl_value_t *v, jl_tvar_t *var, int invariant) JL_NOTSAFEPOINT
 {
-    jl_typeenv_t env = { ua->var, NULL, prev };
-    if (jl_is_unionall(ua->body))
-        return _jl_has_typevar_from_ua(t, (jl_unionall_t*)ua->body, &env);
-    else
-        return jl_has_bound_typevars(t, &env);
+    return has_typevar(v, var, invariant ? TVAR_INVARIANT : TVAR_CONSTRUCTOR);
+}
+
+int jl_always_occurs_covariant(jl_value_t *v, jl_tvar_t *var, int inside) JL_NOTSAFEPOINT
+{
+    return has_typevar(v, var, inside ? TVAR_ALWAYS_COV_INSIDE : TVAR_ALWAYS_COV);
 }
 
 JL_DLLEXPORT int jl_has_typevar_from_unionall(jl_value_t *t, jl_unionall_t *ua)
 {
-    return _jl_has_typevar_from_ua(t, ua, NULL);
+    while (1) {
+        if (jl_has_typevar(t, ua->var))
+            return 1;
+        if (!jl_is_unionall(ua->body))
+            return 0;
+        ua = (jl_unionall_t*)ua->body;
+    }
 }
 
 int jl_has_fixed_layout(jl_datatype_t *dt)
@@ -3242,9 +3214,16 @@ static jl_value_t *instantiate_with(jl_value_t *t, jl_value_t **env, size_t n, j
 {
     if (n > 0) {
         jl_typeenv_t en = { (jl_tvar_t*)env[0], env[1], te };
-        return instantiate_with(t, &env[2], n-1, &en );
+        return instantiate_with(t, &env[2], n-1, &en);
     }
     return inst_type_w_(t, te, NULL, 1, 0, 0);
+}
+
+jl_value_t *jl_instantiate_with_typeenv(jl_value_t *t, jl_typeenv_t *env, int nothrow)
+{
+    if (env == NULL || !jl_has_free_typevars(t))
+        return t;
+    return inst_type_w_(t, env, NULL, 1, nothrow, 0);
 }
 
 jl_value_t *jl_instantiate_type_with(jl_value_t *t, jl_value_t **env, size_t n)
