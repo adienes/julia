@@ -2825,6 +2825,13 @@ end
         @test typeintersect(B, A) == I
     end
 
+    # Normalize a concrete tuple parameter constrained through an outer variable.
+    let A = Ref{S} where Missing<:S<:Union{Missing, Tuple{Int8, Int8}},
+        B = Ref{Union{Missing, Tuple{T, T}}} where {U, T<:U},
+        I = Ref{Union{Missing, Tuple{Int8, Int8}}}
+        @test typeintersect(A, B) == I
+    end
+
     let A = Matrix{S} where S<:(Union{Missing, U} where U<:Number),
         B = Array{Union{Missing, T}, N} where {N, R<:Number, T<:R},
         I = Matrix{Union{Missing, T}} where T<:Number
@@ -3007,6 +3014,13 @@ end
         I = Tuple{Ref{Union{Missing, Tuple{U, U}}}, Ref{Union{Missing, Tuple{U, U}}}} where U<:Integer
         @test typeintersect(A, B) == I
         @test typeintersect(B, A) == I
+    end
+
+    # A later binding must satisfy the kind bound of a captured parameter.
+    let A = Tuple{Ref{S}, Ref{S}, Ref{DataType}} where S<:Union{Missing, Tuple{Type{Int}, DataType}},
+        B = Tuple{(Ref{Union{Missing, Tuple{T, T}}} where T<:Type{Int}), Ref{Union{Missing, Tuple{U, U}}}, Ref{U}} where U
+        @test typeintersect(A, B) == Union{}
+        @test typeintersect(B, A) == Union{}
     end
 
     # A later covariant intersection must preserve the union parameter's family.
