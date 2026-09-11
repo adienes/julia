@@ -3016,11 +3016,47 @@ end
         @test typeintersect(B, A) == I
     end
 
-    # A later binding must satisfy the kind bound of a captured parameter.
-    let A = Tuple{Ref{S}, Ref{S}, Ref{DataType}} where S<:Union{Missing, Tuple{Type{Int}, DataType}},
-        B = Tuple{(Ref{Union{Missing, Tuple{T, T}}} where T<:Type{Int}), Ref{Union{Missing, Tuple{U, U}}}, Ref{U}} where U
+    # Captured parameters must retain both declared and inferred kind bounds.
+    let A = Tuple{Ref{S}, Ref{S}, Ref{DataType}} where S<:Union{Missing, Tuple{Type{Int}, DataType}}
+        for bound in (Type{Int}, Any)
+            B = Tuple{(Ref{Union{Missing, Tuple{T, T}}} where T<:bound), Ref{Union{Missing, Tuple{U, U}}}, Ref{U}} where U
+            @test typeintersect(A, B) == Union{}
+            @test typeintersect(B, A) == Union{}
+        end
+    end
+
+    # Projecting a captured union parameter must preserve both upper-bound constraints.
+    let A = Tuple{Ref{S}, Ref{S}, Ref{DataType}} where S<:Union{Missing, Type{Int}},
+        B = Tuple{(Ref{Union{Missing, T}} where T<:DataType), Ref{Union{Missing, U}}, Ref{U}} where U
         @test typeintersect(A, B) == Union{}
         @test typeintersect(B, A) == Union{}
+    end
+
+    let A = Tuple{Ref{S}, Ref{S}, Ref{Type{Int}}} where S<:Union{Missing, Nothing, DataType},
+        B = Tuple{(Ref{Union{Missing, Nothing, T}} where T<:Type{Int}), Ref{Union{Missing, Nothing, U}}, Ref{U}} where U
+        @test typeintersect(A, B) == Union{}
+    end
+
+    # Capturing a union parameter must retain equalities established by other slots.
+    let A = Tuple{Ref{Int8}, Ref{S}, Ref{S}} where S<:Union{Missing, Nothing, Int8},
+        B = Tuple{Ref{U}, Ref{Union{Missing, Nothing, U}}, (Ref{Union{Missing, Nothing, T}} where T<:Int8)} where U,
+        I = Tuple{Ref{Int8}, Ref{Union{Missing, Nothing, Int8}}, Ref{Union{Missing, Nothing, Int8}}}
+        @test typeintersect(A, B) == I
+        @test typeintersect(B, A) == I
+    end
+
+    let A = Tuple{Ref{S}, Ref{S}, Ref{Integer}} where S<:Union{Missing, Nothing, Int8},
+        B = Tuple{(Ref{Union{Missing, Nothing, T}} where T<:Int8), Ref{Union{Missing, Nothing, U}}, Ref{U}} where U
+        @test typeintersect(A, B) == Union{}
+        @test typeintersect(B, A) == Union{}
+    end
+
+    # Union alternatives must preserve the relation to a later tuple slot.
+    let A = Tuple{Ref{Union{Missing, Nothing, T}}, DataType, Union{Missing, Nothing, T}} where T,
+        B = Tuple{Ref{S}, S, Any} where S,
+        I = Tuple{Ref{Union{Missing, Nothing, T}}, DataType, T} where T,
+        W = Tuple{Ref{Union{Missing, Nothing, DataType}}, DataType, Missing}
+        @test W <: typeintersect(B, A) <: I
     end
 
     # A later covariant intersection must preserve the union parameter's family.
