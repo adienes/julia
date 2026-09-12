@@ -3005,6 +3005,14 @@ end
         @test typeintersect(B, A) == Union{}
     end
 
+    # Closing dependent captured bounds must preserve the whole shared family.
+    let A = Tuple{Ref{S}, Ref{S}} where S<:Union{Nothing, Tuple{Number, Number}},
+        B = Tuple{(Ref{Union{Nothing, Tuple{R, T}}} where {R<:Number, T<:R}), Ref{Union{Nothing, Tuple{U, V}}}} where {U, V},
+        I = Tuple{Ref{Union{Nothing, Tuple{U, V}}}, Ref{Union{Nothing, Tuple{U, V}}}} where {U<:Number, V<:U}
+        @test I <: typeintersect(A, B)
+        @test I <: typeintersect(B, A)
+    end
+
     # A tuple bound constrains each independent parameter inside the union.
     let A = Tuple{Ref{S}, Ref{Int8}} where S<:Union{Missing, Tuple{Int8, Int8}},
         B = Tuple{Ref{Union{Missing, Tuple{T, U}}}, Ref{T}} where {T, U},
