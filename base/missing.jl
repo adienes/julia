@@ -122,6 +122,8 @@ for f in (:(+), :(-), :(*), :(/), :(^), :(mod), :(rem))
     end
 end
 
+rem(::Missing, ::MultiplicativeInverses.MultiplicativeInverse) = missing
+
 div(::Missing, ::Missing, r::RoundingMode) = missing
 div(::Missing, ::Number, r::RoundingMode) = missing
 div(::Number, ::Missing, r::RoundingMode) = missing

@@ -2462,4 +2462,19 @@ let mi = Compiler.specialize_method(only(methods(ndims, (Matrix{Float64},))),
     @test Compiler.ci_get_source(interp, codeinst) isa Core.CodeInfo
 end
 
+# issue #63037: an abstract field type must not exclude a valid dispatch case.
+struct Holder63037
+    x::Matrix{S} where S<:(Union{Missing, U} where U<:Number)
+end
+f63037(::Array{Union{Missing, T}, N} where {N, T<:Number}) = 1
+g63037(h::Holder63037) = f63037(h.x)
+f63037_unbounded(::Array{Union{Missing, T}, N} where {N, T}) = 1
+g63037_unbounded(h::Holder63037) = f63037_unbounded(h.x)
+@testset "issue #63037" begin
+    A = Matrix{Union{Missing, Float64}}(undef, 1, 1)
+    h = Holder63037(A)
+    @test g63037(h) == 1
+    @test g63037_unbounded(h) == 1
+end
+
 end # module inline_tests

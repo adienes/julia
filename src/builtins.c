@@ -2502,7 +2502,7 @@ JL_CALLABLE(jl_f_task_result_type)
 // object for layout purposes before we got around to deciding if inlining
 // would be possible, so we cannot change the layout now if so.
 // affects_layout is a (conservative) analysis of layout_uses_free_typevars
-// freevars is a (conservative) analysis of what calling jl_has_bound_typevars from name->wrapper gives (TODO: just call this instead?)
+// freevars is a (conservative) analysis of what jl_has_typevar_from_unionall(p, name->wrapper) gives (TODO: just call this instead?)
 int references_name(jl_value_t *p, jl_typename_t *name, int affects_layout, int freevars) JL_NOTSAFEPOINT
 {
     if (freevars && !jl_has_free_typevars(p))
