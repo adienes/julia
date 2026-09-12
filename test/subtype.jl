@@ -3013,6 +3013,14 @@ end
         @test I <: typeintersect(B, A)
     end
 
+    # Union branches must retain witnesses when they constrain captured bounds differently.
+    let A = Tuple{Ref{S}, Q} where {S<:Union{Nothing, Tuple{Number, Number}}, Q<:Ref{S}},
+        B = Tuple{(Ref{Union{Nothing, Tuple{R, T}}} where {R<:Number, T<:R}), Union{Ref{Union{Nothing, Tuple{U, V}}}, Ref{Union{Nothing, Tuple{V, U}}}}} where {U, V},
+        W = Tuple{Ref{Union{Nothing, Tuple{Int, Int}}}, Ref{Union{Nothing, Tuple{Int, Int}}}}
+        @test W <: typeintersect(A, B)
+        @test W <: typeintersect(B, A)
+    end
+
     # A tuple bound constrains each independent parameter inside the union.
     let A = Tuple{Ref{S}, Ref{Int8}} where S<:Union{Missing, Tuple{Int8, Int8}},
         B = Tuple{Ref{Union{Missing, Tuple{T, U}}}, Ref{T}} where {T, U},
