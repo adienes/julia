@@ -3459,7 +3459,8 @@ JL_DLLEXPORT uint32_t jl_create_system_image(void **_native_data, jl_array_t *wo
 
     mod_array = jl_get_loaded_modules();  // __toplevel__ modules loaded in this session (from Base.loaded_modules_array)
     int64_t checksumpos = write_header(f, (worklist ? JI_FLAG_PKGIMAGE : 0) |
-                                              (emit_split ? JI_FLAG_SPLIT : 0));
+                                              (emit_split ? JI_FLAG_SPLIT : 0) |
+                                              (compress ? JI_FLAG_COMPRESSED_ZSTD : 0));
     if (worklist) {
         if (_native_data != NULL) {
             if (suppress_precompile)
@@ -3671,6 +3672,16 @@ static char *jl_image_alloc_pages(size_t size)
     return data;
 }
 
+static void jl_image_free_pages(char *data, size_t size)
+{
+#ifdef _OS_WINDOWS_
+    VirtualFree((void *)data, 0, MEM_RELEASE);
+#else
+    size_t page_size = jl_getpagesize();
+    munmap((void *)data, LLT_ALIGN(size, page_size));
+#endif
+}
+
 // Decompress a compressed image payload found after the .ji header in data, and
 // return a buffer containing the uncompressed header and payload.
 static void jl_image_decompress(jl_image_buf_t *image, char *data, size_t len) JL_CANSAFEPOINT
@@ -3683,7 +3694,9 @@ static void jl_image_decompress(jl_image_buf_t *image, char *data, size_t len) J
     // modules are not known yet, so the full cache validation happens later,
     // against the decompressed buffer.
     uint32_t checksum;
-    int err = jl_read_verify_header(&f, &flags, &checksum, &dataendpos, &datastartpos);
+    int64_t flagspos = 0;
+    int err = jl_read_verify_header_impl(&f, &flags, &checksum, &dataendpos,
+                                         &datastartpos, &flagspos);
     if (err != 0)
         jl_error("Precompile file header verification checks failed.");
     if (image->is_split && checksum != image->heap_checksum)
@@ -3703,6 +3716,8 @@ static void jl_image_decompress(jl_image_buf_t *image, char *data, size_t len) J
     // Copy the uncompressed header, updating its recorded end of the payload
     // to account for decompression
     memcpy((void *)image->data, data, datastartpos);
+    uint32_t uncompressed_flags = flags & ~JI_FLAG_COMPRESSED_ZSTD;
+    memcpy((void *)(image->data + flagspos), &uncompressed_flags, sizeof(uint32_t));
     int64_t new_dataendpos = image->size;
     memcpy((void *)(image->data + dataendpos_fieldpos), &new_dataendpos, sizeof(uint64_t));
     size_t res = ZSTD_decompress((void *)(image->data + datastartpos), heap_size,
@@ -4735,6 +4750,104 @@ JL_DLLEXPORT jl_value_t *jl_restore_incremental(const char *fname, jl_array_t *d
     return ret;
 }
 
+static jl_value_t *jl_restore_package_image_from_ji(const char *fname, jl_array_t *depmods,
+                                                    int completeinfo, const char *pkgname) JL_CANSAFEPOINT
+{
+    ios_t f;
+    if (ios_file(&f, fname, 1, 0, 0, 0) == NULL) {
+        return jl_get_exceptionf(jl_errorexception_type,
+            "Cache file \"%s\" not found.\n", fname);
+    }
+    uint32_t flags = 0;
+    uint32_t checksum = 0;
+    int64_t dataendpos = 0;
+    int64_t datastartpos = 0;
+    int err = jl_read_verify_header(&f, &flags, &checksum, &dataendpos, &datastartpos);
+    if (err != 0) {
+        ios_close(&f);
+        return jl_get_exceptionf(jl_errorexception_type,
+            "Precompile file header verification checks failed.");
+    }
+
+    jl_image_t pkgimage = {
+        .heap_checksum = checksum,
+        .is_split = !!(flags & JI_FLAG_SPLIT),
+    };
+    // Must disable native code in possible downstream images, since they may
+    // contain call edges into the native code that this image deliberately skipped.
+    if (pkgimage.is_split)
+        IMAGE_NATIVE_CODE_TAINTED = 1;
+
+    int compressed = !!(flags & JI_FLAG_COMPRESSED_ZSTD);
+    if (!compressed) {
+        ios_seek(&f, 0);
+        jl_value_t *ret = jl_restore_package_image_from_stream(&f, &pkgimage, depmods,
+                                                               completeinfo, pkgname, 1);
+        ios_close(&f);
+        return ret;
+    }
+
+    int64_t filelen = ios_filesize(&f);
+    if (filelen < 0) {
+        ios_close(&f);
+        return jl_get_exceptionf(jl_errorexception_type,
+            "Error reading package image file.");
+    }
+    size_t len = (size_t)filelen;
+    char *data = (char*)malloc_s(len);
+    ios_seek(&f, 0);
+    ios_bufmode(&f, bm_none);
+    if (ios_readall(&f, data, len) != len) {
+        ios_close(&f);
+        free(data);
+        return jl_get_exceptionf(jl_errorexception_type,
+            "Error reading package image file.");
+    }
+    ios_close(&f);
+
+    jl_image_buf_t buf = {
+        .kind = JL_IMAGE_KIND_JI,
+        .pointers = NULL,
+        .data = NULL,
+        .size = len,
+        .base = 0,
+        .heap_checksum = checksum,
+        .is_split = !!(flags & JI_FLAG_SPLIT),
+    };
+
+    jl_value_t *decompress_error = NULL;
+    JL_GC_PUSH1(&decompress_error);
+    { JL_TRY {
+        jl_image_decompress(&buf, data, len);
+    }
+    JL_CATCH {
+        decompress_error = jl_current_exception(jl_current_task);
+        if (buf.data)
+            jl_image_free_pages((char *)buf.data, buf.size);
+    } }
+    free(data);
+    if (decompress_error) {
+        JL_GC_POP();
+        return decompress_error;
+    }
+    JL_GC_POP();
+    if (!jl_options.permalloc_pkgimg)
+        jl_gc_notify_image_load(buf.data, buf.size);
+    jl_value_t *ret = NULL;
+    { JL_TRY {
+        ret = jl_restore_incremental_from_buf(buf, &pkgimage, depmods, completeinfo,
+                                              pkgname, 0);
+    }
+    JL_CATCH {
+        if (jl_options.permalloc_pkgimg)
+            jl_image_free_pages((char *)buf.data, buf.size);
+        jl_rethrow();
+    } }
+    if (jl_options.permalloc_pkgimg)
+        jl_image_free_pages((char *)buf.data, buf.size);
+    return ret;
+}
+
 JL_DLLEXPORT void jl_restore_system_image(jl_image_t *image, jl_image_buf_t buf)
 {
     ios_t f;
@@ -4756,6 +4869,9 @@ JL_DLLEXPORT void jl_restore_system_image(jl_image_t *image, jl_image_buf_t buf)
 
 JL_DLLEXPORT jl_value_t *jl_restore_package_image_from_file(const char *fname, jl_array_t *depmods, int completeinfo, const char *pkgname, int ignore_native) JL_CANSAFEPOINT
 {
+    if (ignore_native)
+        return jl_restore_package_image_from_ji(fname, depmods, completeinfo, pkgname);
+
     void *pkgimg_handle = jl_dlopen_e(fname, JL_RTLD_LAZY);
     jl_image_buf_t buf = get_image_buf(pkgimg_handle, /* is_pkgimage */ 1);
 
@@ -4763,13 +4879,6 @@ JL_DLLEXPORT jl_value_t *jl_restore_package_image_from_file(const char *fname, j
 
     // Despite the name, this function actually parses the pkgimage
     jl_image_t pkgimage = jl_load_pkgimg(buf);
-
-    if (ignore_native) {
-        // Must disable using native code in possible downstream users of this code:
-        // https://github.com/JuliaLang/julia/pull/52123#issuecomment-1959965395.
-        // The easiest way to do that is to disable it in all of them.
-        IMAGE_NATIVE_CODE_TAINTED = 1;
-    }
 
     jl_value_t* mod = jl_restore_incremental_from_buf(buf, &pkgimage, depmods, completeinfo, pkgname, 0);
 

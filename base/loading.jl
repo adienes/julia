@@ -1454,10 +1454,18 @@ function _include_from_serialized(pkg::PkgId, path::String, ocachepath::Union{No
             depmods[i] = dep
         end
 
-        ignore_native = false
+        ignore_native = JLOptions().use_pkgimages == 0
         unlock(require_lock) # temporarily _unlock_ during these operations
         sv = try
-            if ocachepath !== nothing
+            if ignore_native
+                if ocachepath === nothing
+                    @debug "Loading cache file $path for $(repr("text/plain", pkg))"
+                else
+                    @debug "Loading cache file $path without native code for $(repr("text/plain", pkg))"
+                end
+                ccall(:jl_restore_package_image_from_file, Any, (Cstring, Any, Cint, Cstring, Cint),
+                    path, depmods, #=completeinfo=#false, pkg.name, ignore_native)
+            elseif ocachepath !== nothing
                 @debug "Loading object cache file $ocachepath for $(repr("text/plain", pkg))"
                 ccall(:jl_restore_package_image_from_file, Any, (Cstring, Any, Cint, Cstring, Cint),
                     ocachepath, depmods, #=completeinfo=#false, pkg.name, ignore_native)
@@ -2210,11 +2218,14 @@ function _tryrequire_from_serialized(pkg::PkgId, path::String, ocachepath::Union
 
         pkgimage = !isempty(clone_targets)
         if pkgimage
-            ocachepath !== nothing || return ArgumentError("Expected ocachepath to be provided")
-            isfile(ocachepath) || return ArgumentError("Ocachepath $ocachepath is not a file.")
-            ocachepath == ocachefile_from_cachefile(path) || return ArgumentError("$ocachepath is not the expected ocachefile")
-            # TODO: Check for valid clone_targets?
-            isvalid_pkgimage_crc(io, ocachepath) || return ArgumentError("Invalid checksum in cache file $ocachepath.")
+            expected_ocachepath = ocachefile_from_cachefile(path)
+            ocachepath = something(ocachepath, expected_ocachepath)
+            if JLOptions().use_pkgimages != 0
+                isfile(ocachepath) || return ArgumentError("Ocachepath $ocachepath is not a file.")
+                ocachepath == expected_ocachepath || return ArgumentError("$ocachepath is not the expected ocachefile")
+                # TODO: Check for valid clone_targets?
+                isvalid_pkgimage_crc(io, ocachepath) || return ArgumentError("Invalid checksum in cache file $ocachepath.")
+            end
         else
             @assert ocachepath === nothing
         end
@@ -3804,6 +3815,7 @@ end
 
 const JI_FLAG_PKGIMAGE::UInt32 = 1 << 0
 const JI_FLAG_SPLIT::UInt32 = 1 << 1
+const JI_FLAG_COMPRESSED_ZSTD::UInt32 = 1 << 2
 
 function isvalid_cache_header(f::IOStream)
     flags = Ref{UInt32}()
@@ -4382,7 +4394,6 @@ const CACHE_REJECT_REASONS = Dict{Symbol,Pair{Symbol,String}}(
     :fsize_changed           => :actionable  => "file size changed",
     :content_changed         => :actionable  => "file content changed",
     :flags_mismatch          => :actionable  => "different compilation options",
-    :pkgimages_disabled      => :actionable  => "native code caching disabled",
     :cpu_target              => :actionable  => "different system or CPU target",
     :ocachefile_missing      => :actionable  => "native code cache file not found",
     :dep_loaded_incompatible => :actionable  => "different version of dependency already loaded",
@@ -4553,6 +4564,9 @@ end
                                           reasons::Union{Dict{Symbol,Int},Nothing}=nothing, stalecheck::Bool=true,
                                           verify_checksums::Bool=true)
     # n.b.: this function does nearly all of the file validation, not just those checks related to stale, so the name is potentially unclear
+    # `existing` is not representable in CacheFlags, so it is relevant only
+    # when inherited from the current process rather than supplied as a config.
+    loads_native = requested_flags.use_pkgimages || JLOptions().use_pkgimages == 2
     io = try
         open(cachefile, "r")
     catch ex
@@ -4588,25 +4602,21 @@ end
         pkgimage = !isempty(clone_targets)
         if pkgimage
             ocachefile = ocachefile_from_cachefile(cachefile)
-            if JLOptions().use_pkgimages == 0
-                # presence of clone_targets means native code cache
-                @debug "Rejecting cache file $cachefile for $modkey since it would require usage of pkgimage"
-                record_reason(reasons, :pkgimages_disabled)
-                return true
-            end
-            rejection_reasons = check_clone_targets(clone_targets)
-            if !isnothing(rejection_reasons)
-                @debug("Rejecting cache file $cachefile for $modkey:",
-                    Reasons=rejection_reasons,
-                    var"Image Targets"=parse_image_targets(clone_targets),
-                    var"Current Targets"=current_image_targets())
-                record_reason(reasons, :cpu_target)
-                return true
-            end
-            if !isfile(ocachefile)
-                @debug "Rejecting cache file $cachefile for $modkey since pkgimage $ocachefile was not found"
-                record_reason(reasons, :ocachefile_missing)
-                return true
+            if loads_native
+                rejection_reasons = check_clone_targets(clone_targets)
+                if !isnothing(rejection_reasons)
+                    @debug("Rejecting cache file $cachefile for $modkey:",
+                        Reasons=rejection_reasons,
+                        var"Image Targets"=parse_image_targets(clone_targets),
+                        var"Current Targets"=current_image_targets())
+                    record_reason(reasons, :cpu_target)
+                    return true
+                end
+                if !isfile(ocachefile)
+                    @debug "Rejecting cache file $cachefile for $modkey since pkgimage $ocachefile was not found"
+                    record_reason(reasons, :ocachefile_missing)
+                    return true
+                end
             end
         else
             ocachefile = nothing
@@ -4720,7 +4730,7 @@ end
                 return true
             end
 
-            if pkgimage
+            if pkgimage && loads_native
                 if !isvalid_pkgimage_crc(io, ocachefile::String)
                     @debug "Rejecting cache file $cachefile because $ocachefile has an invalid checksum"
                     record_reason(reasons, :ocache_checksum_invalid)

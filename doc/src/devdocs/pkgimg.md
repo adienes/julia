@@ -6,9 +6,16 @@ In fact the underlying serialization format is the same, and the system image is
 
 ## High-level overview
 
-Package images are shared libraries that contain both code and data. Like `.ji` cache files, they are generated per package. The data section contains both global data (global variables in the package) as well as the necessary metadata about what methods and types are defined by the package. The code section contains native objects that cache the final output of Julia's LLVM-based compiler.
+Each package-image cache consists of a `.ji` file containing the serialized heap
+and a companion shared library containing native code. The heap contains global
+data as well as the metadata describing the package's methods and types. The
+shared library caches the final output of Julia's LLVM-based compiler.
 
-The command line option `--pkgimages=no` can be used to turn off object caching for this session. Note that this means that cache files have to likely be regenerated.
+The command line option `--pkgimages=no` turns off native object caching for
+the session. A compatible `.ji` produced with package images enabled can still
+be loaded; Julia ignores the companion shared library and JIT-compiles methods
+as needed. A redundant semantic-only cache therefore does not need to be
+generated solely because native package images are disabled.
 See [`JULIA_MAX_NUM_PRECOMPILE_FILES`](@ref JULIA_MAX_NUM_PRECOMPILE_FILES) for the upper limit of variants Julia caches per default.
 
 !!! note
@@ -40,12 +47,26 @@ See the [`JULIA_CPU_TARGET`](@ref JULIA_CPU_TARGET) environment variable for mor
 
 ## Flags that impact package image creation and selection
 
-These are the Julia command line flags that impact cache selection. Package images
-that were created with different flags will be rejected.
+These are the Julia command line flags that impact cache selection. Which of them
+have to match depends on whether the session will load the cache's native image,
+which is decided by `--pkgimages`:
+
+- `--pkgimages=yes` requires a cache that has a native image, and compares every
+  flag below.
+- `--pkgimages=existing` compares every flag below against a cache that has a
+  native image, and only the heap flags against one that does not.
+- `--pkgimages=no` never loads a native image, so it compares only the heap flags.
+
+Flags recorded in the heap, which have to match whenever the `.ji` is loaded:
+
+- `--inline`: Exact match required, since inference stores the optimized IR it
+  produced and inlining is applied before the results are cached.
+
+Flags that only describe native code, which have to match only when that native
+code is loaded. A session that loads the heap alone regenerates machine code with
+its own settings, so these do not restrict it:
 
 - `-g`, `--debug-info`: Exact match required since it changes code generation.
 - `--check-bounds`: Exact match required since it changes code generation.
-- `--inline`: Exact match required since it changes code generation.
-- `--pkgimages`: To allow running without object caching enabled.
 - `-O`, `--optimize`: Reject package images generated for a lower optimization level,
   but allow for higher optimization levels to be loaded.

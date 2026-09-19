@@ -90,6 +90,7 @@ Command-line option changes
 ---------------------------
 
 * `-P <project>` is now a shorthand for `--project <project>` ([#59867]).
+* `--pkgimages=no` no longer forces a package to be precompiled again when a usable cache is already present: Julia loads the heap from the `.ji`, ignores any companion native library, and JIT-compiles as needed. Since such a session generates its own machine code, cache selection no longer compares the flags that only affect code generation (`-O`, `-g` and `--check-bounds`); `--inline` still has to match, because its value is reflected in the cached inference results ([#51412]).
 
 Multi-threading changes
 -----------------------

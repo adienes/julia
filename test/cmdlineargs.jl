@@ -1596,6 +1596,7 @@ end
             @test err == 0
             @test flags[] & Base.JI_FLAG_PKGIMAGE != 0
             @test (flags[] & Base.JI_FLAG_SPLIT != 0) == native
+            @test (flags[] & Base.JI_FLAG_COMPRESSED_ZSTD != 0) == (native && compress)
             seek(io, datastartpos[])
             zstd_magic = UInt8[0x28, 0xb5, 0x2f, 0xfd]
             @test (read(io, 4) == zstd_magic) == (native && compress)

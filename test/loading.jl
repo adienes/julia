@@ -1627,6 +1627,35 @@ end
 
     # Round trip CacheFlags
     @test parse(Base.CacheFlags, repr(cf)) == cf
+
+    # Cache matching follows the explicitly requested configuration, not the parent
+    # process options, and a configuration that will not load native code compares
+    # only the flags that are recorded in the heap.
+    script = """
+    let
+        actual = Base.CacheFlags(; use_pkgimages=true, debug_level=1,
+                                 check_bounds=2, inline=false, opt_level=0)
+        codegen_only = Base.CacheFlags(; use_pkgimages=false, debug_level=2,
+                                       check_bounds=1, inline=false, opt_level=3)
+        inline_differs = Base.CacheFlags(; use_pkgimages=false, debug_level=1,
+                                         check_bounds=2, inline=true, opt_level=0)
+        native_match = Base.CacheFlags(; use_pkgimages=true, debug_level=1,
+                                       check_bounds=2, inline=false, opt_level=0)
+        native_codegen_differs = Base.CacheFlags(; use_pkgimages=true, debug_level=1,
+                                                 check_bounds=1, inline=false, opt_level=0)
+        match(requested) = @ccall jl_match_cache_flags(
+            Base._cacheflag_to_uint8(requested)::UInt8,
+            Base._cacheflag_to_uint8(actual)::UInt8)::UInt8
+        match(codegen_only) == 1 || error("heap reuse rejected over codegen-only flags")
+        match(inline_differs) == 0 || error("heap reuse accepted with mismatched --inline")
+        match(native_match) == 1 || error("native match rejected")
+        match(native_codegen_differs) == 0 || error("native reuse accepted with mismatched --check-bounds")
+    end
+    """
+    for pkgimages in ("no", "yes")
+        cmd = `$(Base.julia_cmd()) --startup-file=no --pkgimages=$pkgimages -e $script`
+        @test success(pipeline(cmd; stdout, stderr))
+    end
 end
 
 empty!(Base.DEPOT_PATH)
@@ -1825,10 +1854,24 @@ end
                 using Child
                 end""")
         end
+        open(joinpath(dir, "NativeOnly.jl"), "w") do io
+            println(io, """
+                module NativeOnly
+                answer() = 42
+                precompile(answer, ())
+                end""")
+        end
+        open(joinpath(dir, "HeapFlags.jl"), "w") do io
+            println(io, """
+                module HeapFlags
+                answer() = 42
+                precompile(answer, ())
+                end""")
+        end
 
         # helper function to load a package and return the output
-        function load_package(name, args=``)
-            code = "Base.disable_parallel_precompile = true; using $name"
+        function load_package(name, args=``; code="using $name")
+            code = "Base.disable_parallel_precompile = true; $code"
             cmd = addenv(`$(Base.julia_cmd()) -e $code $args`,
                         "JULIA_LOAD_PATH" => dir,
                         "JULIA_DEPOT_PATH" => depot_path,
@@ -1891,6 +1934,112 @@ end
         @test occursin(r"Loading object cache file .+ for Child", log)
         @test occursin(r"Generating object cache file for Parent", log)
         @test occursin(r"Loading object cache file .+ for Parent", log)
+
+        # A native cache can provide its heap state when native pkgimages are disabled.
+        log = load_package("NativeOnly", `--pkgimages=yes`)
+        @test occursin(r"Generating object cache file for NativeOnly", log)
+        native_ji = joinpath(depot_path, "compiled", "v$(VERSION.major).$(VERSION.minor)", "NativeOnly.ji")
+        cache_bytes = read(native_ji)
+        native_image = Base.ocachefile_from_cachefile(native_ji)
+        @test isfile(native_image)
+        mv(native_image, native_image * ".uncompressed")
+
+        # Native artifact checks follow the requested cache configuration, not the parent process.
+        stored_flags = Base.CacheFlags(Base.parse_cache_header(native_ji)[7])
+        semantic_flags = Base.CacheFlags(stored_flags; use_pkgimages=false)
+        native_flags = Base.CacheFlags(stored_flags; use_pkgimages=true)
+        native_source = joinpath(dir, "NativeOnly.jl")
+        @test Base.stale_cachefile(native_source, native_ji;
+                                   requested_flags=semantic_flags) !== true
+        @test Base.stale_cachefile(native_source, native_ji;
+                                   requested_flags=native_flags) === true
+
+        direct_code = """
+            pkg = Base.PkgId("NativeOnly")
+            path = $(repr(native_ji))
+            source = $(repr(native_source))
+            stored_flags = Base.CacheFlags(Base.parse_cache_header(path)[7])
+            semantic_flags = Base.CacheFlags(stored_flags; use_pkgimages=false)
+            native_flags = Base.CacheFlags(stored_flags; use_pkgimages=true)
+            Base.stale_cachefile(source, path; requested_flags=semantic_flags) !== true ||
+                error("semantic cache reported stale")
+            Base.stale_cachefile(source, path; requested_flags=native_flags) === true ||
+                error("missing native cache reported fresh")
+            loaded = Base.@lock Base.require_lock begin
+                Base._tryrequire_from_serialized(pkg, path, nothing)
+            end
+            loaded isa Module || throw(loaded)
+            loaded.answer() == 42 || error("wrong answer")
+            """
+        log = load_package("NativeOnly", `--pkgimages=no`; code=direct_code)
+        @test !occursin(r"Generating (cache|object cache) file", log)
+        @test occursin(r"Loading cache file .+ without native code for NativeOnly", log)
+        @test read(native_ji) == cache_bytes
+
+        log = load_package("NativeOnly", `--pkgimages=no`;
+                           code="using NativeOnly; NativeOnly.answer() == 42 || error(\"wrong answer\")")
+        @test !occursin(r"Generating (cache|object cache) file", log)
+        @test occursin(r"Loading cache file .+ without native code for NativeOnly", log)
+        @test read(native_ji) == cache_bytes
+
+        log = load_package("NativeOnly", `--pkgimages=yes --compress-sysimage=yes`)
+        @test occursin(r"Generating object cache file for NativeOnly", log)
+        cache_bytes = read(native_ji)
+        @test isfile(native_image)
+        mv(native_image, native_image * ".compressed")
+
+        corrupt_ji = joinpath(dirname(native_ji), "NativeOnly_corrupt.ji")
+        corrupt_bytes = copy(cache_bytes)
+        datastartpos = Ref{Int64}()
+        open(native_ji, "r") do io
+            err = @ccall jl_read_verify_header(io.ios::Ptr{Cvoid}, Ref{UInt32}()::Ptr{UInt32},
+                Ref{UInt32}()::Ptr{UInt32}, Ref{Int64}()::Ptr{Int64},
+                datastartpos::Ptr{Int64})::Cint
+            @test err == 0
+        end
+        corrupt_bytes[datastartpos[] + 1] ⊻= 0xff
+        corrupt_crc = Base._crc32c(corrupt_bytes[1:end - sizeof(UInt32)])
+        corrupt_bytes[end - sizeof(UInt32) + 1:end] .= reinterpret(UInt8, [corrupt_crc])
+        write(corrupt_ji, corrupt_bytes)
+        corrupt_code = """
+            pkg = Base.PkgId("NativeOnly")
+            loaded = Base.@lock Base.require_lock begin
+                Base._tryrequire_from_serialized(pkg, $(repr(corrupt_ji)), nothing)
+            end
+            loaded isa Exception || error("corrupt compressed cache was accepted")
+            """
+        log = load_package("NativeOnly", `--pkgimages=no`; code=corrupt_code)
+        @test !occursin(r"Generating (cache|object cache) file", log)
+
+        log = load_package("NativeOnly", `--pkgimages=no`;
+                           code="using NativeOnly; NativeOnly.answer() == 42 || error(\"wrong answer\")")
+        @test !occursin(r"Generating (cache|object cache) file", log)
+        @test occursin(r"Loading cache file .+ without native code for NativeOnly", log)
+        @test read(native_ji) == cache_bytes
+
+        log = load_package("NativeOnly", `--pkgimages=no --permalloc-pkgimg=yes`;
+                           code="using NativeOnly; NativeOnly.answer() == 42 || error(\"wrong answer\")")
+        @test !occursin(r"Generating (cache|object cache) file", log)
+        @test occursin(r"Loading cache file .+ without native code for NativeOnly", log)
+        @test read(native_ji) == cache_bytes
+
+        # Loading a heap without its native code regenerates machine code here, so flags
+        # that only affect code generation do not have to match, but `--inline` does.
+        log = load_package("HeapFlags", `--pkgimages=yes -O0 -g0 --check-bounds=no`)
+        @test occursin(r"Generating object cache file for HeapFlags", log)
+        heap_ji = joinpath(depot_path, "compiled", "v$(VERSION.major).$(VERSION.minor)", "HeapFlags.ji")
+        cache_bytes = read(heap_ji)
+        mv(Base.ocachefile_from_cachefile(heap_ji), Base.ocachefile_from_cachefile(heap_ji) * ".bak")
+
+        log = load_package("HeapFlags", `--pkgimages=no -O3 -g2 --check-bounds=yes`;
+                           code="using HeapFlags; HeapFlags.answer() == 42 || error(\"wrong answer\")")
+        @test !occursin(r"Generating (cache|object cache) file", log)
+        @test occursin(r"Loading cache file .+ without native code for HeapFlags", log)
+        @test read(heap_ji) == cache_bytes
+
+        log = load_package("HeapFlags", `--pkgimages=no --inline=no`)
+        @test occursin(r"Generating cache file for HeapFlags", log)
+        @test read(heap_ji) != cache_bytes
     end end
 end
 
