@@ -219,6 +219,28 @@ for ItrT = (Tuple,Any)
     end
 end
 
+function _any(f, itr::Iterators.TreeTraversal, ::Colon)
+    r = Iterators._iterate_loop(itr, false) do anymissing, x
+        v = f(x)
+        ismissing(v) && return Iterators.LoopContinue(true)
+        v && return Iterators.LoopReturn(true)
+        Iterators.LoopContinue(anymissing)
+    end
+    r isa Iterators.LoopReturn && return true
+    return r.accum ? missing : false
+end
+
+function _all(f, itr::Iterators.TreeTraversal, ::Colon)
+    r = Iterators._iterate_loop(itr, false) do anymissing, x
+        v = f(x)
+        ismissing(v) && return Iterators.LoopContinue(true)
+        v || return Iterators.LoopReturn(false)
+        Iterators.LoopContinue(anymissing)
+    end
+    r isa Iterators.LoopReturn && return false
+    return r.accum ? missing : true
+end
+
 # When the function is side effect-free, we may avoid short-circuiting to help
 # vectorize the loop.
 function _all(::typeof(identity), itr::Tuple{Vararg{Bool}}, ::Colon)
