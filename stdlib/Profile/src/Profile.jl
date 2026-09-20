@@ -1280,7 +1280,7 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
             insert!(builder_value, fastkey, this)
         end
     end
-    foreach(Iterators.bfs(n -> values(n.down), root)) do node
+    foreach(Iterators.dfs(n -> values(n.down), root)) do node
         node.recur = 0
         empty!(node.builder_key)
         empty!(node.builder_value)
@@ -1289,7 +1289,7 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
 end
 
 function maxstats(root::StackFrameTree)
-    m = mapreduce((a, b) -> max.(a, b), Iterators.bfs(n -> values(n.down), root)) do node
+    m = mapreduce((a, b) -> max.(a, b), Iterators.dfs(n -> values(n.down), root)) do node
         (node.count, node.flat_count, node.overhead, node.max_recur)
     end
     return (count=m[1], count_flat=m[2], overhead=m[3], max_recur=m[4])

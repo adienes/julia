@@ -984,7 +984,7 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
     root_uuids = manifest ? keys(env.workspace_deps) : values(env.project_deps)
     pkg_uuids = Set{UUID}()
     for uuid in root_uuids
-        union!(pkg_uuids, Iterators.dfs(u -> get(Vector{UUID}, env.deps, u), uuid; visited = pkg_uuids))
+        foreach(Returns(nothing), Iterators.dfs(u -> get(Vector{UUID}, env.deps, u), uuid; visited = pkg_uuids))
     end
 
     for dep in pkg_uuids
@@ -1055,7 +1055,7 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
             # `package` is included only when reached through a cycle
             all_deps = Set{PkgId}()
             for dep in children(package)
-                union!(all_deps, Iterators.dfs(children, dep; visited = all_deps))
+                foreach(Returns(nothing), Iterators.dfs(children, dep; visited = all_deps))
             end
             indirect_deps[package] = all_deps
         end
@@ -1127,12 +1127,12 @@ function filter_dep_graph!(direct_deps, pkg_names, ext_to_parent, requested_pkgi
     keep = Set{PkgId}()
     for dep_pkgid in keys(direct_deps)
         if dep_pkgid.name in pkg_names
-            union!(keep, Iterators.dfs(children, dep_pkgid; visited = keep))
+            foreach(Returns(nothing), Iterators.dfs(children, dep_pkgid; visited = keep))
         end
     end
     for requested_pkgid in requested_pkgids
         if haskey(direct_deps, requested_pkgid)
-            union!(keep, Iterators.dfs(children, requested_pkgid; visited = keep))
+            foreach(Returns(nothing), Iterators.dfs(children, requested_pkgid; visited = keep))
         end
     end
     for ext in keys(ext_to_parent)
