@@ -21,19 +21,19 @@ using .Core
 using Core: @doc
 
 using Base:
-    cld, resize!, IndexCartesian, Checked
+    cld, resize!, push!, pop!, IndexCartesian, Checked
 using .Checked: checked_mul
 
 import Base:
     first, last,
-    length, size, axes, ndims,
+    isempty, length, size, axes, ndims,
     eltype, IteratorSize, IteratorEltype, promote_typejoin,
     haskey, keys, values, pairs,
     getindex, setindex!, get, iterate,
-    popfirst!, isdone, peek, intersect
+    popfirst!, isdone, peek, intersect, foreach
 
 export enumerate, zip, rest, countfrom, take, drop, takewhile, dropwhile, cycle, repeated, product, flatten, flatmap, partition, nth, findeach
-public accumulate, filter, map, peel, reverse, Reverse, Stateful
+public accumulate, bfs, dfs, filter, map, peel, reverse, Reverse, Stateful
 
 """
     Iterators.map(f, iterators...)
@@ -1786,5 +1786,445 @@ julia> map(fifth_element, ("Willis", "Jovovich", "Oldman"))
 ```
 """
 nth(n::Integer) = Base.Fix2(nth, n)
+
+struct DepthFirst{order, F, T, V}
+    children::F
+    root::T
+    visited::V
+end
+
+struct BreadthFirst{F, T, V}
+    children::F
+    root::T
+    visited::V
+end
+
+const TreeTraversal = Union{DepthFirst, BreadthFirst}
+
+IteratorSize(::Type{<:DepthFirst}) = SizeUnknown()
+IteratorEltype(::Type{<:DepthFirst}) = EltypeUnknown()
+IteratorSize(::Type{<:BreadthFirst}) = SizeUnknown()
+IteratorEltype(::Type{<:BreadthFirst}) = EltypeUnknown()
+
+# Preorder, postorder, and BFS yield the root unless it has already been visited.
+# Leaves-only traversal can be empty even when the root has not been visited.
+isdone(t::TreeTraversal) = t.visited !== nothing && t.root in t.visited
+isdone(t::DepthFirst{:leaves}) =
+    t.visited !== nothing && t.root in t.visited ? true : missing
+
+_visit!(::Nothing, node) = true
+function _visit!(visited, node)
+    node in visited && return false
+    push!(visited, node)
+    return true
+end
+
+"""
+    Iterators.dfs(children, root; order = :pre, visited = nothing)
+
+Return a lazy depth-first traversal of the tree rooted at `root`, where
+`children(node)` returns its children. `order = :pre` yields nodes before
+their descendants, `:post` after them, and `:leaves` only childless nodes.
+Siblings follow `children` order.
+
+`visited` may be any container supporting `in` and `push!`; it records nodes
+and skips those already present and their subtrees. Use it for graphs:
+otherwise shared nodes repeat and cycles do not terminate. Because iteration
+mutates `visited`, a traversal using one should be consumed only once; the
+set may be pre-seeded or shared.
+
+For preorder, postorder, and breadth-first traversal, checking `isempty` before
+iteration does not advance the traversal. With `:leaves`, determining emptiness
+may require a search. Wrap the traversal in [`Iterators.Stateful`](@ref) to
+preserve the next node across emptiness checks or to resume after stopping early.
+This wrapper buffers a node and may advance `children` and `visited` ahead of
+consumption.
+
+`children` is called lazily and its iterator advanced one element at a time:
+with `:pre` not until after the node has been yielded. `:post` and `:leaves`
+require finite child iterators.
+
+Traversal uses an explicit worklist, including when consumed by `foreach`,
+`collect`, or reductions such as `sum` and `any`, so its depth is not limited
+by the call stack.
+
+See also: [`Iterators.bfs`](@ref).
+
+!!! compat "Julia 1.14"
+    This function requires at least Julia 1.14.
+
+# Examples
+```jldoctest
+julia> collect(Iterators.dfs(n -> n < 3 ? (2n, 2n + 1) : (), 1))
+5-element Vector{Int64}:
+ 1
+ 2
+ 4
+ 5
+ 3
+
+julia> graph = Dict(:a => [:b, :c], :b => [:d], :c => [:d], :d => Symbol[]);
+
+julia> collect(Iterators.dfs(n -> graph[n], :a; visited = Set{Symbol}()))
+4-element Vector{Symbol}:
+ :a
+ :b
+ :d
+ :c
+
+julia> leaves = Iterators.Stateful(Iterators.dfs(n -> graph[n], :a; order = :leaves, visited = Set{Symbol}()));
+
+julia> isempty(leaves)
+false
+
+julia> collect(leaves)
+1-element Vector{Symbol}:
+ :d
+```
+"""
+function dfs(children, root; order::Symbol = :pre, visited = nothing)
+    order === :pre || order === :post || order === :leaves ||
+        throw(ArgumentError(LazyString("`order` must be `:pre`, `:post` or `:leaves`, got `:", order, "`")))
+    return DepthFirst{order, typeof(children), typeof(root), typeof(visited)}(children, root, visited)
+end
+
+"""
+    Iterators.bfs(children, root; visited = nothing)
+
+Return a lazy breadth-first (level-order) traversal of the tree rooted at
+`root`. See [`Iterators.dfs`](@ref) for `children`, `visited`, and laziness.
+
+!!! compat "Julia 1.14"
+    This function requires at least Julia 1.14.
+
+# Examples
+```jldoctest
+julia> collect(Iterators.bfs(n -> n < 3 ? (2n, 2n + 1) : (), 1))
+5-element Vector{Int64}:
+ 1
+ 2
+ 3
+ 4
+ 5
+```
+"""
+bfs(children, root; visited = nothing) = BreadthFirst(children, root, visited)
+
+# Frames hold a node and its live child iterator. Keep node and iterator types
+# separate so a heterogeneous node need not erase a homogeneous iterator type.
+# Incompatible values widen the affected storage once, without restarting it.
+struct DFSFrame{N,I,S}
+    node::N
+    it::I
+    st::S
+end
+
+struct DepthFirstState{N,I,S,P}
+    stack::Vector{DFSFrame{N,I,S}}
+    pending::P
+end
+
+# Every remaining postorder frame will eventually yield its parent.
+isdone(::DepthFirst{:post}, st::DepthFirstState) = isempty(st.stack)
+
+# Preorder traversal of homogeneous tuples only needs the unvisited siblings.
+# Tuple slots are immutable, so saving them does not advance a lazy iterator.
+struct DFSNodeState{N}
+    stack::Vector{N}
+    pending::N
+end
+
+struct BreadthFirstState{N,I,S}
+    queue::Vector{N}
+    it::I
+    st::S
+end
+
+function _widen_state(st::DepthFirstState{N,I,S,P}) where {N,I,S,P}
+    stack = DFSFrame{Any,Any,Any}[DFSFrame{Any,Any,Any}(f.node, f.it, f.st) for f in st.stack]
+    return DepthFirstState{Any,Any,Any,P}(stack, st.pending)
+end
+function _widen_nodes(st::DepthFirstState{N,I,S}) where {N,I,S}
+    return DepthFirstState{N,I,S,Any}(st.stack, st.pending)
+end
+function _widen_nodes(st::BreadthFirstState{N,I,S}) where {N,I,S}
+    return BreadthFirstState{Any,I,S}(Vector{Any}(st.queue), st.it, st.st)
+end
+
+# Keep the iterator and its first result together so inference can exclude
+# child iterator types that are always empty (for example, `Tuple{}`).
+@inline function _firstchild(it::I) where {I}
+    y = iterate(it)
+    y === nothing && return nothing
+    return it, y
+end
+
+struct Start end
+struct Done end
+
+isdone(::TreeTraversal, ::Done) = true
+iterate(t::DepthFirst, ::Done) = nothing
+iterate(t::BreadthFirst, ::Done) = nothing
+
+@inline function iterate(t::DepthFirst{order}) where {order}
+    _visit!(t.visited, t.root) || return nothing
+    order === :pre && return t.root, Start()
+    first = _firstchild(t.children(t.root))
+    first === nothing && return t.root, Done()
+    return _start(t, first[1], first[2])
+end
+
+@inline function iterate(t::DepthFirst{:pre}, ::Start)
+    first = _firstchild(t.children(t.root))
+    first === nothing && return nothing
+    return _start(t, first[1], first[2])
+end
+
+@inline function _start(t::DepthFirst, it::I, y::Tuple{Any,S}) where {I,S}
+    # This is only a storage hint; later values are checked before insertion.
+    # Inference avoids calling eltype on children that do not implement it.
+    N = promote_typejoin(typeof(t.root), @default_eltype(it))
+    st = DepthFirstState{N,I,S,N}([DFSFrame{N,I,S}(t.root, it, y[2])], t.root)
+    return _continue!(t, st, y[1])
+end
+
+# At each yield, preorder has a node to expand; the other orders have already
+# expanded theirs. Keep this phase local instead of storing it in the state.
+@inline iterate(t::DepthFirst{order}, st::DepthFirstState) where {order} = _advance!(t, st, order === :pre)
+
+@inline function _start(t::DepthFirst{:pre,F,N}, it::Tuple{Vararg{N}}, y::Tuple{N,Int}) where {F,N}
+    st = DFSNodeState{N}(N[], t.root)
+    _push_children!(st.stack, it)
+    return _popnext!(t, st)
+end
+
+@inline function _push_children!(stack, children::Tuple)
+    for i in length(children):-1:1
+        push!(stack, children[i])
+    end
+end
+
+@inline function _popnext!(t::DepthFirst{:pre}, st::DFSNodeState)
+    while !isempty(st.stack)
+        c = pop!(st.stack)
+        if _visit!(t.visited, c)
+            return c, DFSNodeState(st.stack, c)
+        end
+    end
+    return nothing
+end
+
+@inline function iterate(t::DepthFirst{:pre}, st::DFSNodeState{N}) where {N}
+    children = t.children(st.pending)
+    if children isa Tuple{Vararg{N}}
+        _push_children!(st.stack, children)
+    else
+        first = _firstchild(children)
+        if first !== nothing
+            # Switch once to general frames, retaining both the pending siblings
+            # and the child already obtained, without repeating any callbacks.
+            frames = DFSFrame{Any,Any,Any}[
+                DFSFrame{Any,Any,Any}(nothing, (c,), 1) for c in st.stack]
+            it, y = first
+            push!(frames, DFSFrame{Any,Any,Any}(st.pending, it, y[2]))
+            wide = DepthFirstState{Any,Any,Any,Any}(frames, st.pending)
+            return _continue!(t, wide, y[1])
+        end
+    end
+    return _popnext!(t, st)
+end
+
+@inline function _continue!(t::DepthFirst{order}, st::DepthFirstState{N,I,S,P}, c) where {order,N,I,S,P}
+    c isa P || return _continue!(t, _widen_nodes(st), c)
+    if _visit!(t.visited, c)
+        st = DepthFirstState{N,I,S,P}(st.stack, c)
+        order === :pre && return c, st
+        return _advance!(t, st, true)
+    end
+    return _advance!(t, st, false)
+end
+
+@inline function _advance!(t::DepthFirst{order}, st::DepthFirstState{N,I,S,P}, haspending::Bool) where {order,N,I,S,P}
+    stack = st.stack
+    while true
+        if haspending
+            p = st.pending
+            haspending = false
+            first = _firstchild(t.children(p))
+            if first === nothing
+                order === :pre || return p, st
+                continue
+            end
+            it, y = first
+            if !(p isa N && it isa I && y[2] isa S)
+                wide = _widen_state(st)
+                push!(wide.stack, DFSFrame{Any,Any,Any}(p, it, y[2]))
+                return _continue!(t, wide, y[1])
+            end
+            push!(stack, DFSFrame{N,I,S}(p, it, y[2]))
+            c = y[1]
+            c isa P || return _continue!(t, _widen_nodes(st), c)
+            if _visit!(t.visited, c)
+                st = DepthFirstState{N,I,S,P}(stack, c)
+                haspending = true
+                order === :pre && return c, st
+            end
+        else
+            isempty(stack) && return nothing
+            f = stack[end]
+            y = iterate(f.it, f.st)
+            if y === nothing
+                pop!(stack)
+                order === :post && return f.node, st
+            else
+                if !(y[2] isa S)
+                    wide = _widen_state(st)
+                    wide.stack[end] = DFSFrame{Any,Any,Any}(f.node, f.it, y[2])
+                    return _continue!(t, wide, y[1])
+                end
+                stack[end] = DFSFrame{N,I,S}(f.node, f.it, y[2])
+                c = y[1]
+                c isa P || return _continue!(t, _widen_nodes(st), c)
+                if _visit!(t.visited, c)
+                    st = DepthFirstState{N,I,S,P}(stack, c)
+                    haspending = true
+                    order === :pre && return c, st
+                end
+            end
+        end
+    end
+end
+
+@inline function iterate(t::BreadthFirst)
+    _visit!(t.visited, t.root) || return nothing
+    return t.root, Start()
+end
+
+@inline function iterate(t::BreadthFirst, ::Start)
+    first = _firstchild(t.children(t.root))
+    first === nothing && return nothing
+    return _start(t, first[1], first[2])
+end
+
+@inline function _start(t::BreadthFirst, it::I, y::Tuple{Any,S}) where {I,S}
+    T = @default_eltype(it)
+    st = BreadthFirstState{T,I,S}(T[], it, y[2])
+    return _continue!(t, st, y[1])
+end
+
+@inline iterate(t::BreadthFirst, st::BreadthFirstState) = _advance!(t, st)
+
+@inline function _continue!(t::BreadthFirst, st::BreadthFirstState{N}, c) where {N}
+    c isa N || return _continue!(t, _widen_nodes(st), c)
+    if _visit!(t.visited, c)
+        push!(st.queue, c)
+        return c, st
+    end
+    return _advance!(t, st)
+end
+
+@inline function _advance!(t::BreadthFirst, st::BreadthFirstState{N,I,S}) where {N,I,S}
+    queue = st.queue
+    it = st.it
+    y = iterate(it, st.st)
+    while true
+        while y !== nothing
+            c, s = y
+            if !(s isa S)
+                return _continue!(t, BreadthFirstState{N,Any,Any}(queue, it, s), c)
+            end
+            st = BreadthFirstState{N,I,S}(queue, it, s)
+            c isa N || return _continue!(t, _widen_nodes(st), c)
+            if _visit!(t.visited, c)
+                push!(queue, c)
+                return c, st
+            end
+            y = iterate(it, s)
+        end
+        isempty(queue) && return nothing
+        first = _firstchild(t.children(popfirst!(queue)))
+        first === nothing && continue
+        it, y = first
+        if !(it isa I && y[2] isa S)
+            return _continue!(t, BreadthFirstState{N,Any,Any}(queue, it, y[2]), y[1])
+        end
+    end
+end
+
+# Standard consumers can specialize around initialization and widening.
+struct LoopContinue{A}
+    accum::A
+end
+struct LoopReturn{T}
+    val::T
+end
+
+@inline function _iterate_loop(body::F, itr::TreeTraversal, accum) where {F}
+    y = iterate(itr)
+    y === nothing && return LoopContinue(accum)
+    tk = body(accum, y[1])
+    tk isa LoopContinue || return tk
+    return _iterate_from(body, itr, tk.accum, y[2])
+end
+
+# A traversal state only changes type when it starts or widens. Redispatch
+# then, so the steady-state loop keeps its worklist concrete. This recursion
+# is bounded by the number of state changes, independently of tree depth.
+@inline function _iterate_from(body::F, itr::TreeTraversal, accum, st::S) where {F,S}
+    while true
+        y = iterate(itr, st)
+        y === nothing && return LoopContinue(accum)
+        tk = body(accum, y[1])
+        tk isa LoopContinue || return tk
+        accum = tk.accum
+        y[2] isa S || return _iterate_from(body, itr, accum, y[2])
+        st = y[2]
+    end
+end
+
+# A consumer can finish each parent's children locally instead of saving the
+# child iterator after every yield. Visiting and calling the body still precede
+# advancing it, including when the body short-circuits or mutates the children.
+@inline function _iterate_from(body::F, itr::BreadthFirst, accum, ::Start) where {F}
+    first = _firstchild(itr.children(itr.root))
+    first === nothing && return LoopContinue(accum)
+    it, y = first
+    N = @default_eltype(it)
+    return _bfs_loop(body, itr, accum, N[], it, y)
+end
+
+@inline function _bfs_loop(body::F, itr::BreadthFirst, accum, queue::Vector{N}, it, y) where {F,N}
+    while true
+        while y !== nothing
+            c, s = y
+            c isa N || return _bfs_loop(body, itr, accum, Vector{Any}(queue), it, y)
+            if _visit!(itr.visited, c)
+                push!(queue, c)
+                tk = body(accum, c)
+                tk isa LoopContinue || return tk
+                accum = tk.accum
+            end
+            y = iterate(it, s)
+        end
+        isempty(queue) && return LoopContinue(accum)
+        it = itr.children(popfirst!(queue))
+        y = iterate(it)
+    end
+end
+
+# With heterogeneous nodes, retain the concrete child iterator and state types
+# in the protocol state instead of merging them across parents in the loop.
+@inline function _bfs_loop(body::F, itr::BreadthFirst, accum, queue::Vector{Any}, it::I, y::Tuple{Any,S}) where {F,I,S}
+    next = _continue!(itr, BreadthFirstState{Any,I,S}(queue, it, y[2]), y[1])
+    next === nothing && return LoopContinue(accum)
+    tk = body(accum, next[1])
+    tk isa LoopContinue || return tk
+    return _iterate_from(body, itr, tk.accum, next[2])
+end
+
+function foreach(f, t::TreeTraversal)
+    _iterate_loop((_, x) -> (f(x); LoopContinue(nothing)), t, nothing)
+    return nothing
+end
 
 end

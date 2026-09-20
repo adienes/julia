@@ -1256,3 +1256,460 @@ end == Vector{Int}
     # a greedy algorithm
     @test_throws MethodError last(zip(Iterators.filter(x -> x > 0, -5:5), Iterators.filter(x -> x % 2 == 0, -5:5)))  # (5, 4)
 end
+
+# traversal regression helpers: an iterator whose states include `nothing` and
+# change type every step (forces mid-frame widening that must resume, not
+# restart), and one whose eltype throws despite valid iteration
+struct WeirdStates end
+Base.iterate(::WeirdStates) = (10, missing)
+Base.iterate(::WeirdStates, ::Missing) = (20, nothing)
+Base.iterate(::WeirdStates, ::Nothing) = (30, "s")
+Base.iterate(::WeirdStates, ::String) = nothing
+struct NoEltypeIt end
+Base.IteratorEltype(::Type{NoEltypeIt}) = Base.EltypeUnknown()
+Base.eltype(::Type{NoEltypeIt}) = error("eltype is not meaningful")
+Base.iterate(it::NoEltypeIt, st = 0) = st < 2 ? (st + 10, st + 1) : nothing
+
+@testset "dfs/bfs" begin
+    arr_children(x) = x isa AbstractArray ? x : ()
+    nested = [1, [2, [3, 4]], 5]
+    graph = Dict(:a => [:b, :c], :b => [:d], :c => [:d], :d => Symbol[])
+    graph_children(n) = graph[n]
+
+    @testset "orders" begin
+        @test [x for x in Iterators.dfs(arr_children, nested) if x isa Int] == [1, 2, 3, 4, 5]
+        @test [x for x in Iterators.bfs(arr_children, nested) if x isa Int] == [1, 5, 2, 3, 4]
+        @test collect(Iterators.dfs(arr_children, [[1, 2], 3]; order = :post)) ==
+              Any[1, 2, [1, 2], 3, [[1, 2], 3]]
+        @test collect(Iterators.dfs(arr_children, Any[1, Any[], 2]; order = :leaves)) ==
+              Any[1, Any[], 2]
+        # a node with only visited children is not a leaf
+        @test collect(Iterators.dfs(graph_children, :a; order = :leaves, visited = Set{Symbol}())) ==
+              [:d]
+        @test collect(Iterators.dfs(arr_children, 42)) == [42]
+        @test collect(Iterators.dfs(arr_children, 42; order = :post)) == [42]
+        @test collect(Iterators.dfs(arr_children, 42; order = :leaves)) == [42]
+        @test collect(Iterators.bfs(arr_children, 42)) == [42]
+        @test_throws ArgumentError Iterators.dfs(arr_children, 1; order = :inorder)
+    end
+
+    @testset "visited" begin
+        @test collect(Iterators.dfs(graph_children, :a; visited = Set{Symbol}())) == [:a, :b, :d, :c]
+        @test collect(Iterators.dfs(graph_children, :a; visited = Set{Symbol}(), order = :post)) ==
+              [:d, :b, :c, :a]
+        @test collect(Iterators.bfs(graph_children, :a; visited = Set{Symbol}())) == [:a, :b, :c, :d]
+        @test collect(Iterators.dfs(graph_children, :a)) == [:a, :b, :d, :c, :d]
+        cyc = Dict(1 => [2], 2 => [3], 3 => [1])
+        @test collect(Iterators.dfs(n -> cyc[n], 1; visited = Set{Int}())) == [1, 2, 3]
+        @test collect(Iterators.bfs(n -> cyc[n], 1; visited = Set{Int}())) == [1, 2, 3]
+        @test collect(Iterators.dfs(graph_children, :a; visited = Set([:b]))) == [:a, :c, :d]
+        @test isempty(Iterators.dfs(graph_children, :a; visited = Set([:a])))
+        visited = Set{Symbol}()
+        @test collect(Iterators.dfs(graph_children, :b; visited)) == [:b, :d]
+        @test collect(Iterators.dfs(graph_children, :a; visited)) == [:a, :c]
+    end
+
+    @testset "laziness" begin
+        infkids(n) = (2n, 2n + 1)
+        @test collect(Iterators.take(Iterators.dfs(infkids, 1), 5)) == [1, 2, 4, 8, 16]
+        @test collect(Iterators.take(Iterators.bfs(infkids, 1), 7)) == 1:7
+        @test collect(Iterators.take(Iterators.bfs(n -> Iterators.countfrom(10n), 1), 4)) ==
+              [1, 10, 11, 12]
+        # `children` is not called before the node is yielded
+        calls = Int[]
+        countingkids(n) = (push!(calls, n); n < 3 ? (n + 1,) : ())
+        @test first(Iterators.dfs(countingkids, 1)) == 1
+        @test first(Iterators.bfs(countingkids, 1)) == 1
+        @test isempty(calls)
+        # children are advanced one element at a time
+        advanced = Int[]
+        lazykids(n) = ((push!(advanced, x); x) for x in (n == 0 ? (1:1000) : ()))
+        @test collect(Iterators.take(Iterators.dfs(lazykids, 0), 3)) == [0, 1, 2]
+        @test advanced == [1, 2]
+        # mutating a yielded node prunes its subtree
+        prunable = Any[1, Any[2, Any[3]], 4]
+        seen = Any[]
+        for x in Iterators.dfs(arr_children, prunable)
+            push!(seen, x)
+            x isa AbstractArray && !isempty(x) && x[1] == 2 && empty!(x)
+        end
+        @test seen == Any[prunable, 1, Any[], 4]
+    end
+
+    # Consumers must observe mutations and stop before advancing another child.
+    @testset "consumer callback ordering" begin
+        function walk_events(traverse, consumer, stop)
+            graph = Dict(1 => [2, 3], 2 => [4], 3 => Int[], 4 => Int[], 5 => Int[])
+            events = Tuple{Symbol,Int}[]
+            visited = Set{Int}()
+            children(n) = begin
+                push!(events, (:children, n))
+                ((push!(events, (:child, c)); c) for c in graph[n])
+            end
+            body(n) = begin
+                @test n in visited
+                push!(events, (:node, n))
+                n == 2 && (graph[1][2] = 5)
+                stop && n == 4
+            end
+            itr = traverse(children, 1; visited)
+            if consumer === :protocol
+                for n in itr
+                    body(n) && break
+                end
+            elseif consumer === :foreach
+                foreach(body, itr)
+            else
+                @test any(body, itr) == stop
+            end
+            return events, visited
+        end
+        for traverse in (Iterators.dfs, Iterators.bfs)
+            expected = traverse === Iterators.dfs ? [1, 2, 4, 5] : [1, 2, 5, 4]
+            full = walk_events(traverse, :protocol, false)
+            @test [n for (kind, n) in full[1] if kind === :node] == expected
+            @test walk_events(traverse, :foreach, false) == full
+            @test walk_events(traverse, :any, false) == full
+            partial = walk_events(traverse, :protocol, true)
+            @test last(partial[1]) == (:node, 4)
+            @test walk_events(traverse, :any, true) == partial
+            calls = Int[]
+            @test any(Returns(true), traverse(n -> (push!(calls, n); (n + 1,)), 1))
+            @test isempty(calls)
+        end
+    end
+
+    # Tuple worklists retain sibling order and visit timing when switching to
+    # lazy children, encountering a cycle, and later changing node types.
+    @testset "tuple worklist fallback" begin
+        for consumer in (:protocol, :foreach), skip in (false, true)
+            calls, advanced, nodes = Any[], Int[], Any[]
+            snapshots = Set{Any}[]
+            visited = skip ? Set{Any}([7]) : Set{Any}()
+            children(n) = begin
+                push!(calls, n)
+                n === 1 ? (2, 3, 4) :
+                n === 2 ? (5, 6) :
+                n === 5 ? ((push!(advanced, c); c) for c in (7, 8)) :
+                n === 6 ? (2,) :
+                n === 3 ? (:leaf,) : ()
+            end
+            body(n) = (push!(nodes, n); push!(snapshots, copy(visited)))
+            itr = Iterators.dfs(children, 1; visited)
+            if consumer === :protocol
+                for n in itr
+                    body(n)
+                end
+            else
+                foreach(body, itr)
+            end
+            expected = skip ? Any[1, 2, 5, 8, 6, 3, :leaf, 4] : Any[1, 2, 5, 7, 8, 6, 3, :leaf, 4]
+            @test nodes == expected
+            @test calls == expected
+            @test advanced == [7, 8]
+            @test snapshots == [union(Set(expected[1:i]), skip ? Set([7]) : Set()) for i in eachindex(expected)]
+        end
+    end
+
+    @testset "traits and restartability" begin
+        it = Iterators.dfs(arr_children, nested)
+        @test Base.IteratorSize(it) isa Base.SizeUnknown
+        @test Base.IteratorEltype(it) isa Base.EltypeUnknown
+        @test Base.IteratorSize(Iterators.bfs(arr_children, nested)) isa Base.SizeUnknown
+        @test collect(it) == collect(it)
+    end
+
+    # Initial completion checks must not consume roots; Stateful retains search
+    # results when leaves-only traversal needs lookahead, including cyclic graphs.
+    @testset "completion checks" begin
+        for traverse in (Iterators.dfs, Iterators.bfs,
+                         (f, root; kw...) -> Iterators.dfs(f, root; order = :post, kw...))
+            for visited in (nothing, Set{Int}(), Int[])
+                calls = Int[]
+                children(n) = (push!(calls, n); n == 1 ? (2, 3) : ())
+                itr = traverse(children, 1; visited)
+                @test Base.isdone(itr) === false
+                @test !isempty(itr)
+                @test !isempty(itr)
+                @test isempty(collect(zip(itr, ())))
+                @test isempty(collect(zip((), itr)))
+                @test isempty(collect(zip(itr, Iterators.filter(Returns(false), 1:2))))
+                @test isempty(calls)
+                @test visited === nothing || isempty(visited)
+                expected = traverse === Iterators.dfs || traverse === Iterators.bfs ? [1, 2, 3] : [2, 3, 1]
+                @test collect(itr) == expected
+            end
+        end
+        for order in (:pre, :post, :leaves)
+            itr = Iterators.dfs(n -> error("visited root expanded"), 1; order, visited = Set([1]))
+            @test Base.isdone(itr) === true
+            @test isempty(itr)
+            leaf = Iterators.dfs(Returns(()), 1; order)
+            y = iterate(leaf)
+            if order !== :pre
+                @test Base.isdone(leaf, y[2]) === true
+            end
+        end
+        @test isempty(Iterators.bfs(n -> error("visited root expanded"), 1; visited = Set([1])))
+        visited = Set{Int}()
+        post = Iterators.dfs(n -> n == 1 ? (2, 3) : (), 1; order = :post, visited)
+        @test collect(zip(post, (:only,))) == [(2, :only)]
+        @test visited == Set([1, 2])
+        for (children, expected) in ((n -> n == 1 ? (2, 3) : (), [2, 3]),
+                                     (n -> (1,), Int[]),
+                                     (Returns(()), [1]))
+            itr = Iterators.dfs(children, 1; order = :leaves, visited = Set{Int}())
+            @test Base.isdone(itr) === missing
+            buffered = Iterators.Stateful(itr)
+            @test isempty(buffered) == isempty(expected)
+            @test isempty(buffered) == isempty(expected)
+            @test isempty(collect(zip(buffered, ())))
+            prefix = collect(Iterators.take(buffered, 1))
+            @test vcat(prefix, collect(buffered)) == expected
+        end
+    end
+
+    # The BFS consumer must preserve callback order and early exit when its
+    # queue starts heterogeneous or widens while siblings are still pending.
+    @testset "heterogeneous BFS callback ordering" begin
+        function bfs_events(consumer, widen, skip, stop)
+            calls, advanced, nodes = Any[], Any[], Any[]
+            visited = skip ? Set{Any}([:leaf]) : Set{Any}()
+            children(n) = begin
+                push!(calls, n)
+                xs = n === 1 ? (widen ? [2, 3] : Any[2, :leaf, 3]) :
+                     n === 2 ? Any[:leaf, 4] : ()
+                ((push!(advanced, c); c) for c in xs)
+            end
+            body(n) = (push!(nodes, n); n === stop)
+            itr = Iterators.bfs(children, 1; visited)
+            if consumer === :protocol
+                for n in itr
+                    body(n) && break
+                end
+            elseif consumer === :foreach
+                foreach(body, itr)
+            elseif consumer === :any
+                @test any(body, itr) == (stop in nodes)
+            else
+                @test all(n -> !body(n), itr) == !(stop in nodes)
+            end
+            return calls, advanced, nodes, visited
+        end
+        for widen in (false, true), skip in (false, true)
+            full = bfs_events(:protocol, widen, skip, nothing)
+            expected = widen ? Any[1, 2, 3, :leaf, 4] : Any[1, 2, :leaf, 3, 4]
+            skip && filter!(!=(:leaf), expected)
+            @test full[3] == expected
+            @test bfs_events(:foreach, widen, skip, nothing) == full
+            for stop in (1, 2, :leaf, 4, nothing), consumer in (:any, :all)
+                @test bfs_events(consumer, widen, skip, stop) ==
+                      bfs_events(:protocol, widen, skip, stop)
+            end
+        end
+    end
+
+    # Use the protocol directly as an independent reference for the consumers.
+    @testset "consumer and protocol agreement" begin
+        protocol(itr) = begin
+            nodes = Any[]
+            for node in itr
+                push!(nodes, node)
+            end
+            nodes
+        end
+        rng = MersenneTwister(21)
+        for trial in 1:25
+            n = rand(rng, 2:30)
+            kids = Dict(i => [j for j in i+1:n if rand(rng) < 0.25] for i in 1:n)
+            kc = i -> kids[i]
+            for order in (:pre, :post, :leaves)
+                @test protocol(Iterators.dfs(kc, 1; order)) == collect(Iterators.dfs(kc, 1; order))
+                @test protocol(Iterators.dfs(kc, 1; order, visited = Set{Int}())) ==
+                      collect(Iterators.dfs(kc, 1; order, visited = Set{Int}()))
+            end
+            @test protocol(Iterators.bfs(kc, 1)) == collect(Iterators.bfs(kc, 1))
+            @test protocol(Iterators.bfs(kc, 1; visited = Set{Int}())) ==
+                  collect(Iterators.bfs(kc, 1; visited = Set{Int}()))
+            cyclic = Dict(i => [j for j in 1:n if rand(rng) < 0.25] for i in 1:n)
+            for traverse in (Iterators.dfs, Iterators.bfs)
+                a, b = Set{Int}(), Set{Int}()
+                expected = protocol(traverse(i -> cyclic[i], 1; visited = a))
+                @test expected == collect(traverse(i -> cyclic[i], 1; visited = b))
+                @test a == b
+                for children in (i -> Tuple(cyclic[i]),
+                                 i -> isodd(i) ? Tuple(cyclic[i]) : cyclic[i])
+                    c, d = Set{Int}(), Set{Int}()
+                    @test protocol(traverse(children, 1; visited = c)) == expected
+                    @test collect(traverse(children, 1; visited = d)) == expected
+                    @test c == d == a
+                end
+            end
+        end
+    end
+
+    # Concrete child iterators, including empty tuples, keep the protocol inferred.
+    @testset "typed worklists" begin
+        protocol_sum(itr) = begin
+            total = 0
+            for node in itr
+                total += node
+            end
+            total
+        end
+        tuplekids(n) = n < 8 ? (2n, 2n + 1) : ()
+        vectorkids(n) = n < 8 ? [2n, 2n + 1] : Int[]
+        for children in (tuplekids, vectorkids), traverse in (Iterators.dfs, Iterators.bfs)
+            itr = traverse(children, 1)
+            @test @inferred(protocol_sum(itr)) == 120
+            @test @inferred(sum(itr)) == 120
+        end
+    end
+
+    # Consumers must stay iterative even when a tree is deeper than the call stack.
+    @testset "deep trees" begin
+        depth = 1_000_000
+        children(n) = 0 < n < depth ? (n + 1, 0) : ()
+        @test count(Returns(true), Iterators.dfs(children, 1)) == 2depth - 1
+        @test count(Returns(true), Iterators.dfs(children, 1; order = :post)) == 2depth - 1
+        @test count(Returns(true), Iterators.dfs(children, 1; order = :leaves)) == depth
+        @test count(Returns(true), Iterators.bfs(children, 1)) == 2depth - 1
+    end
+
+    # consumers routed through the driver must agree with the protocol path
+    @testset "standard consumers" begin
+        IT = Base.Iterators
+        kids(n) = n < 8 ? (2n, 2n + 1) : ()
+        for itr in (IT.dfs(kids, 1), IT.dfs(kids, 1; order = :post),
+                    IT.dfs(kids, 1; order = :leaves), IT.bfs(kids, 1))
+            nodes = Int[]
+            for x in itr; push!(nodes, x); end
+            @test sum(itr) == sum(nodes)
+            @test prod(itr) == prod(nodes)
+            @test maximum(itr) == maximum(nodes)
+            @test minimum(itr) == minimum(nodes)
+            @test extrema(itr) == extrema(nodes)
+            @test count(isodd, itr) == count(isodd, nodes)
+            @test foldl(-, itr) == foldl(-, nodes)
+            @test foldl(-, itr; init = 100) == foldl(-, nodes; init = 100)
+            @test mapreduce(x -> 2x, +, itr) == mapreduce(x -> 2x, +, nodes)
+            @test sum(x -> x + 1, itr) == sum(x -> x + 1, nodes)
+            @test sum(x^2 for x in itr if isodd(x)) == sum(x^2 for x in nodes if isodd(x))
+            @test sum(IT.filter(isodd, IT.map(x -> 3x, itr))) == sum(3x for x in nodes if isodd(3x))
+            @test sum(IT.flatten(IT.map(x -> (x, -x), itr))) == 0
+            @test map(x -> x + 1, itr) == map(x -> x + 1, nodes)
+            @test [2x for x in itr if isodd(x)] == [2x for x in nodes if isodd(x)]
+            @test Int[x for x in itr] == nodes
+            @test Float64[x for x in itr] == nodes && Float64[x for x in itr] isa Vector{Float64}
+            @test collect(Int, itr) == nodes && collect(Int, itr) isa Vector{Int}
+            @test collect(Float64, (2x for x in itr if isodd(x))) ==
+                  Float64[2x for x in nodes if isodd(x)]
+            seen = Int[]
+            @test foreach(x -> push!(seen, x), itr) === nothing
+            @test seen == nodes
+            protocol = Base.@invoke Base.grow_to!(Vector{Union{}}()::Any, itr::Any)
+            c = collect(itr)
+            @test c == protocol && typeof(c) == typeof(protocol)
+        end
+
+        g = IT.dfs(kids, 1)
+        @test any(x -> x == 9, g) === true
+        @test any(x -> x == 99, g) === false
+        @test all(x -> x < 20, g) === true
+        @test all(isodd, g) === false
+        @test any(x -> x == 9 ? true : missing, g) === true
+        @test any(x -> x == 99 ? true : missing, g) === missing
+        @test all(x -> x == 99 ? false : missing, g) === missing
+        @test all(x -> x < 9 ? true : missing, g) === missing
+        @test all(x -> x == 9 ? false : missing, g) === false
+        @test any(x -> x == 9 ? true : missing, g) === true
+        @test (4 in g) && !(99 in g)
+        @test_throws TypeError any(x -> 1, g)
+        @test_throws TypeError all(x -> 0, g)
+        sg = Set(g)
+        sp = Base.@invoke Base.grow_to!(Set{Union{}}()::Any, g::Any)
+        @test sg == sp && typeof(sg) == typeof(sp)
+        pre = collect(g)
+        @test union!(Set([99]), g) == Set(vcat(99, pre))
+        @test union!(BitSet(), g) == BitSet(pre)
+        @test Set(2x for x in g) == Set(2x for x in pre)
+        # max_values saturation terminates on an infinite traversal
+        @test union!(Set{Bool}(), IT.dfs(x -> (!x,), true)) == Set([true, false])
+
+        # container family and eltype preserved exactly as the protocol grow_to!
+        for (dest, itr) in ((Base.IdSet{Symbol}(), IT.dfs(Returns(()), :x)),
+                            (BitSet(), IT.dfs(kids, 1)),
+                            (BitVector(), IT.dfs(Returns(()), true)))
+            gr = Base.grow_to!(dest, itr)
+            pr = Base.@invoke Base.grow_to!(dest::Any, itr::Any)
+            @test gr == pr && typeof(gr) == typeof(pr)
+        end
+
+        # short-circuiting consumers terminate on infinite trees
+        inf = IT.dfs(n -> (2n, 2n + 1), 1)
+        @test any(x -> x > 40, inf)
+        @test !all(x -> x < 40, inf)
+        @test 64 in inf
+        @test any(x -> x > 3, IT.bfs(n -> (2n, 2n + 1), 1))
+
+        # widening through heterogeneous nodes
+        mixed(x) = x isa Tuple ? x : ()
+        troot = (1, (2.5, (3,)), 0x04)
+        for itr in (IT.dfs(mixed, troot), IT.dfs(mixed, troot; order = :post), IT.bfs(mixed, troot))
+            protocol = Base.@invoke Base.grow_to!(Vector{Union{}}()::Any, itr::Any)
+            c = collect(itr)
+            @test c == protocol && typeof(c) == typeof(protocol)
+            gen = (x for x in itr)
+            cg = collect(gen)
+            pg = Base.@invoke Base.grow_to!(Vector{Union{}}()::Any, gen::Any)
+            @test cg == pg && typeof(cg) == typeof(pg)
+        end
+
+        cyc = Dict(1 => [2], 2 => [3], 3 => [1])
+        @test sum(IT.dfs(n -> cyc[n], 1; visited = Set{Int}())) == 6
+        empty_t = IT.dfs(kids, 1; visited = Set([1]))
+        @test sum(empty_t; init = 0.5) == 0.5
+        @test_throws ArgumentError sum(empty_t)
+        @test count(isodd, empty_t) == 0
+        @test !any(isodd, empty_t) && all(isodd, empty_t)
+        @test isempty(collect(empty_t)) && collect(empty_t) isa Vector
+        @test isempty([x for x in empty_t]) && [x for x in empty_t] isa Vector
+        @test Int[x for x in empty_t] isa Vector{Int}
+        @test collect(Int, empty_t) isa Vector{Int} && isempty(collect(Int, empty_t))
+
+        # no ambiguity with the AbstractDict grow_to! methods
+        pkids(p) = p.second < 3 ? (p.first + 1 => p.second + 1,) : ()
+        @test Dict(IT.dfs(pkids, 1 => 1)) == Dict(1 => 1, 2 => 2, 3 => 3)
+    end
+
+    @testset "heterogeneous and unusual children iterators" begin
+        hkids(x) = x == 1 ? Int[2, 3] : x == 2 ? Any[:a] : Int[]
+        @test collect(Iterators.dfs(hkids, 1)) == [1, 2, :a, 3]
+        @test collect(Iterators.dfs(hkids, 1; order = :post)) == [:a, 2, 3, 1]
+        @test collect(Iterators.dfs(hkids, 1; order = :leaves)) == [:a, 3]
+        @test collect(Iterators.bfs(hkids, 1)) == [1, 2, 3, :a]
+        # child-iterator states change type between steps, including `nothing`
+        wkids(x) = x === :root ? WeirdStates() : ()
+        for order in (:pre, :post, :leaves)
+            expect = order === :pre ? [:root, 10, 20, 30] :
+                     order === :post ? [10, 20, 30, :root] : [10, 20, 30]
+            itr = Iterators.dfs(wkids, :root; order)
+            @test collect(itr) == expect
+            nodes = Any[]
+            for node in itr
+                push!(nodes, node)
+            end
+            @test nodes == expect
+        end
+        @test collect(Iterators.bfs(wkids, :root)) == [:root, 10, 20, 30]
+        nodes = Any[]
+        for node in Iterators.bfs(wkids, :root)
+            push!(nodes, node)
+        end
+        @test nodes == [:root, 10, 20, 30]
+        # EltypeUnknown children with a throwing eltype
+        nkids(x) = x === :root ? NoEltypeIt() : ()
+        @test collect(Iterators.dfs(nkids, :root)) == [:root, 10, 11]
+        @test collect(Iterators.bfs(nkids, :root)) == [:root, 10, 11]
+    end
+end

@@ -67,6 +67,24 @@ function _foldl_impl(op, init, itr::Union{Tuple,NamedTuple})
     @invoke _foldl_impl(op, init, itr::Any)
 end
 
+function _foldl_impl(op::OP, init, itr::Iterators.TreeTraversal) where {OP}
+    r = Iterators._iterate_loop((acc, x) -> Iterators.LoopContinue(op(acc, x)), itr, init)
+    return r.accum
+end
+
+# Match grow_to!'s container family and widening, specializing only traversals.
+function grow_to!(dest::Union{AbstractVector, AbstractSet}, itr::Iterators.TreeTraversal)
+    r = _foldl_impl(nothing, itr) do d, el
+        d === nothing && return push!(empty(dest, typeof(el)), el)
+        el isa eltype(d) ? push!(d, el) : push_widen(d, el)
+    end
+    return r === nothing ? dest : r
+end
+
+function _collect(::Type{T}, itr::Iterators.TreeTraversal, ::SizeUnknown) where {T}
+    return _foldl_impl((a, el) -> (push!(a, el); a), Vector{T}(), itr)::Vector{T}
+end
+
 struct _InitialValue end
 
 """
