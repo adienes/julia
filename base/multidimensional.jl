@@ -10,7 +10,7 @@ module IteratorsMD
     import .Base: +, -, *, (:)
     import .Base: simd_outer_range, simd_inner_length, simd_index, setindex
     import Core: Tuple
-    using .Base: to_index, fill_to_length, tail, safe_tail, flatten
+    using .Base: to_index, fill_to_length, tail, safe_tail
     using .Base: IndexLinear, IndexCartesian, AbstractCartesianIndex,
         ReshapedArray, ReshapedArrayLF, OneTo, Fix1
     using .Base.Iterators: Reverse, PartitionIterator
@@ -87,6 +87,9 @@ module IteratorsMD
     # Un-nest passed CartesianIndexes
     CartesianIndex{N}(index::CartesianIndex{N}) where {N} = index
     CartesianIndex(index::Union{Integer, CartesianIndex}...) = CartesianIndex(flatten(index))
+    flatten(::Tuple{}) = ()
+    flatten(I::Tuple{Any}) = Tuple(I[1])
+    @inline flatten(I::Tuple) = (Tuple(I[1])..., flatten(tail(I))...)
     CartesianIndex(index::Tuple{Vararg{Union{Integer, CartesianIndex}}}) = CartesianIndex(index...)
     function show(io::IO, i::CartesianIndex)
         print(io, "CartesianIndex(")
@@ -816,11 +819,9 @@ index_shape() = ()
 @inline index_shape(::Real, rest...) = index_shape(rest...)
 @inline index_shape(A::AbstractArray, rest...) = (axes(A)..., index_shape(rest...)...)
 
-index_shape_nested() = ()
-
-# -1 used as signal for dropped dimension. 0 is actually a valid index length
-@inline index_shape_nested(::Real, rest...) = (-1, index_shape_nested(rest...)...)
-@inline index_shape_nested(A::AbstractArray, rest...) = (size(A), index_shape_nested(rest...)...)
+index_sizes() = ()
+@inline index_sizes(::Real, rest...) = index_sizes(rest...)
+@inline index_sizes(A::AbstractArray, rest...) = (size(A)..., index_sizes(rest...)...)
 
 """
     LogicalIndex(mask)
@@ -1044,8 +1045,7 @@ function _generate_unsafe_setindex!_body(N::Int)
     quote
         x′ = unalias(A, x)
         @nexprs $N d->(I_d = unalias(A, I[d]))
-        idxsigs = @ncall $N index_shape_nested I
-        @ncall $N setindex_shape_check x′ (d->idxsigs[d])
+        setindex_shape_check(x′, @ncall $N index_sizes I)
         X = eachindex(x′)
         Xy = _prechecked_iterate(X)
         @inbounds @nloops $N i d->I_d begin
@@ -1526,8 +1526,7 @@ end
     N = length(I)
     quote
         idxlens = @ncall $N index_lengths I0 d->I[d]
-        idxsigs = @ncall $N index_shape_nested I0 d->I[d]
-        @ncall $N setindex_shape_check X idxsigs[1] d->idxsigs[d+1]
+        setindex_shape_check(X, @ncall $N index_sizes I0 d->I[d])
         isempty(X) && return B
         f0 = indexoffset(I0)+1
         l0 = idxlens[1]

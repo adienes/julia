@@ -204,61 +204,27 @@ end
 
 function throw_setindex_mismatch(X, I)
     @noinline
-    pI = Int[i for i in I if !isnegative(i)]
-    if length(pI) == 1
-        throw(DimensionMismatch("tried to assign $(length(X)) elements to $(pI[1]) destinations"))
+    if length(I) == 1
+        throw(DimensionMismatch("tried to assign $(length(X)) elements to $(I[1]) destinations"))
     else
-        throw(DimensionMismatch("tried to assign $(dims2string(size(X))) array to $(dims2string(pI)) destination"))
+        throw(DimensionMismatch("tried to assign $(dims2string(size(X))) array to $(dims2string(I)) destination"))
     end
 end
-
-const IntegerOrTuple = Union{Integer, Tuple{Vararg{Integer}}}
-
-_nnprod() = 1
-_nnprod(i::Integer, I::Vararg{Integer,N}) where N =
-    (i == -1) ? _nnprod(I...) : i * _nnprod(I...)
-
-_trailing_dropped() = true
-_trailing_dropped(i::Integer, I::Vararg{Integer,N}) where N =
-    (i == -1) && _trailing_dropped(I...)
-
-_shapes_match(::Bool, ::Tuple{}) = true
-_shapes_match(isfirstdim::Bool, sz) = _shapes_match(isfirstdim, (), sz...)
-_shapes_match(isfirstdim::Bool, sz::Tuple{}, i::Integer, I::Vararg{Integer,N}) where N =
-    isone(abs(i)) && _shapes_match(isfirstdim, sz, I...)
-
-function _shapes_match(isfirstdim, sz, i::Integer, I::Vararg{Integer,N}) where N
-    if i == -1
-        return _shapes_match(isfirstdim, sz, I...)
-    else
-        if isfirstdim && _trailing_dropped(I...)
-            # sz comes from a call to size(X) and never contains negatives
-            return prod(sz) == i
-        else
-            return (first(sz) == i) && _shapes_match(false, tail(sz), I...)
-        end
-    end
-end
-
-setindex_shape_check(X::AbstractArray) =
-    (length(X) == 1 || throw_setindex_mismatch(X, ()))
 
 setindex_shape_check(X::AbstractArray, i::Integer) =
-    (length(X) == i || throw_setindex_mismatch(X, (i,)))
+    (length(X)==i || throw_setindex_mismatch(X, (i,)))
 
-setindex_shape_check(X::AbstractArray{<:Any,0}, I::Vararg{Integer,N}) where N =
-    (length(X) == _nnprod(I...) || throw_setindex_mismatch(X, I))
+_shapes_match(::Tuple{}, ::Tuple{}) = true
+_shapes_match(a::Tuple, ::Tuple{}) = all(isone, a)
+_shapes_match(::Tuple{}, b::Tuple) = all(isone, b)
+_shapes_match(a::Tuple, b::Tuple) = first(a) == first(b) && _shapes_match(tail(a), tail(b))
 
-setindex_shape_check(X::AbstractArray{<:Any,1}, I::Vararg{Integer,N}) where N =
-    (length(X) == _nnprod(I...) || throw_setindex_mismatch(X, I))
+function setindex_shape_check(X::AbstractArray, shape::Tuple{Vararg{Integer}})
+    matches = (ndims(X) == 1 || length(shape) == 1) ? length(X) == prod(shape) : _shapes_match(size(X), shape)
+    matches || throw_setindex_mismatch(X, shape)
+end
 
-setindex_shape_check(X::AbstractArray, I::Vararg{IntegerOrTuple,N}) where N =
-    setindex_shape_check(X, flatten(I)...)
-
-setindex_shape_check(X::AbstractArray, I::Vararg{Integer,N}) where N =
-    _shapes_match(true, size(X), I...) || throw_setindex_mismatch(X, I)
-
-setindex_shape_check(::Any...) =
+setindex_shape_check(::Any, ::Tuple) =
     throw(ArgumentError("indexed assignment with a single value to possibly many locations is not supported; perhaps use broadcasting `.=` instead?"))
 
 # convert to a supported index type (array or Int)
