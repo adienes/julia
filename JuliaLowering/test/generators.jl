@@ -243,3 +243,63 @@ end
     end
     """) == ones(Int, 5, 5)
 end
+
+@testset "generators: `[_ for _ in rhs]`, `[f(_) for _ in rhs]` compat (#18621)" begin
+    local test_mod = @newmod()
+    local jeval(str) = jl_eval(test_mod, parsestmt(SyntaxTree, str); expr_compat_mode=true)
+    local jnew(str)  = jl_eval(test_mod, parsestmt(SyntaxTree, str))
+    local feval(str) = fl_eval(test_mod, parsestmt(Expr, str))
+    JuliaLowering.include_string(test_mod, "f(x) = x; f(x, y) = x; g(x) = x")
+
+    for s in ("[_ for _ in 1:3]",
+              "collect(_ for _ in 1:3)",
+              "[f(_) for _ in 1:3]",
+              "[(f)(__) for __ in 1:3]",
+              "[identity(_) for _ in 1:3]",
+              )
+        @test jeval(s) == feval(s) context=s
+        @test_throws LoweringError jnew(s) # this behaviour is deprecated
+    end
+
+    # Intentionally left out for now
+    for s in ("[f(_) for _ in 1:3 if isodd(_)]",
+              "[f(_) for _ in 1:2 for _ in 1:2]",
+              "[_ for _ in 1:2 for _ in 1:2]",
+              "[f(_) for a in 1:2 for _ in 1:2]",
+              "[f(_) for _ in 1:3 if isodd(_) for _ in 1:2]")
+        @test_broken jeval(s) == feval(s) context=s
+        @test_throws LoweringError jnew(s)
+    end
+
+    # Rejected by both
+    for s in ("[f(_, _) for _ in 1:3]",           # >1 argument
+              "[f(identity(_)) for _ in 1:3]",    # arg is not exactly `_`
+              "[f(_)(_) for _ in 1:3]",           # callee contains `_`
+              "[_(_) for _ in 1:3]",              # callee *is* `_`
+              "[.+(_) for _ in 1:3]",             # dot-operator callee
+              "[sqrt.(_) for _ in 1:3]",          # broadcast, not a `call`
+              "[f(_; k=_) for _ in 1:3]",         # keyword arg reads `_`
+              "[f(_) for _ in 1:2, _ in 1:2]",    # comma product (two `_`)
+              "[f(_) for _ in 1:3 if _ > 0]",     # non-reducible filter read
+              "[f(_) for _ in 1:2 for b in 1:2]") # body reads an outer `_`
+        @test_throws LoweringError jeval(s) context=s
+        @test_throws LoweringError jnew(s)
+    end
+
+    @test (feval("(_ for _ in 1:3)")).f === Base.identity
+    @test (jeval("(_ for _ in 1:3)")).f === Base.identity
+    @test (feval("(f(_) for _ in 1:3)")).f === test_mod.f
+    @test (jeval("(f(_) for _ in 1:3)")).f === test_mod.f
+end
+
+@testset "a comprehension may contain a non-syntactic generator" begin
+    ex = Expr(:comprehension,
+              Expr(:call, GlobalRef(Base, :Generator), :(i -> 2i), :(1:3)))
+    @test fl_eval(test_mod, ex) == [2,4,6]
+    @test jl_eval(test_mod, ex) == [2,4,6]
+
+    ex = Expr(:typed_comprehension, Int,
+              Expr(:call, GlobalRef(Base, :Generator), :(i -> 2i), :(1:3)))
+    @test fl_eval(test_mod, ex) == Int[2,4,6]
+    @test jl_eval(test_mod, ex) == Int[2,4,6]
+end

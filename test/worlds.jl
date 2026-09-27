@@ -539,6 +539,24 @@ Base.delete_method(fshadow_m2)
 
 @test_throws "Method of fshadow already disabled" Base.delete_method(fshadow_m2)
 
+# A caller compiled with an ambiguous callee instead compiles a `throw(::MethodError)`.
+# Deleting one of the ambiguous methods must invalidate the caller (#63224).
+module AmbiguousDeletion
+f(::Nothing, x) = :nothing_method
+f(x, ::Int) = :int_method
+g(a, b) = f(a, b)
+end
+@test_throws "is ambiguous" AmbiguousDeletion.g(nothing, 1)
+wc_ambiguous = get_world_counter()
+Base.delete_method(which(AmbiguousDeletion.f, (Any, Int)))
+@test AmbiguousDeletion.f(nothing, 1) === :nothing_method
+@test AmbiguousDeletion.g(nothing, 1) === :nothing_method
+@test Base.invokelatest(AmbiguousDeletion.g, nothing, 1) === :nothing_method
+# The deletion is not retroactive: earlier worlds retain the ambiguity.
+# `showerror` looks up candidates in the latest world, so test the exception rather than its message.
+@test_throws MethodError Base.invoke_in_world(wc_ambiguous, AmbiguousDeletion.f, nothing, 1)
+@test_throws MethodError Base.invoke_in_world(wc_ambiguous, AmbiguousDeletion.g, nothing, 1)
+
 # Generated functions without edges must have min_world = 1.
 # N.B.: If changing this, move this test to precompile and make sure
 # that the specialization survives revalidation.
@@ -653,3 +671,30 @@ struct W62022{T}; x::T; end
 @noinline foo62022(::W62022{W62022{W62022{W62022{Int}}}}) = false
 @test foo62022(W62022(1)) === false # test for invalidation
 @test foo62022(W62022(W62022(W62022(1)))) === false
+
+# issue #61667 - rebinding a name in Main must not invalidate the show machinery, which
+# concrete-evals binding queries against Main (via `isvisible`)
+struct ShowInval61667; x::Int; end
+fshow61667(v) = string(v)
+@test fshow61667([ShowInval61667(1)]) isa String
+let ci = method_instance(fshow61667, (Vector{ShowInval61667},)).cache
+    @test ci.max_world == typemax(UInt)
+    Core.eval(Main, :(struct ShowInval61667 end))
+    @test ci.max_world == typemax(UInt)
+end
+
+# issue #61667 - new array types must not invalidate abstractly-typed array iteration
+struct IterInval61667{T} <: AbstractVector{T}
+    v::Vector{T}
+end
+Base.size(A::IterInval61667) = size(A.v)
+Base.getindex(A::IterInval61667, i::Int) = A.v[i]
+absvec61667() = Base.inferencebarrier(Module[])::AbstractVector{Module}
+iter61667() = invoke(iterate, Tuple{AbstractArray}, absvec61667())
+@test precompile(iter61667, ())
+let ci = method_instance(iter61667, ()).cache
+    @test ci.max_world == typemax(UInt)
+    Base.eachindex(::IndexLinear, A::IterInval61667) = eachindex(A.v)
+    Base.iterate(A::IterInval61667, y...) = iterate(A.v, y...)
+    @test ci.max_world == typemax(UInt)
+end

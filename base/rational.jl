@@ -259,7 +259,6 @@ function rationalize(::Type{T}, x::AbstractFloat, tol::Real) where T<:Integer
     y = one(x)
     tolx = oftype(x, tol)
     nt, t, tt = tolx, zero(tolx), tolx
-    ia = np = nq = zero(T)
 
     # compute the successive convergents of the continued fraction
     #  np // nq = (p*a + pp) // (q*a + qq)
@@ -402,7 +401,7 @@ function -(x::Rational{T}) where T<:Unsigned
 end
 
 function +(x::Rational, y::Rational)
-    xp, yp = promote(x, y)::NTuple{2,Rational}
+    xp, _ = promote(x, y)::NTuple{2,Rational}
     if isinf(x) && x == y
         return xp
     end
@@ -420,7 +419,7 @@ function +%(x::Rational, y::Rational)
 end
 
 function -(x::Rational, y::Rational)
-    xp, yp = promote(x, y)::NTuple{2,Rational}
+    xp, _ = promote(x, y)::NTuple{2,Rational}
     if isinf(x) && x == -y
         return xp
     end
@@ -686,7 +685,7 @@ function hash(x::Rational{<:BitInteger64}, h::UInt)
         end
     end
     h = hash_integer(pow, h)
-    h = hash_integer((pow > 0) ? (num << (pow % 64)) : num, h)
+    h = hash_integer((pow > 0) ? (num << (pow % 8)) : num, h)
     return h
 end
 

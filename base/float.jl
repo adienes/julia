@@ -177,6 +177,7 @@ function ieee754_representation(
     ret |= exponent_field
     ret <<= significand_bits(F)
     ret |= significand_field
+    return ret
 end
 
 # ±floatmax(T)
@@ -380,7 +381,8 @@ Float64
 """
 float(::Type{T}) where {T<:Number} = typeof(float(zero(T)))
 float(::Type{T}) where {T<:AbstractFloat} = T
-float(::Type{Union{}}, slurp...) = Union{}
+float(::Type{Union{}}) = Union{}
+float(::Type{Union{}}, slurp...) = throw(MethodError(float, (Union{}, slurp...)))
 
 """
     unsafe_trunc(T, x)
@@ -508,7 +510,6 @@ function _to_float(number::U, ep) where {U<:Unsigned}
     lz::signed(U) = unsafe_trunc(S, Core.Intrinsics.ctlz_int(number) - U(exponent_bits(F)))
     number <<= lz
     epint -= lz
-    bits = U(0)
     if epint >= 0
         bits = number & significand_mask(F)
         bits |= ((epint + S(1)) << significand_bits(F)) & exponent_mask(F)
@@ -713,14 +714,18 @@ See also: [`Inf`](@ref), [`iszero`](@ref), [`isfinite`](@ref), [`isnan`](@ref).
 isinf(x::Real) = !isnan(x) & !isfinite(x)
 isinf(x::IEEEFloat) = abs(x) === oftype(x, Inf)
 
-#=
-`decompose(x)`: non-canonical decomposition of rational values as `num*2^pow/den`.
+"""
+    Base.decompose(x::Real) -> (num::Integer, pow::Integer, den::Integer)
 
-The decompose function is the point where rational-valued numeric types that support
-hashing hook into the hashing protocol. `decompose(x)` should return three integer
-values `num, pow, den`, such that the value of `x` is mathematically equal to
+Return three integer values `num, pow, den`, such that the value of `x` is
+mathematically equal to
 
     num*2^pow/den
+
+The decompose function is the point where rational-valued `Real` subtypes that support
+hashing hook into the hashing protocol. It also provides the generic definitions of
+[`isfinite`](@ref) and [`isinf`](@ref) for `Real` subtypes, and it is used to compare
+`AbstractFloat` values against [`Rational`](@ref) values.
 
 The decomposition need not be canonical in the sense that it just needs to be *some*
 way to express `x` in this form, not any particular way – with the restriction that
@@ -732,8 +737,9 @@ Special values:
  - `x` is zero: `num` should be zero and `den` should have the same sign as `x`
  - `x` is infinite: `den` should be zero and `num` should have the same sign as `x`
  - `x` is not a number: `num` and `den` should both be zero
-=#
 
+See also [`hash`](@ref).
+"""
 decompose(x::Integer) = x, 0, 1
 
 function decompose(x::Float16)::NTuple{3,Int}
@@ -744,7 +750,7 @@ function decompose(x::Float16)::NTuple{3,Int}
     e = ((n & 0x7c00) >> 10) % Int
     s |= Int16(e != 0) << 10
     d = ifelse(signbit(x), -1, 1)
-    s, e - 25 + (e == 0), d
+    s%Int, e - 25 + (e == 0), d
 end
 
 function decompose(x::Float32)::NTuple{3,Int}
@@ -755,7 +761,7 @@ function decompose(x::Float32)::NTuple{3,Int}
     e = ((n & 0x7f800000) >> 23) % Int
     s |= Int32(e != 0) << 23
     d = ifelse(signbit(x), -1, 1)
-    s, e - 150 + (e == 0), d
+    s%Int, e - 150 + (e == 0), d
 end
 
 function decompose(x::Float64)::Tuple{Int64, Int, Int}

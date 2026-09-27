@@ -5,7 +5,7 @@
 using Random
 using Base: remove_linenums!
 
-using_JuliaSyntax = parentmodule(Core._parse) != Core.Compiler
+using_JuliaSyntax = parentmodule(Core._parse) != Base
 
 macro test_parseerror(str, msg)
     if using_JuliaSyntax
@@ -582,8 +582,10 @@ end
 let code = Meta.lower(Main, :(@inline f(p::Int=2) = 3)).args[1].code
     local src
     for i = length(code):-1:1
-        if Meta.isexpr(code[i], :method)
-            src = code[i].args[3]
+        if Meta.isexpr(code[i], :call) && length(code[i].args) >= 5 &&
+           code[i].args[1] isa GlobalRef && code[i].args[1].name == :define_method &&
+           code[i].args[5] isa Core.CodeInfo
+            src = code[i].args[5]
             break
         end
     end
@@ -3769,7 +3771,9 @@ end
 end
 
 @testset "public keyword" begin
-    p(str) = Base.remove_linenums!(Meta.parse(str))
+    local test_mod = Module()
+    Base.set_syntax_version(test_mod, v"1.13")
+    p(str) = Base.remove_linenums!(Meta.parse(str; mod=test_mod))
     # tests ported from JuliaSyntax.jl
     @test p("function f(public)\n    public + 3\nend") == Expr(:function, Expr(:call, :f, :public), Expr(:block, Expr(:call, :+, :public, 3)))
     @test p("public A, B") == Expr(:public, :A, :B)
@@ -4058,8 +4062,16 @@ end
     code = src.args[1].code
     for i = length(code):-1:1
         expr = code[i]
-        Meta.isexpr(expr, :method) || continue
-        @test isa(expr.args[1], Union{GlobalRef, Symbol})
+        if Meta.isexpr(expr, :call) && length(expr.args) >= 3 &&
+           expr.args[1] isa GlobalRef && expr.args[1].name == :define_method
+            # args[3] should be a QuoteNode wrapping a Symbol, or a GlobalRef
+            name_arg = expr.args[3]
+            if name_arg isa QuoteNode
+                @test isa(name_arg.value, Symbol)
+            else
+                @test isa(name_arg, GlobalRef)
+            end
+        end
     end
 end
 
@@ -4129,6 +4141,11 @@ module ExtendedIsDefined
         @test !Core.isdefinedglobal(@__MODULE__, :x2, false)
         @test !Core.isdefinedglobal(@__MODULE__, :x3, false)
         @test !Core.isdefinedglobal(@__MODULE__, :x4, false)
+
+        @test Core.isdefinedglobal(@__MODULE__, :x1, true, :monotonic)
+        @test Core.isdefinedglobal(@__MODULE__, :x1, false, :acquire)
+        @test !Core.isdefinedglobal(@__MODULE__, :x2, false, :sequentially_consistent)
+        @test_throws ConcurrencyViolationError Core.isdefinedglobal(@__MODULE__, :x1, true, :not_atomic)
     end
 end
 
@@ -4441,12 +4458,27 @@ module DoubleImport
 end
 @test DoubleImport.Random === Test.Random
 
-# Expr(:method) returns the method
+# define_method call returns the method
 let ex = @Meta.lower function return_my_method(); 1; end
     code = ex.args[1].code
-    idx = findfirst(ex->Meta.isexpr(ex, :method) && length(ex.args) > 1, code)
+    idx = findfirst(ex->Meta.isexpr(ex, :call) && length(ex.args) >= 5 &&
+                       ex.args[1] isa GlobalRef && ex.args[1].name == :define_method, code)
     code[end] = Core.ReturnNode(Core.SSAValue(idx))
     @test isa(Core.eval(@__MODULE__, ex), Method)
+end
+
+# Core.define_method validates its internal signature and body representation.
+@test_throws TypeError Core.define_method(@__MODULE__, :invalid_method, nothing, nothing)
+@test_throws ErrorException Core.define_method(@__MODULE__, :invalid_method, Core.svec(), nothing)
+
+# A method defined through a GlobalRef name records the evaluating module,
+# not the GlobalRef's module
+module GlobalRefMethodModule62320
+function no_methods_yet end
+end
+let f = GlobalRefMethodModule62320.no_methods_yet
+    Core.eval(@__MODULE__, Expr(:function, Expr(:call, GlobalRef(GlobalRefMethodModule62320, :no_methods_yet)), nothing))
+    @test only(methods(f)).module === @__MODULE__
 end
 
 # Capturing a @nospecialize argument should result in an Any field in the closure

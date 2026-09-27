@@ -32,7 +32,6 @@ function kill_timer(delay)
         # **DON'T COPY ME.**
         # The correct way to handle timeouts is to close the handle:
         # e.g. `close(stdout_read); close(stdin_write)`
-        test_task.queue === nothing || Base.list_deletefirst!(test_task.queue::Base.IntrusiveLinkedList{Task}, test_task)
         schedule(test_task, "hard kill repl test"; error=true)
         print(stderr, "WARNING: attempting hard kill of repl test after exceeding timeout\n")
     end
@@ -67,7 +66,10 @@ end
 #end
 
 # REPL tests
-function fake_repl(@nospecialize(f); options::REPL.Options=REPL.Options(confirm_exit=false,style_input=false,auto_insert_closing_bracket=false))
+function fake_repl(@nospecialize(f);
+        options::REPL.Options=REPL.Options(confirm_exit=false, style_input=false,
+            auto_insert_closing_bracket=false),
+        semantic_prompts::Bool=false)
     # Use pipes so we can easily do blocking reads
     # In the future if we want we can add a test that the right object
     # gets displayed by intercepting the display
@@ -80,6 +82,7 @@ function fake_repl(@nospecialize(f); options::REPL.Options=REPL.Options(confirm_
 
     repl = REPL.LineEditREPL(FakeTerminal(input.out, output.in, err.in, options.hascolor), options.hascolor)
     repl.options = options
+    repl.options.semantic_prompts = semantic_prompts
 
     hard_kill = kill_timer(900) # Your debugging session starts now. You have 15 minutes. Go.
     f(input.in, output.out, repl)
@@ -93,6 +96,76 @@ function fake_repl(@nospecialize(f); options::REPL.Options=REPL.Options(confirm_
     Base.wait(t)
     close(hard_kill)
     nothing
+end
+
+# Semantic prompt markers delimit prompt input and output and report evaluation status.
+@test REPL.Options().semantic_prompts
+@test REPL.serialize_vscode_osc_message("a b;c\\d\nα") ==
+    "a\\x20b\\x3bc\\\\d\\x0aα"
+withenv("TERM_PROGRAM" => "") do
+    fake_repl(semantic_prompts=true) do stdin_write, stdout_read, repl
+        markers = REPL.OSC_133_MARKERS
+        repl.specialdisplay = REPL.REPLDisplay(repl)
+        repl.history_file = false
+        repltask = @async REPL.run_repl(repl)
+
+        prompt = readuntil(stdout_read, markers.prompt_end, keep=true)
+        @test occursin(markers.prompt_start, prompt)
+
+        write(stdin_write, "\"semantic output\"\n")
+        response = readuntil(stdout_read, markers.command_finish_ok, keep=true)
+        @test occursin(markers.command_start * "\"semantic output\"", response)
+        readuntil(stdout_read, markers.prompt_end)
+
+        write(stdin_write, "error(\"semantic failure\")\n")
+        response = readuntil(stdout_read, markers.command_finish_error, keep=true)
+        @test occursin(markers.command_start, response)
+        @test occursin("semantic failure", response)
+        readuntil(stdout_read, markers.prompt_end)
+
+        write(stdin_write, '\n')
+        readuntil(stdout_read, markers.command_finish)
+        readuntil(stdout_read, markers.prompt_end)
+
+        # A prompt without an associated REPL emits neither prompt nor command markers.
+        julia_prompt = repl.interface.modes[1]::LineEdit.Prompt
+        julia_prompt.repl = nothing
+        write(stdin_write, "1 + 1\n")
+        response = readuntil(stdout_read, "julia> ", keep=true)
+        @test !occursin("\e]133;", response)
+        julia_prompt.repl = repl
+
+        write(stdin_write, '\x04')
+        readuntil(stdout_read, markers.command_finish)
+        Base.wait(repltask)
+    end
+end
+
+withenv("TERM_PROGRAM" => "vscode") do
+    fake_repl(semantic_prompts=true) do stdin_write, stdout_read, repl
+        markers = REPL.OSC_633_MARKERS
+        # The terminal protocol is selected once when the REPL is constructed.
+        withenv("TERM_PROGRAM" => "") do
+            repl.specialdisplay = REPL.REPLDisplay(repl)
+            repl.history_file = false
+            repltask = @async REPL.run_repl(repl)
+
+            prompt = readuntil(stdout_read, markers.prompt_end, keep=true)
+            @test occursin(markers.prompt_start, prompt)
+
+            write(stdin_write, "2 + 2\n")
+            response = readuntil(stdout_read, markers.command_finish_ok, keep=true)
+            command_line = markers.command_line * "2\\x20+\\x202\a"
+            @test occursin(markers.command_start * "4", response)
+            @test occursin(command_line * markers.command_finish_ok, response)
+            @test !occursin("\e]133;", response)
+            readuntil(stdout_read, markers.prompt_end)
+
+            write(stdin_write, '\x04')
+            readuntil(stdout_read, markers.command_finish)
+            Base.wait(repltask)
+        end
+    end
 end
 
 # Writing ^C to the repl will cause sigint, so let's not die on that
@@ -112,6 +185,45 @@ fake_repl() do stdin_write, stdout_read, repl
     end
     repltask = @async REPL.run_interface(repl.t, LineEdit.ModalInterface(Any[panel]))
     close(stdin_write)
+    Base.wait(repltask)
+end
+
+
+# Pressing ^C twice in a row at an empty prompt cancels every task that earlier
+# REPL inputs started and that is still running (issue #47839, see
+# `Base.cancel_session_work!`). The first press only prints a hint. Any other
+# input in between resets this, so the next ^C counts as a first press again.
+#
+# In fake_repl, `stdout_read` only receives what the REPL itself prints: the
+# echo of the typed input, the prompts, and the displayed results. A `println`
+# in an evaluated expression goes to the process stdout instead. So each step
+# below evaluates an expression and waits for its displayed result. The results
+# are written as concatenations such as `"BG" * "UP"` so that the awaited text
+# occurs only in the result and not in the echo of the input.
+fake_repl() do stdin_write, stdout_read, repl
+    repltask = @async REPL.run_repl(repl)
+    # start a background task that never finishes on its own
+    write(stdin_write, "global bg = @async while true; sleep(0.01); end; \"BG\" * \"UP\"\n")
+    readuntil(stdout_read, "BGUP")
+    readuntil(stdout_read, "julia> ")
+    # the first ^C at the empty prompt only prints a hint
+    write(stdin_write, "\x03")
+    readuntil(stdout_read, "press ^C again to cancel all in-flight work")
+    # entering anything else resets that, so this ^C again only prints the hint
+    write(stdin_write, "\"un\" * \"related\"\n")
+    readuntil(stdout_read, "unrelated")
+    write(stdin_write, "\x03")
+    readuntil(stdout_read, "press ^C again to cancel all in-flight work")
+    # a second ^C directly after it cancels the running tasks
+    write(stdin_write, "\x03")
+    readuntil(stdout_read, "Cancelled all in-flight work.")
+    # the background task was cancelled ...
+    write(stdin_write, "\"done=\" * string(timedwait(() -> istaskdone(bg), 30.0) === :ok)\n")
+    readuntil(stdout_read, "done=true")
+    # ... and the REPL still evaluates new input afterwards
+    write(stdin_write, "\"still\" * \"-alive\"\n")
+    readuntil(stdout_read, "still-alive")
+    write(stdin_write, '\x04') # ^D exits the REPL loop, not the process
     Base.wait(repltask)
 end
 
@@ -244,7 +356,6 @@ fake_repl(options = REPL.Options(confirm_exit=false,hascolor=true,style_input=fa
         @test occursin("shell> ", s) # check for the echo of the prompt
         @test occursin("'", s) # check for the echo of the input
         s = readuntil(stdout_read, "\n\n")
-        @info repr(s)
         @test(startswith(s, "\e[0mERROR: unterminated single quote\nStacktrace:\n [1] ") ||
             startswith(s, "\e[0m\e[1m\e[91mERROR: \e[39m\e[22m\e[91munterminated single quote\e[39m\nStacktrace:\n [1] "),
             skip = Sys.iswindows() && Sys.WORD_SIZE == 32)
@@ -572,6 +683,7 @@ for prompt = ["TestΠ", () -> randstring(rand(1:10))]
         # test that history_first jumps to beginning of current session's history
         @test hp.start_idx == 11
         hp.start_idx -= 5 # temporarily alter history
+        @test REPL.repl_filename(repl, hp) == "REPL[5]"
         LineEdit.history_first(s, hp)
         @test hp.cur_idx == 6
         # we are at the beginning of current session's history, so history_first
@@ -1680,11 +1792,16 @@ fake_repl() do stdin_write, stdout_read, repl
     end
     LineEdit.edit_input(s, input_f)
     @test buffercontents(LineEdit.buffer(s)) == "1234αβ56γ"
+    write(stdin_write, '\x04')
+    wait(repltask)
 end
 
-# Non standard output_prefix, tested via `numbered_prompt!`
+# Test that numbered prompts start at one with initialized session history.
 fake_repl() do stdin_write, stdout_read, repl
     repl.interface = REPL.setup_interface(repl)
+    hp = repl.interface.modes[1].hist
+    @test hp.start_idx == 1
+    @test REPL.history_do_initialize(hp)
 
     backend = REPL.REPLBackend()
     repltask = @async begin

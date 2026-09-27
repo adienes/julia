@@ -1,6 +1,15 @@
-# Interrogate the fortran compiler (which is always GCC based) on where it is keeping its libraries
-STD_LIB_PATH := $(shell LANG=C $(FC) -print-search-dirs 2>/dev/null | grep '^programs: =' | sed -e "s/^programs: =//")
-STD_LIB_PATH += $(PATHSEP)$(shell LANG=C $(FC) -print-search-dirs 2>/dev/null | grep '^libraries: =' | sed -e "s/^libraries: =//")
+# Interrogate the fortran compiler (which is always GCC based) on where it is keeping its libraries.
+# If there is no functioning fortran compiler, fall back to the C compiler, since many distros
+# install the GCC runtime libraries even when gfortran itself is not installed. A GCC-based C
+# compiler reports the same search directories; clang (e.g. `CC=clang`) also answers
+# `-print-search-dirs` and includes the GCC installation it found, so the lookup works there too.
+ifneq ($(shell LANG=C $(FC) -print-search-dirs 2>/dev/null),)
+CSL_COMPILER := $(FC)
+else
+CSL_COMPILER := $(CC)
+endif
+STD_LIB_PATH := $(shell LANG=C $(CSL_COMPILER) -print-search-dirs 2>/dev/null | grep '^programs: =' | sed -e "s/^programs: =//")
+STD_LIB_PATH += $(PATHSEP)$(shell LANG=C $(CSL_COMPILER) -print-search-dirs 2>/dev/null | grep '^libraries: =' | sed -e "s/^libraries: =//")
 ifeq ($(BUILD_OS),WINNT)  # the mingw compiler lies about it search directory paths
 STD_LIB_PATH += $(shell echo '$(STD_LIB_PATH)' | sed -e "s!/lib/!/bin/!g")
 endif
@@ -80,6 +89,7 @@ $(eval $(call copy_csl,$(call versioned_libname,libgfortran,5)))
 $(eval $(call copy_csl,$(call versioned_libname,libquadmath,0)))
 $(eval $(call copy_csl,$(call versioned_libname,libstdc++,6)))
 $(eval $(call copy_csl,$(call versioned_libname,libatomic,1)))
+$(eval $(call copy_csl,libatomic.$(SHLIB_EXT)))
 $(eval $(call copy_csl,$(call versioned_libname,libgomp,1)))
 
 # Configurable either a static or dynamic library depending on the system
@@ -103,6 +113,7 @@ $(eval $(call copy_csl_static_private,libwinmm.a))
 $(eval $(call copy_csl_static_private,libdbghelp.a))
 $(eval $(call copy_csl_static_private,libuserenv.a))
 $(eval $(call copy_csl_static_private,libsecur32.a))
+$(eval $(call copy_csl_static_private,libsynchronization.a))
 $(eval $(call copy_csl_static_private,libole32.a))
 $(eval $(call copy_csl_static_private,libuuid.a))
 $(eval $(call copy_csl_static_private,libadvapi32.a))
@@ -144,16 +155,17 @@ $(eval $(call copy_csl_static,crti.o))
 $(eval $(call copy_csl_static,crtn.o))
 $(eval $(call copy_csl_static,crtbeginS.o))
 $(eval $(call copy_csl_static,crtendS.o))
-ifeq ($(OS),Linux) # glibc-specific
+ifeq ($(LIBC),glibc)
 $(eval $(call copy_csl_static,libc_nonshared.a))
 endif
 endif
 endif
 
-# winpthread is only Windows, pthread is only others
+# winpthread is only Windows, pthread is only others. Not on Linux, where libpthread is
+# part of glibc: a copy from a toolchain's sysroot would not match the system's libc.
 ifeq ($(OS),WINNT)
 $(eval $(call copy_csl,$(call versioned_libname,libwinpthread,1)))
-else
+else ifneq ($(OS),Linux)
 $(eval $(call copy_csl,$(call versioned_libname,libpthread,0)))
 endif
 
@@ -194,6 +206,7 @@ install-csl:
 	cp -a $(build_libdir)/gcc/$(BB_TRIPLET)/$(GCC_VERSION)/libdbghelp.a $(build_private_libdir)/
 	cp -a $(build_libdir)/gcc/$(BB_TRIPLET)/$(GCC_VERSION)/libuserenv.a $(build_private_libdir)/
 	cp -a $(build_libdir)/gcc/$(BB_TRIPLET)/$(GCC_VERSION)/libsecur32.a $(build_private_libdir)/
+	cp -a $(build_libdir)/gcc/$(BB_TRIPLET)/$(GCC_VERSION)/libsynchronization.a $(build_private_libdir)/
 	cp -a $(build_libdir)/gcc/$(BB_TRIPLET)/$(GCC_VERSION)/libole32.a $(build_private_libdir)/
 	cp -a $(build_libdir)/gcc/$(BB_TRIPLET)/$(GCC_VERSION)/libuuid.a $(build_private_libdir)/
 	cp -a $(build_libdir)/gcc/$(BB_TRIPLET)/$(GCC_VERSION)/libadvapi32.a $(build_private_libdir)/
@@ -213,7 +226,7 @@ install-csl:
 	cp -a $(build_libdir)/gcc/$(BB_TRIPLET)/$(GCC_VERSION)/crtn.o $(build_libdir)/
 	cp -a $(build_libdir)/gcc/$(BB_TRIPLET)/$(GCC_VERSION)/crtbeginS.o $(build_libdir)/
 	cp -a $(build_libdir)/gcc/$(BB_TRIPLET)/$(GCC_VERSION)/crtendS.o $(build_libdir)/
-ifeq ($(OS),Linux)
+ifeq ($(LIBC),glibc)
 	cp -a $(build_libdir)/gcc/$(BB_TRIPLET)/$(GCC_VERSION)/libc_nonshared.a $(build_libdir)/
 endif
 endif
@@ -239,6 +252,7 @@ uninstall-gcc-libraries:
 	-rm -f $(build_private_libdir)/libdbghelp.a
 	-rm -f $(build_private_libdir)/libuserenv.a
 	-rm -f $(build_private_libdir)/libsecur32.a
+	-rm -f $(build_private_libdir)/libsynchronization.a
 	-rm -f $(build_private_libdir)/libole32.a
 	-rm -f $(build_private_libdir)/libuuid.a
 	-rm -f $(build_private_libdir)/libadvapi32.a

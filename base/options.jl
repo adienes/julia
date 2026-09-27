@@ -24,6 +24,7 @@ struct JLOptions
     startupfile::Int8
     compile_enabled::Int8
     code_coverage::Int8
+    code_coverage_mode::Int8
     malloc_log::Int8
     tracked_path::Ptr{UInt8}
     opt_level::Int8
@@ -82,6 +83,12 @@ else
 end
 
 JLOptions() = unsafe_load(cglobal(:jl_options, JLOptions))
+
+# NOTE: Keep in sync with the JL_OPTIONS_COMPILE_* defines in src/julia.h
+const JL_OPTIONS_COMPILE_OFF = 0
+const JL_OPTIONS_COMPILE_ON  = 1
+const JL_OPTIONS_COMPILE_ALL = 2
+const JL_OPTIONS_COMPILE_MIN = 3
 
 function colored_text(opts::JLOptions)
     return if opts.color != 0

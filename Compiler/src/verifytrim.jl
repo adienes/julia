@@ -281,6 +281,7 @@ function may_dispatch(@nospecialize ftyp)
                Core.finalizer isa ftyp ||
                Core.modifyfield! isa ftyp ||
                Core.modifyglobal! isa ftyp ||
+               Core.modifyglobal_partition isa ftyp ||
                Core.memoryrefmodify! isa ftyp
     else
         return true
@@ -343,7 +344,7 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
                         end
                     end
                 elseif Core.finalizer isa ftyp
-                    if length(stmt.args) == 3
+                    if 3 <= length(stmt.args) <= 5
                         finalizer = argextype(stmt.args[2], codeinfo, sptypes)
                         obj = argextype(stmt.args[3], codeinfo, sptypes)
                         atype = argtypes_to_type(Any[finalizer, obj])
@@ -353,9 +354,8 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
                             ci = get(caches, mi, nothing)
                             ci isa CodeInstance && continue
                         end
-
-                        error = "unresolved finalizer registered"
                     end
+                    error = "unresolved finalizer registered"
                 elseif Core._apply isa ftyp
                     error = "trim verification not yet implemented for builtin `Core._apply`"
                 elseif Core._call_in_world_total isa ftyp
@@ -370,6 +370,8 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
                     error = "trim verification not yet implemented for builtin `Core.modifyfield!`"
                 elseif Core.modifyglobal! isa ftyp
                     error = "trim verification not yet implemented for builtin `Core.modifyglobal!`"
+                elseif Core.modifyglobal_partition isa ftyp
+                    error = "trim verification not yet implemented for builtin `Core.modifyglobal_partition`"
                 elseif Core.memoryrefmodify! isa ftyp
                     error = "trim verification not yet implemented for builtin `Core.memoryrefmodify!`"
                 else @assert false "unexpected builtin" end

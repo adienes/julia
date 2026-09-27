@@ -72,7 +72,7 @@ static char *jl_gc_try_alloc_pages_(int pg_cnt) JL_NOTSAFEPOINT
 // smaller `MIN_BLOCK_PG_ALLOC` a `jl_memory_exception` is thrown.
 // Assumes `gc_pages_lock` is acquired, the lock is released before the
 // exception is thrown.
-static char *jl_gc_try_alloc_pages(void) JL_NOTSAFEPOINT
+STATIC_INLINE char *jl_gc_try_alloc_pages(void) JL_NOTSAFEPOINT_LEAVE_ENTER
 {
     unsigned pg_cnt = block_pg_cnt;
     char *mem = NULL;
@@ -110,6 +110,7 @@ NOINLINE jl_gc_pagemeta_t *jl_gc_alloc_page(void) JL_NOTSAFEPOINT
     // try to get page from `pool_lazily_freed`
     meta = pop_lf_back(&global_page_pool_lazily_freed);
     if (meta != NULL) {
+        jl_atomic_fetch_add_relaxed(&global_page_pool_lazily_freed_n, -(ssize_t)1);
         gc_alloc_map_set(meta->data, GC_PAGE_ALLOCATED);
         // page is already mapped
         return meta;

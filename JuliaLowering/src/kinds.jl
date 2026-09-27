@@ -46,8 +46,6 @@ function _register_kinds()
             "symboliclabel"
             # Goto named label
             "symbolicgoto"
-            # Goto named label (old syntax version, no try/finally check)
-            "oldsymbolicgoto"
             # Labeled block for `@label name expr` (block break)
             "symbolicblock"
             # Internal initializer for struct types, for inner constructors/functions
@@ -124,15 +122,28 @@ function _register_kinds()
             # [K"function_type" name]
             # Evaluates to the type of the function or closure with given `name`
             "function_type"
-            # [K"method_defs" name block]
-            # The code in `block` defines methods for generic function `name`
+            # [K"method_defs" name [K"block" typevars...] [K"block" body...]]
+            # The code in `body` defines methods for generic function `name`.
+            # If non-toplevel, all contained methods share a closure type.
+            # `typevars` are assigned-once top-level locals only referenced
+            # inside `K"method"`, but outside of `K"lambda"`, since any
+            # reference inside a lambda should resolve to the lambda's sparam
+            # shadowing it.
             "method_defs"
+            # from `function f end`, tells closure conversion to give f its value
+            # (usually done with method_defs)
+            "no_method_defs"
+            # [K"typevar" name rhs] appears only in method_defs and gets special
+            # scope resolution: a sequence of K"sparam"s are similar to nested
+            # let-blocks, but without introducing a local scope.
+            "typevar"
             "_opaque_closure"
             # The enclosed statements must be executed at top level
             "toplevel_butfirst"
             # like v = val, except that if `v` turns out global (either
             # implicitly or by explicit `global`), it gains an implicit `const`
             "assign_or_constdecl_if_global"
+            "global_if_global"
             "moved_local"
             "label"
             "trycatchelse"
@@ -165,6 +176,18 @@ function _register_kinds()
             # should not be lowered (and should mostly be treated as :inert), but
             # requires scope resolution and special conversion to Expr.
             "foreignsymbol"
+            "thunk"
+            "with-static-parameters"
+            # Options specific to K"lambda"
+            "generated_lambda"
+            "toplevel_lambda"
+
+            # Options specific to K"scope_block"
+            "hard_scope"
+            "neutral_scope"
+
+            "LambdaBindings"
+            "Slots"
         "END_LOWERING_KINDS"
 
         # The following kinds are emitted by lowering and used in Julia's untyped IR

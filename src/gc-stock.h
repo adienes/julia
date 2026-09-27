@@ -119,6 +119,16 @@ typedef struct _jl_gc_pagemeta_t {
     // still be old dead objects in the page and `nold` and `prev_nold`
     // should be used to determine if the page needs to be swept
     uint8_t has_young;
+    // Whether any object requiring weak processing on death (see
+    // jl_gc_set_needs_weak_processing) was ever allocated in this page:
+    // such pages must not be freed wholesale when fully dead, and their
+    // dead cells must be inspected by the sweep so those objects get their
+    // processing (currently: linked cancellation token sources, see
+    // gc_is_dead_linked_cancel_source). Atomic: mutators may set it
+    // concurrently for a shared parent's page; all other accesses happen
+    // inside the collection (relaxed suffices - the flag-setter's object
+    // publication, not the flag, carries the ordering)
+    _Atomic(uint8_t) has_weak_processing;
     // Number of old objects in the page
     uint16_t nold;
     // Number of old objects in the page at the end of the previous full sweep
@@ -134,6 +144,7 @@ typedef struct _jl_gc_pagemeta_t {
 } jl_gc_pagemeta_t;
 
 extern jl_gc_page_stack_t global_page_pool_lazily_freed;
+extern _Atomic(size_t) global_page_pool_lazily_freed_n;
 extern jl_gc_page_stack_t global_page_pool_clean;
 extern jl_gc_page_stack_t global_page_pool_freed;
 
@@ -575,7 +586,7 @@ STATIC_INLINE void gc_record_full_sweep_reason(int reason) JL_NOTSAFEPOINT
 void gc_mark_finlist(jl_gc_markqueue_t *mq, arraylist_t *list, size_t start) JL_NOTSAFEPOINT;
 void gc_collect_neighbors(jl_ptls_t ptls, jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT;
 void gc_mark_queue_all_roots(jl_ptls_t ptls, jl_gc_markqueue_t *mq);
-void jl_gc_debug_init(void);
+void jl_gc_debug_init(void) JL_NOTSAFEPOINT;
 
 // GC permanent allocation
 extern uv_mutex_t gc_perm_lock;
@@ -713,6 +724,14 @@ extern int gc_verifying;
 #define verify_parent2(ty,obj,slot,arg1,arg2) do {} while (0)
 #define gc_verifying (0)
 #endif
+
+// Does this (live or dead-this-cycle) cell hold a cancellation source? Such
+// cells take part in the collector's own weak (unlink-on-death) child lists,
+// so passes that rewrite dead objects in place have to leave them alone.
+STATIC_INLINE int gc_is_cancel_source(jl_taggedvalue_t *v) JL_NOTSAFEPOINT
+{
+    return (v->header & ~(uintptr_t)0xf) == (jl_cancel_source_tag << 4);
+}
 
 #ifdef GC_DEBUG_ENV
 JL_DLLEXPORT extern jl_gc_debug_env_t jl_gc_debug_env;

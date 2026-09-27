@@ -8,7 +8,7 @@
 #define keyhash(k) jl_object_id_(jl_typetagof(k), k)
 #define h2index(hv, sz) (size_t)(((hv) & ((sz)-1)) * 2)
 
-static inline int jl_table_assign_bp(jl_genericmemory_t **pa, jl_value_t *key, jl_value_t *val);
+static inline int jl_table_assign_bp(jl_genericmemory_t **pa, jl_value_t *key, jl_value_t *val) JL_CANSAFEPOINT;
 
 JL_DLLEXPORT jl_genericmemory_t *jl_idtable_rehash(jl_genericmemory_t *a, size_t newsz)
 {
@@ -170,8 +170,8 @@ jl_value_t *jl_eqtable_pop(jl_genericmemory_t *h, jl_value_t *key, jl_value_t *d
     if (bp == NULL)
         return deflt;
     jl_value_t *val = jl_atomic_load_relaxed(bp);
-    jl_atomic_store_relaxed(bp - 1, jl_nothing); // clear the key
-    jl_atomic_store_relaxed(bp, NULL); // and the value (briefly corrupting the table)
+    jl_gc_write_atomic(h, bp[-1], jl_value_t, jl_nothing, relaxed); // clear the key
+    jl_gc_write_atomic(h, *bp, jl_value_t, NULL, relaxed); // and the value (briefly corrupting the table)
     return val;
 }
 

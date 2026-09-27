@@ -54,8 +54,6 @@ using namespace llvm;
 #include <atomic>
 #include <mutex>
 
-#include <zstd.h>
-
 #include "jitlayers.h"
 #include "serialize.h"
 #include "julia_assert.h"
@@ -172,6 +170,13 @@ typedef struct {
     std::map<jl_code_instance_t*, std::tuple<uint32_t, uint32_t>> jl_fvar_map;
     SmallVector<void*, 0> jl_value_to_llvm;
     SmallVector<jl_code_instance_t*, 0> jl_external_to_llvm;
+    // ordered list of CodeInstances emitted for this image, in the order they
+    // were presented in `codeinfos`; consumed by staticdata.c to rewrite each
+    // MethodInstance's `cache` field into a `next`-linked list
+    SmallVector<jl_code_instance_t*, 0> jl_ci_order;
+    // coverage counters emitted into the image: (file, line, flags, symbol),
+    // serialized as the `jl_image_coverage` table
+    SmallVector<std::tuple<std::string, int32_t, uint32_t, std::string>, 0> jl_coverage_entries;
 } jl_native_code_desc_t;
 
 extern "C" JL_DLLEXPORT_CODEGEN
@@ -204,6 +209,24 @@ jl_get_llvm_cis_impl(void *native_code, size_t *num_elements, jl_code_instance_t
     for (auto &ci : map) {
         data[i++] = ci.first;
     }
+}
+
+// get the ordered list of CodeInstances that were emitted for this image, in
+// the order they appeared in `codeinfos`. staticdata.c uses this to rewrite the
+// `cache` field of each MethodInstance into a `next`-linked list.
+extern "C" JL_DLLEXPORT_CODEGEN void
+jl_get_llvm_mi_cache_order_impl(void *native_code, size_t *num_elements, jl_code_instance_t **data)
+{
+    jl_native_code_desc_t *desc = (jl_native_code_desc_t *)native_code;
+    auto &order = desc->jl_ci_order;
+
+    if (data == NULL) {
+        *num_elements = order.size();
+        return;
+    }
+
+    assert(*num_elements == order.size());
+    memcpy(data, order.data(), *num_elements * sizeof(jl_code_instance_t *));
 }
 
 // get the list of global variables managed by the compiler
@@ -422,14 +445,14 @@ static void makeSafeName(GlobalObject &G)
 }
 
 namespace { // file-local namespace
-class egal_set {
+class JL_GC_TRACKED_TYPE egal_set {
 public:
     jl_genericmemory_t *list = (jl_genericmemory_t*)jl_an_empty_memory_any;
     jl_genericmemory_t *keyset = (jl_genericmemory_t*)jl_an_empty_memory_any;
     egal_set(egal_set&) = delete;
     egal_set(egal_set&&) = delete;
     egal_set() = default;
-    void insert(jl_value_t *val)
+    void insert(jl_value_t *val) JL_CANSAFEPOINT
     {
         // list/keyset are GC-rooted by the caller via JL_GC_PUSH
         JL_GC_PROMISE_ROOTED(val);
@@ -452,7 +475,7 @@ public:
 using ::egal_set;
 typedef DenseMap<jl_code_instance_t*, jl_llvm_functions_t> jl_compiled_functions_t;
 
-static void record_method_roots(egal_set &method_roots, jl_method_instance_t *mi)
+static void record_method_roots(egal_set &method_roots, jl_method_instance_t *mi) JL_CANSAFEPOINT
 {
     jl_method_t *m = mi->def.method;
     if (!jl_is_method(m))
@@ -471,19 +494,24 @@ static void record_method_roots(egal_set &method_roots, jl_method_instance_t *mi
     JL_UNLOCK(&m->writelock);
 }
 
-static void aot_optimize_roots(jl_codegen_output_t &out, egal_set &method_roots)
+static void aot_optimize_roots(jl_codegen_output_t &out, egal_set &method_roots) JL_CANSAFEPOINT
 {
     for (size_t i = 0; i < jl_array_dim0(out.temporary_roots); i++) {
         jl_value_t *val = jl_array_ptr_ref(out.temporary_roots, i);
         auto ref = out.global_targets.find((void*)val);
         if (ref == out.global_targets.end())
             continue;
-        auto get_global_root = [val, &method_roots]() {
+        auto get_global_root = [val, &method_roots]() JL_CANSAFEPOINT {
             if (jl_is_globally_rooted(val))
                 return val;
-            jl_value_t *mval = method_roots.get(val);
-            if (mval)
-                return mval;
+            // `--trim` / `--strip-ir` drop all method roots in the serializer
+            // under the assumption that they root only objects for compressed
+            // IR so any roots for codegen must be stored separately
+            if (!(jl_options.trim || jl_options.strip_ir)) {
+                jl_value_t *mval = method_roots.get(val);
+                if (mval)
+                    return mval;
+            }
             return jl_as_global_root(val, 1);
         };
         jl_value_t *mval = get_global_root();
@@ -501,7 +529,7 @@ static void aot_optimize_roots(jl_codegen_output_t &out, egal_set &method_roots)
     }
 }
 
-static Function *aot_abi_converter(jl_codegen_output_t &out, jl_abi_t from_abi, jl_code_instance_t *codeinst, Function *func, Function *specfunc, bool target_specsig)
+static Function *aot_abi_converter(jl_codegen_output_t &out, jl_abi_t from_abi, jl_code_instance_t *codeinst, Function *func, Function *specfunc, bool target_specsig) JL_CANSAFEPOINT
 {
     std::string gf_thunk_name;
     if (specfunc)
@@ -513,7 +541,7 @@ static Function *aot_abi_converter(jl_codegen_output_t &out, jl_abi_t from_abi, 
     return F;
 }
 
-static void generate_cfunc_thunks(jl_codegen_output_t &out)
+static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
 {
     DenseMap<jl_method_instance_t*, jl_code_instance_t*> compiled_mi;
     for (auto &[ci, _] : out.ci_funcs) {
@@ -530,7 +558,7 @@ static void generate_cfunc_thunks(jl_codegen_output_t &out)
         JL_GC_PROMISE_ROOTED(declrt);
         Function *unspec = aot_abi_converter(out, cfunc.abi, nullptr, nullptr, nullptr, false);
         jl_code_instance_t *codeinst = nullptr;
-        auto assign_fptr = [&out, &cfunc, &codeinst, &unspec](Function *f) {
+        auto assign_fptr = [&out, &cfunc, &codeinst, &unspec](Function *f) JL_CANSAFEPOINT {
             ConstantArray *init = cast<ConstantArray>(cfunc.cfuncdata->getInitializer());
             SmallVector<Constant*,8> initvals;
             for (unsigned i = 0; i < init->getNumOperands(); ++i)
@@ -598,6 +626,14 @@ static void generate_cfunc_thunks(jl_codegen_output_t &out)
     }
 }
 
+// Coverage counters are the module-local globals `newCoverageCounter` in
+// codegen.cpp creates; they are identified by their name prefix. Keep both in
+// sync if counters ever get a metadata tag or a dedicated section instead.
+static bool isCoverageCounter(const GlobalValue &G)
+{
+    return G.getName().starts_with("jl_covctr");
+}
+
 static bool canPartition(const Function &F)
 {
     return !F.hasFnAttribute(Attribute::AlwaysInline) &&
@@ -644,16 +680,23 @@ void *jl_create_native_impl(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int ex
     fargs[4] = worklist ? (jl_value_t*)worklist : jl_nothing; // worklist (or nothing)
     fargs[5] = mod_array ? (jl_value_t*)mod_array : jl_nothing; // mod_array (or nothing)
     fargs[6] = jl_box_bool(all);
-    fargs[7] = module_init_order ? (jl_value_t*)module_init_order : jl_nothing; // module_init_order (or nothing)
+    fargs[7] = (jl_value_t*)module_init_order; // module_init_order
     fargs[8] = ext_foreign_cis ? (jl_value_t*)ext_foreign_cis : jl_nothing; // ext_foreign_cis (or nothing)
     size_t last_age = ct->world_age;
     ct->world_age = jl_typeinf_world;
     fargs[0] = jl_apply(fargs, 9);
     fargs[1] = fargs[2] = fargs[3] = fargs[4] = fargs[5] = fargs[6] = fargs[7] = fargs[8] = NULL;
     ct->world_age = last_age;
-    jl_value_t *codeinfos = fargs[0];
+    // the bridge returns svec(codeinfos, ci_order): the interleaved
+    // CodeInstance/CodeInfo work list to emit, and the ordered CodeInstances to
+    // store in the method caches of the output image
+    jl_value_t *result = fargs[0];
+    assert(jl_is_svec(result) && jl_svec_len(result) == 2);
+    jl_value_t *codeinfos = jl_svecref(result, 0);
+    jl_value_t *ci_order = jl_svecref(result, 1);
     JL_TYPECHK(jl_create_native, array_any, codeinfos);
-    auto data = (jl_native_code_desc_t *)jl_emit_native((jl_array_t*)codeinfos, llvmmod, NULL, external_linkage ? 1 : 0);
+    JL_TYPECHK(jl_create_native, array_any, ci_order);
+    auto data = (jl_native_code_desc_t *)jl_emit_native((jl_array_t*)codeinfos, (jl_array_t*)ci_order, llvmmod, NULL, external_linkage ? 1 : 0);
     JL_GC_POP();
 
     // move everything inside, now that we've merged everything
@@ -671,6 +714,15 @@ void *jl_create_native_impl(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int ex
         }
         for (GlobalObject &G : M.global_objects()) {
             if (!G.isDeclaration()) {
+                if (isCoverageCounter(G)) {
+                    // Coverage counters are referenced by name from the image
+                    // coverage table in the separately-compiled metadata module,
+                    // so they must stay visible across the image's objects.
+                    G.setLinkage(GlobalValue::ExternalLinkage);
+                    G.setVisibility(GlobalValue::HiddenVisibility);
+                    G.setDSOLocal(true);
+                    continue;
+                }
                 G.setLinkage(GlobalValue::InternalLinkage);
                 G.setDSOLocal(true);
                 makeSafeName(G);
@@ -787,28 +839,43 @@ static Function *emit_pkg_plt_thunk(jl_codegen_output_t &out, jl_code_instance_t
 
 static jl_compiled_functions_t::iterator get_ci_equiv_compiled(jl_code_instance_t *ci JL_PROPAGATES_ROOT, jl_compiled_functions_t &compiled_functions) JL_NOTSAFEPOINT
 {
-    jl_value_t *def = ci->def;
-    jl_value_t *owner = ci->owner;
-    jl_value_t *rettype = ci->rettype;
-    size_t min_world = jl_atomic_load_relaxed(&ci->min_world);
-    size_t max_world = jl_atomic_load_relaxed(&ci->max_world);
     for (auto it = compiled_functions.begin(), E = compiled_functions.end(); it != E; ++it) {
         auto codeinst = it->first;
-        if (codeinst != ci &&
-            jl_atomic_load_relaxed(&codeinst->inferred) != NULL &&
-            jl_atomic_load_relaxed(&codeinst->min_world) <= min_world &&
-            jl_atomic_load_relaxed(&codeinst->max_world) >= max_world &&
-            jl_egal(codeinst->def, def) &&
-            jl_egal(codeinst->owner, owner) &&
-            jl_egal(codeinst->rettype, rettype)) {
+        if (codeinst != ci && jl_is_ci_equiv(ci, codeinst, 0))
             return it;
-        }
     }
     return compiled_functions.end();
 }
 
+// Check the global cache for an equivalent CodeInstance with a world age range
+// containing the world age range of the given CodeInstance.
+static jl_code_instance_t *jl_get_ci_equiv_range(jl_code_instance_t *ci JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
+{
+    size_t target_min = jl_atomic_load_relaxed(&ci->min_world);
+    size_t target_max = jl_atomic_load_relaxed(&ci->max_world);
+    jl_value_t *def = ci->def;
+    jl_method_instance_t *mi = jl_get_ci_mi(ci);
+    jl_value_t *owner = ci->owner;
+    jl_value_t *rettype = ci->rettype;
+    jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
+    while (codeinst) {
+        if (codeinst != ci &&
+            jl_atomic_load_relaxed(&codeinst->inferred) != NULL &&
+            jl_atomic_load_relaxed(&codeinst->min_world) <= target_min &&
+            jl_atomic_load_relaxed(&codeinst->max_world) >= target_max &&
+            jl_egal(codeinst->def, def) &&
+            jl_egal(codeinst->owner, owner) &&
+            jl_egal(codeinst->rettype, rettype)) {
+            return codeinst;
+        }
+        codeinst = jl_atomic_load_relaxed(&codeinst->next);
+    }
+    return ci;
+}
+
+
 // Static version of JuliaOJIT::linkOutput
-static void aot_link_output(jl_codegen_output_t &out)
+static void aot_link_output(jl_codegen_output_t &out) JL_CANSAFEPOINT
 {
     for (auto &[call, target] : out.call_targets) {
         auto [ci, api] = call;
@@ -818,8 +885,16 @@ static void aot_link_output(jl_codegen_output_t &out)
             continue;
 
         auto it = out.ci_funcs.find(ci);
-        if (it == out.ci_funcs.end())
-            it = get_ci_equiv_compiled(ci, out.ci_funcs);
+        // Prefer a equivalent CodeInstance that we are compiling.
+        if (it == out.ci_funcs.end()) {
+            auto equiv = get_ci_equiv_compiled(ci, out.ci_funcs);
+            if (equiv != out.ci_funcs.end())
+                it = equiv;
+        }
+        // If that fails, look for an equivalent CodeInstance that we can link to.
+        if (it == out.ci_funcs.end() && out.external_linkage &&
+            !(jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_FROM_IMAGE))
+            ci = jl_get_ci_equiv_range(ci);
         jl_codeinst_funcs_t<Value *> funcs;
         if (it != out.ci_funcs.end()) {
             funcs = {it->second.invoke_api, it->second.invoke, it->second.specptr};
@@ -848,13 +923,25 @@ static void aot_link_output(jl_codegen_output_t &out)
 }
 
 static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *codeinfos,
-                                      const jl_cgparams_t *cgparams, int external_linkage)
+                                      jl_array_t *ci_order, const jl_cgparams_t *cgparams,
+                                      int external_linkage) JL_CANSAFEPOINT
 {
     jl_cgparams_t target_cgparams = *cgparams;
     target_cgparams.sanitize_memory = jl_options.target_sanitize_memory;
     target_cgparams.sanitize_thread = jl_options.target_sanitize_thread;
     target_cgparams.sanitize_address = jl_options.target_sanitize_address;
     auto &out = *data->out;
+    // record the caller-provided ordering of CodeInstances to store in the
+    // image's method caches (see jl_get_llvm_mi_cache_order / jl_rewrite_mi_caches)
+    if (ci_order) {
+        size_t nci = jl_array_nrows(ci_order);
+        data->jl_ci_order.reserve(nci);
+        for (size_t k = 0; k < nci; k++) {
+            jl_value_t *ci = jl_array_ptr_ref(ci_order, k);
+            assert(jl_is_code_instance(ci));
+            data->jl_ci_order.push_back((jl_code_instance_t*)ci);
+        }
+    }
     // compile all methods for the current world and type-inference world
     DenseMap<jl_code_instance_t *, jl_code_info_t *> ci_infos;
     egal_set method_roots;
@@ -939,6 +1026,13 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
         gv->setDSOLocal(true);
     }
 
+    data->jl_coverage_entries.reserve(out.image_coverage_counters.size());
+    for (auto &covctr : out.image_coverage_counters) {
+        uint32_t flags = covctr.second.second ? JL_IMAGE_COVERAGE_ENTRY_USER : 0;
+        data->jl_coverage_entries.push_back({covctr.first.first, covctr.first.second, flags,
+                                             covctr.second.first->getName().str()});
+    }
+
     for (auto &[ci, funcs] : out.ci_funcs) {
         uint32_t invoke_id, specptr_id = 0;
         if (funcs.invoke_api == JL_INVOKE_SPECSIG) {
@@ -959,7 +1053,7 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
 // also be used by extern consumers like GPUCompiler.jl to obtain a module containing
 // all reachable & inferrrable functions.
 extern "C" JL_DLLEXPORT_CODEGEN
-void *jl_emit_native_impl(jl_array_t *codeinfos, LLVMOrcThreadSafeModuleRef llvmmod, const jl_cgparams_t *cgparams, int external_linkage)
+void *jl_emit_native_impl(jl_array_t *codeinfos, jl_array_t *ci_order, LLVMOrcThreadSafeModuleRef llvmmod, const jl_cgparams_t *cgparams, int external_linkage)
 {
     JL_TIMING(NATIVE_AOT, NATIVE_Create);
     ++CreateNativeCalls;
@@ -979,9 +1073,9 @@ void *jl_emit_native_impl(jl_array_t *codeinfos, LLVMOrcThreadSafeModuleRef llvm
         data->TSM_ref = &data->TSM;
     }
 
-    data->TSM_ref->withModuleDo([&](Module &M) {
+    data->TSM_ref->withModuleDo([&](Module &M) JL_CANSAFEPOINT {
         data->out = std::make_unique<jl_codegen_output_t>(M);
-        jl_emit_native_to_output(data, codeinfos, cgparams, external_linkage);
+        jl_emit_native_to_output(data, codeinfos, ci_order, cgparams, external_linkage);
     });
 
     return (void *)data;
@@ -1061,7 +1155,7 @@ static GlobalVariable *emit_ptls_table(Module &M, Type *T_size, Type *T_ptr) {
     std::array<Constant *, 3> ptls_table{
         new GlobalVariable(M, T_ptr, false, GlobalValue::ExternalLinkage, emit_pgcstack_default_func(M, T_ptr), "jl_pgcstack_func_slot"),
         new GlobalVariable(M, T_size, false, GlobalValue::ExternalLinkage, Constant::getNullValue(T_size), "jl_pgcstack_key_slot"),
-        new GlobalVariable(M, T_size, false, GlobalValue::ExternalLinkage, Constant::getNullValue(T_size), "jl_tls_offset"),
+        new GlobalVariable(M, T_size, false, GlobalValue::ExternalLinkage, Constant::getNullValue(T_size), "jl_image_tls_offset"),
     };
     for (auto &gv : ptls_table) {
         cast<GlobalVariable>(gv)->setVisibility(GlobalValue::HiddenVisibility);
@@ -1258,6 +1352,9 @@ static inline bool verify_partitioning(const SmallVectorImpl<Partition> &partiti
                     continue;
                 }
                 if (GVNames[val->getName()] != GVNames[GV.getName()]) {
+                    // coverage counters are shared across partitions by design
+                    if (isCoverageCounter(GV) || isCoverageCounter(*val))
+                        continue;
                     bad = true;
                     dbgs() << "Global " << val->getName() << " used by " << GV.getName() << ", which is in partition " << GVNames[GV.getName()] << " but " << val->getName() << " is in partition " << GVNames[val->getName()] << "\n";
                 }
@@ -1334,6 +1431,12 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads) {
     for (auto &G : M.global_values()) {
         if (G.isDeclaration())
             continue;
+        // Coverage counters are shared by commonly inlined code, so
+        // partitioning them together with their users would collapse most of
+        // the module into a single partition. Skip them here; they are
+        // assigned round-robin once the code partitions are settled.
+        if (isCoverageCounter(G))
+            continue;
         // Currently ccallable global aliases have extern linkage, we only want to make the
         // internally linked functions/global variables extern+hidden
         if (G.hasLocalLinkage()) {
@@ -1353,9 +1456,13 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads) {
         for (ConstantUses<GlobalValue> uses(partitioner.nodes[i].GV, M); !uses.done(); uses.next()) {
             auto val = uses.get_info().val;
             auto idx = partitioner.node_map.find(val);
-            // This can fail if we can't partition a global, but it uses something we can partition
-            // This should be fixed by altering canPartition to not permit partitioning this global
-            assert(idx != partitioner.node_map.end());
+            if (idx == partitioner.node_map.end()) {
+                // only coverage counters are deliberately left out of the
+                // partitioning above; anything else is a global that
+                // partitionModule failed to account for
+                assert(isCoverageCounter(*val) && "unpartitioned global that is not a coverage counter");
+                continue;
+            }
             partitioner.merge(i, idx->second);
         }
     }
@@ -1413,6 +1520,19 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads) {
             node.weight = 0;
             node.size = partitioner.nodes[root].size;
         }
+    }
+
+    // Assign the coverage counters that were skipped above, now that the code
+    // partitions are settled. Any partition works: the counters are external
+    // hidden symbols, so cross-partition references resolve at link time.
+    for (auto &G : M.globals()) {
+        if (G.isDeclaration() || !isCoverageCounter(G))
+            continue;
+        auto &P = *pq.top();
+        pq.pop();
+        P.globals.insert({G.getName(), true});
+        P.weight += 1;
+        pq.push(&P);
     }
 
     bool verified = verify_partitioning(partitions, M, fvars, gvars);
@@ -1850,15 +1970,16 @@ static inline void schedule_uv_thread(uv_thread_t *worker, CB &&cb)
 
 // Entrypoint to optionally-multithreaded image compilation. This handles global coordination of the threading,
 // as well as partitioning, serialization, and deserialization. `threads` is the
-// partition (shard) count and the ceiling on concurrency; when `jobserver` is
-// non-null the actual thread pool is rationed elastically from the shared
-// imaging token budget.
+// partition (shard) count and `workers` the ceiling on concurrency; when
+// `jobserver` is non-null the actual thread pool is rationed elastically from
+// the shared imaging token budget.
 template<typename ModuleReleasedFunc>
-static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, StringRef name, unsigned threads,
+static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, StringRef name, unsigned threads, unsigned workers,
                 bool unopt_out, bool opt_out, bool obj_out, bool asm_out,
                 JobserverClient *jobserver, ModuleReleasedFunc module_released) {
     SmallVector<AOTOutputs, 16> outputs(threads);
     assert(threads);
+    assert(workers && workers <= threads);
     assert(unopt_out || opt_out || obj_out || asm_out);
     // Timers for timing purposes
     TimerGroup timer_group("add_output", ("Time to optimize and emit LLVM module " + name).str());
@@ -1947,7 +2068,7 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
     // Compile the partitions with a pool of worker threads pulling from a
     // shared queue. The partition count fixes the shard layout; the pool size
     // only controls how many compile concurrently. Without a jobserver the pool
-    // is one thread per partition. With one it is elastic: it starts with the
+    // is `workers` threads. With one it is elastic: it starts with the
     // baseline thread plus whatever tokens are free, polls for tokens released
     // by sibling workers while unclaimed partitions remain, and returns each
     // token as soon as its thread runs out of work.
@@ -1957,11 +2078,11 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
         std::mutex pool_mutex; // guards held_tokens and live_threads
         unsigned held_tokens = 0;
         unsigned live_threads = 0;
-        std::vector<uv_thread_t> workers(threads);
+        std::vector<uv_thread_t> worker_threads(threads);
         unsigned spawned = 0;
         auto spawn_worker = [&]() {
             unsigned t = spawned++;
-            schedule_uv_thread(&workers[t], [&, t]() {
+            schedule_uv_thread(&worker_threads[t], [&, t]() {
                 // Initialize time trace profiler for this thread if enabled
                 if (jl_is_timing_trace)
                     timeTraceProfilerInitialize(jl_timing_trace_granularity, ("aot_thread_" + std::to_string(t)).c_str());
@@ -2021,11 +2142,11 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
             });
         };
 
-        unsigned initial_pool = threads;
+        unsigned initial_pool = workers;
         if (jobserver) {
             // The orchestrator already holds this worker's baseline token (its
             // main thread only sleeps/polls below); ration the rest from the pool.
-            held_tokens = jobserver->acquire(threads - 1);
+            held_tokens = jobserver->acquire(workers - 1);
             initial_pool = 1 + held_tokens;
         }
         live_threads = initial_pool;
@@ -2034,11 +2155,11 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
 
         // Elastic scale-up: while unclaimed partitions remain, grow the pool
         // as sibling precompile workers return tokens to the budget.
-        while (jobserver && spawned < threads) {
+        while (jobserver && spawned < workers) {
             unsigned claimed = next_partition.load(std::memory_order_relaxed);
             if (claimed >= threads)
                 break;
-            unsigned want = std::min(threads - claimed, threads - spawned);
+            unsigned want = std::min(threads - claimed, workers - spawned);
             unsigned got = jobserver->acquire(want);
             if (got) {
                 {
@@ -2056,7 +2177,7 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
 
         // Wait for all of the worker threads to finish
         for (unsigned t = 0; t < spawned; t++)
-            uv_thread_join(&workers[t]);
+            uv_thread_join(&worker_threads[t]);
         assert(held_tokens == 0 && "precompile jobserver tokens leaked");
     }
 
@@ -2083,13 +2204,7 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
     return outputs;
 }
 
-static unsigned compute_image_thread_count(const ModuleInfo &info, bool jobserver_active, bool &explicit_override) {
-    explicit_override = false;
-    // 32-bit systems are very memory-constrained
-#ifdef _P32
-    LLVM_DEBUG(dbgs() << "32-bit systems are restricted to a single thread\n");
-    return 1;
-#endif
+static unsigned compute_image_thread_count(const ModuleInfo &info, bool jobserver_active) {
     if (jl_is_timing_passes) // LLVM isn't thread safe when timing the passes https://github.com/llvm/llvm-project/issues/44417
         return 1;
     // This is not overridable because empty modules do occasionally appear, but they'll be very small and thus exit early to
@@ -2105,14 +2220,15 @@ static unsigned compute_image_thread_count(const ModuleInfo &info, bool jobserve
     unsigned threads = jobserver_active
         ? std::max(jl_effective_threads(), 1)
         : std::max(jl_effective_threads() / 2, 1);
-
     auto max_threads = info.globals / 100;
     if (max_threads < threads) {
         LLVM_DEBUG(dbgs() << "Low global count limiting threads to " << max_threads << " (" << info.globals << "globals)\n");
         threads = max_threads;
     }
 
-    // environment variable override
+    // environment variable override.
+    // this controls how many threads we request from the jobserver (if it is enabled)
+    // but the question of whether to enable it or not is decided upstream
     const char *env_threads = getenv("JULIA_IMAGE_THREADS");
     bool env_threads_set = false;
     if (env_threads) {
@@ -2141,22 +2257,39 @@ static unsigned compute_image_thread_count(const ModuleInfo &info, bool jobserve
         }
     }
 
+#ifdef _P32
+    // shards are compiled one at a time, so this bounds memory, not parallelism
+    if (!env_threads_set)
+        threads = std::max<size_t>(threads, std::min<size_t>(max_threads, 8));
+#endif
+
     threads = std::max(threads, 1u);
 
-    // An explicit JULIA_IMAGE_THREADS request takes precedence over the
-    // jobserver: honor the user's fixed count rather than rationing tokens.
-    explicit_override = env_threads_set;
-
     return threads;
+}
+
+// Number of shards compiled concurrently. Each worker holds one shard's IR and
+// object code, which is what keeps a 32-bit sysimage build within address space.
+static unsigned compute_image_worker_count(unsigned threads) {
+#ifdef _P32
+    return 1;
+#else
+    return threads;
+#endif
 }
 
 jl_emission_params_t default_emission_params = { 1 };
 
 static void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fname,
                            const char *unopt_bc_fname, const char *obj_fname,
-                           const char *asm_fname, ios_t *z, ios_t *s,
-                           jl_emission_params_t *params, Module &dataM)
+                           const char *asm_fname, ios_t *z, uint32_t checksum,
+                           const char *unpack_func, jl_emission_params_t *params,
+                           Module &dataM)
 {
+    // `data` is deleted when the text outputs finish compiling, well before
+    // the metadata module is built, so take what the coverage table needs now.
+    auto coverage_entries = std::move(data->jl_coverage_entries);
+
     // We don't want to use MCJIT's target machine because
     // it uses the large code model and we may potentially
     // want less optimizations there.
@@ -2204,14 +2337,14 @@ static void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fn
     std::string StackProtectorGuard = dataM.getStackProtectorGuard().str();
     unsigned OverrideStackAlignment = dataM.getOverrideStackAlignment();
 
-    auto compile = [&](Module &M, StringRef name, unsigned threads, JobserverClient *jobserver, auto module_released) {
-        return add_output(M, *SourceTM, name, threads, !!unopt_bc_fname, !!bc_fname, !!obj_fname, !!asm_fname, jobserver, module_released);
+    auto compile = [&](Module &M, StringRef name, unsigned threads, unsigned workers, JobserverClient *jobserver, auto module_released) {
+        return add_output(M, *SourceTM, name, threads, workers, !!unopt_bc_fname, !!bc_fname, !!obj_fname, !!asm_fname, jobserver, module_released);
     };
 
     SmallVector<AOTOutputs, 16> sysimg_outputs;
     SmallVector<AOTOutputs, 16> data_outputs;
     SmallVector<AOTOutputs, 16> metadata_outputs;
-    if (z) {
+    {
         JL_TIMING(NATIVE_AOT, NATIVE_Sysimg);
         LLVMContext Context;
         Context.setDiscardValueNames(true);
@@ -2225,65 +2358,53 @@ static void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fn
         sysimgM.setStackProtectorGuard(StackProtectorGuard);
         sysimgM.setOverrideStackAlignment(OverrideStackAlignment);
 
-        int compression = jl_options.compress_sysimage ? 15 : 0;
-        uint32_t sysimg_checksum = jl_crc32c(0, z->buf, z->size);
-        ArrayRef<char> sysimg_data{z->buf, (size_t)z->size};
-        SmallVector<char, 0> compressed_data;
-        if (compression) {
-            compressed_data.resize(ZSTD_compressBound(z->size));
-            size_t comp_size = ZSTD_compress(compressed_data.data(), compressed_data.size(),
-                                             z->buf, z->size, compression);
-            compressed_data.resize(comp_size);
-            sysimg_data = compressed_data;
-            ios_close(z);
-            free(z);
-        }
-
-        Constant *data = ConstantDataArray::get(Context, sysimg_data);
-        auto sysdata = new GlobalVariable(sysimgM, data->getType(), false,
-                                     GlobalVariable::ExternalLinkage,
-                                     data, "jl_system_image_data");
-        sysdata->setAlignment(Align(jl_page_size));
+        if (z) {
+            ArrayRef<char> sysimg_data{z->buf, (size_t)z->size};
+            Constant *data = ConstantDataArray::get(Context, sysimg_data);
+            auto sysdata = new GlobalVariable(sysimgM, data->getType(), false,
+                                              GlobalVariable::ExternalLinkage,
+                                              data, "jl_system_image_data");
+            sysdata->setAlignment(Align(jl_page_size));
 #if JL_LLVM_VERSION >= 180000
-        sysdata->setCodeModel(CodeModel::Large);
+            sysdata->setCodeModel(CodeModel::Large);
 #else
-        if (TheTriple.isX86() && TheTriple.isArch64Bit() && TheTriple.isOSLinux())
-            sysdata->setSection(".ldata");
+            if (TheTriple.isX86() && TheTriple.isArch64Bit() && TheTriple.isOSLinux())
+                sysdata->setSection(".ldata");
 #endif
-        addComdat(sysdata, TheTriple);
-        Constant *len = ConstantInt::get(sysimgM.getDataLayout().getIntPtrType(Context), sysimg_data.size());
-        addComdat(new GlobalVariable(sysimgM, len->getType(), true,
-                                     GlobalVariable::ExternalLinkage,
-                                     len, "jl_system_image_size"), TheTriple);
-        Constant *checksum_val = ConstantInt::get(Type::getInt32Ty(Context), sysimg_checksum);
-        addComdat(new GlobalVariable(sysimgM, checksum_val->getType(), true,
-                                     GlobalVariable::ExternalLinkage,
-                                     checksum_val, "jl_system_image_checksum"), TheTriple);
+            addComdat(sysdata, TheTriple);
+            Constant *len = ConstantInt::get(sysimgM.getDataLayout().getIntPtrType(Context), sysimg_data.size());
+            addComdat(new GlobalVariable(sysimgM, len->getType(), true,
+                                         GlobalVariable::ExternalLinkage,
+                                         len, "jl_system_image_size"), TheTriple);
 
-        const char *unpack_func = compression ? "jl_image_unpack_zstd" : "jl_image_unpack_uncomp";
-        auto unpack = new GlobalVariable(sysimgM, DL.getIntPtrType(Context), true,
-                                         GlobalVariable::ExternalLinkage, nullptr,
-                                         unpack_func);
-        addComdat(new GlobalVariable(sysimgM, PointerType::getUnqual(Context), true,
-                                     GlobalVariable::ExternalLinkage, unpack,
-                                     "jl_image_unpack"),
-                  TheTriple);
-
-        if (!compression) {
             // Free z here, since we've copied out everything into data
             // Results in serious memory savings
             ios_close(z);
             free(z);
         }
-        compressed_data.clear();
+
+        Constant *checksum_val = ConstantInt::get(Type::getInt32Ty(Context), checksum);
+        addComdat(new GlobalVariable(sysimgM, checksum_val->getType(), true,
+                                     GlobalVariable::ExternalLinkage,
+                                     checksum_val, "jl_system_image_checksum"), TheTriple);
+
+        auto unpack =
+            new GlobalVariable(sysimgM, DL.getIntPtrType(Context), true,
+                               GlobalVariable::ExternalLinkage, nullptr, unpack_func);
+        addComdat(new GlobalVariable(sysimgM, PointerType::getUnqual(Context), true,
+                                     GlobalVariable::ExternalLinkage, unpack,
+                                     "jl_image_unpack"),
+                  TheTriple);
+
         // Note that we don't set z to null, this allows the check in WRITE_ARCHIVE
         // to function as expected
         // no need to free the module/context, destructor handles that
-        sysimg_outputs = compile(sysimgM, "sysimg", 1, nullptr, [](Module &) {});
+        sysimg_outputs = compile(sysimgM, "sysimg", 1, 1, nullptr, [](Module &) {});
     }
 
     const bool imaging_mode = true;
     unsigned threads = 1;
+    unsigned workers = 1;
     unsigned nfvars = 0;
     unsigned ngvars = 0;
 
@@ -2338,15 +2459,15 @@ static void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fn
                 << "    clones: " << module_info.clones << "\n"
                 << "    weight: " << module_info.weight << "\n"
             );
-            bool explicit_threads = false;
-            threads = compute_image_thread_count(module_info, jobserver.active(), explicit_threads);
-            if (jobserver.active() && !explicit_threads && threads > 1) {
-                // `threads` is the partition count and concurrency ceiling;
-                // add_output rations the actual pool size from the shared
-                // token budget, growing it as sibling workers finish.
+            threads = compute_image_thread_count(module_info, jobserver.active());
+            workers = compute_image_worker_count(threads);
+            if (jobserver.active() && workers > 1) {
+                // `threads` is the partition count and `workers` the concurrency
+                // ceiling; add_output rations the actual pool size from the
+                // shared token budget, growing it as sibling workers finish.
                 text_jobserver = &jobserver;
             }
-            LLVM_DEBUG(dbgs() << "Using up to " << threads << " threads to emit aot image\n");
+            LLVM_DEBUG(dbgs() << "Using " << threads << " shards and up to " << workers << " threads to emit aot image\n");
             nfvars = data->jl_sysimg_fvars.size();
             ngvars = data->jl_sysimg_gvars.size();
             emit_table(dataM, data->jl_sysimg_gvars, "jl_gvars", T_psize);
@@ -2389,7 +2510,7 @@ static void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fn
         // auto lock = TSCtx.getLock();
         // auto dataM = data->M.getModuleUnlocked();
 
-        data_outputs = compile(dataM, "text", threads, text_jobserver, [data](Module &) {
+        data_outputs = compile(dataM, "text", threads, workers, text_jobserver, [data](Module &) {
             // Delete data when add_output thinks it's done with it
             // Saves memory for use when multithreading
             delete data;
@@ -2471,6 +2592,45 @@ static void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fn
                                                        GlobalVariable::InternalLinkage,
                                                        cpu_target_data, "jl_cpu_target_string");
 
+            // Emit the coverage counter table (jl_image_coverage_t); the loader
+            // registers the counters so image code contributes to reports. An
+            // empty table still marks the image as instrumented.
+            if (jl_image_coverage_config() != 0) {
+                Type *T_i32 = Type::getInt32Ty(Context);
+                Type *T_i64 = Type::getInt64Ty(Context);
+                StructType *ET = StructType::get(Context, {T_ptr, T_ptr, T_i32, T_i32});
+                StringMap<GlobalVariable*> files;
+                SmallVector<Constant*, 0> entries;
+                entries.reserve(coverage_entries.size());
+                for (auto &[file, line, flags, sym] : coverage_entries) {
+                    GlobalVariable *&fgv = files[file];
+                    if (!fgv) {
+                        auto fdata = ConstantDataArray::getString(Context, file, true);
+                        fgv = new GlobalVariable(metadataM, fdata->getType(), true,
+                                                 GlobalVariable::PrivateLinkage, fdata,
+                                                 "jl_coverage_file");
+                    }
+                    auto counter = cast<GlobalVariable>(metadataM.getOrInsertGlobal(sym, T_i64));
+                    counter->setVisibility(GlobalValue::HiddenVisibility);
+                    counter->setDSOLocal(true);
+                    entries.push_back(ConstantStruct::get(ET, {(Constant*)fgv, (Constant*)counter,
+                        ConstantInt::get(T_i32, line), ConstantInt::get(T_i32, flags)}));
+                }
+                auto entries_arr = ConstantArray::get(ArrayType::get(ET, entries.size()), entries);
+                auto entries_gv = new GlobalVariable(metadataM, entries_arr->getType(), true,
+                                                     GlobalVariable::PrivateLinkage, entries_arr,
+                                                     "jl_coverage_entries");
+                StructType *CT = StructType::get(Context, {T_i32, T_i64, T_ptr});
+                auto cov = new GlobalVariable(metadataM, CT, true,
+                                              GlobalVariable::ExternalLinkage,
+                                              ConstantStruct::get(CT, {
+                                                  ConstantInt::get(T_i32, jl_image_coverage_config()),
+                                                  ConstantInt::get(T_i64, entries.size()),
+                                                  (Constant*)entries_gv}),
+                                              "jl_image_coverage");
+                addComdat(cov, TheTriple);
+            }
+
             AT = ArrayType::get(T_psize, 6);
             auto pointers = new GlobalVariable(metadataM, AT, false,
                                             GlobalVariable::ExternalLinkage,
@@ -2484,15 +2644,11 @@ static void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fn
                                             }),
                                             "jl_image_pointers");
             addComdat(pointers, TheTriple);
-            if (s) {
-                write_int32(s, data.size());
-                ios_write(s, (const char *)data.data(), data.size());
-            }
             jl_free_clone_targets(&targets);
         }
 
         // no need to free module/context, destructor handles that
-        metadata_outputs = compile(metadataM, "data", 1, nullptr, [](Module &) {});
+        metadata_outputs = compile(metadataM, "data", 1, 1, nullptr, [](Module &) {});
     }
 
     {
@@ -2515,10 +2671,8 @@ static void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fn
         } \
         filenames.push_back("metadata" prefix suffix); \
         buffers.push_back(StringRef(metadata_outputs[0].field.data(), metadata_outputs[0].field.size())); \
-        if (z) { \
-            filenames.push_back("sysimg" prefix suffix); \
-            buffers.push_back(StringRef(sysimg_outputs[0].field.data(), sysimg_outputs[0].field.size())); \
-        } \
+        filenames.push_back("sysimg" prefix suffix); \
+        buffers.push_back(StringRef(sysimg_outputs[0].field.data(), sysimg_outputs[0].field.size())); \
         for (size_t i = 0; i < filenames.size(); i++) { \
             archive.push_back(NewArchiveMember(MemoryBufferRef(buffers[i], filenames[i]))); \
         } \
@@ -2535,12 +2689,11 @@ static void jl_dump_native_locked(jl_native_code_desc_t *data, const char *bc_fn
 
 // takes the running content that has collected in the shadow module and dump it to disk
 // this builds the object file portion of the sysimage files for fast startup
-extern "C" JL_DLLEXPORT_CODEGEN
-void jl_dump_native_impl(void *native_code,
-        const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname,
-        const char *asm_fname,
-        ios_t *z, ios_t *s,
-        jl_emission_params_t *params)
+extern "C" JL_DLLEXPORT_CODEGEN void
+jl_dump_native_impl(void *native_code, const char *bc_fname, const char *unopt_bc_fname,
+                    const char *obj_fname, const char *asm_fname, ios_t *z,
+                    uint32_t checksum, const char *unpack_func,
+                    jl_emission_params_t *params)
 {
     JL_TIMING(NATIVE_AOT, NATIVE_Dump);
     jl_native_code_desc_t *data = (jl_native_code_desc_t*)native_code;
@@ -2555,14 +2708,14 @@ void jl_dump_native_impl(void *native_code,
     }
 
     data->TSM_ref->withModuleDo([&](Module &dataM) {
-        jl_dump_native_locked(data, bc_fname, unopt_bc_fname, obj_fname, asm_fname, z, s,
-                              params, dataM);
+        jl_dump_native_locked(data, bc_fname, unopt_bc_fname, obj_fname, asm_fname, z,
+                              checksum, unpack_func, params, dataM);
     });
 }
 
 
 // sometimes in GDB you want to find out what code would be created from a mi
-extern "C" JL_DLLEXPORT_CODEGEN jl_code_info_t *jl_gdbdumpcode(jl_method_instance_t *mi)
+extern "C" JL_DLLEXPORT_CODEGEN jl_code_info_t *jl_gdbdumpcode(jl_method_instance_t *mi) JL_CANSAFEPOINT
 {
     jl_llvmf_dump_t llvmf_dump;
     size_t world = jl_current_task->world_age;

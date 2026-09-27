@@ -18,6 +18,21 @@ let x = [1,2]
 end
 """) == [1,2]
 
+# empty strings
+@test JuliaLowering.include_string(test_mod, raw"""
+\"\"\"
+\"\"\"
+""") == ""
+@test JuliaLowering.include_string(test_mod, raw"""
+""
+""") == ""
+@test JuliaLowering.include_string(test_mod, raw"""
+"$("")"
+""") == ""
+@test JuliaLowering.include_string(test_mod, raw"""
+\"\"\"$("")\"\"\"
+""") == ""
+
 @test JuliaLowering.include_string(test_mod, raw"""
 let
     x = 10
@@ -49,6 +64,22 @@ let x=11
     20x
 end
 """) == 220
+
+@testset "syntactic --> <: >:" begin
+    @test jl_eval(test_mod, Expr(:<:, Int, Number))
+    @test jl_eval(test_mod, Expr(:<:, Expr(:..., Expr(:tuple, Int, Number))))
+    @test jl_eval(test_mod, Expr(:>:, Number, Int))
+    @test jl_eval(test_mod, Expr(:>:, Expr(:..., Expr(:tuple, Number, Int))))
+
+    JuliaLowering.include_string(test_mod, """
+    function var"-->"(args...; kws...)
+        (args, values(kws))
+    end
+    """)
+    @test jl_eval(test_mod, Expr(:-->, 1, 2)) == ((1,2),(;))
+    @test jl_eval(test_mod, Expr(:-->, 1, Expr(:kw, :foo, 2))) == ((1,),(;foo=2))
+    @test jl_eval(test_mod, Expr(:-->, Expr(:..., (1,)))) == ((1,),(;))
+end
 
 @testset "empty symbol" begin
     @test JuliaLowering.include_string(test_mod, """
@@ -360,6 +391,15 @@ Nested.@cfunction_hygiene
 """)
 @test @ccall($cf_hygiene()::Int) == 10
 
+@test JuliaLowering.include_string(test_mod, """
+cfunction_ignores_locals() = Int32(1)
+function getptr()
+    cfunction_ignores_locals = @cfunction(cfunction_ignores_locals, Int32, ())
+    cfunction_ignores_locals
+end
+getptr() isa Ptr{Cvoid}
+""")
+
 # quoted function in cfunction
 quoted_cfn_anon = JuliaLowering.include_string(test_mod, raw"""
     @cfunction((function(x); x; end), Int, (Int,))
@@ -444,6 +484,19 @@ end
 @test test_mod.ccall_with_sparams(Int) === 1
 @test test_mod.ccall_with_sparams(Float64) === 1.0
 
+# (AI) has_fcall: sparam-dependent @cfunction must not inline into a caller
+# knowing T only abstractly. The abstract field keeps T non-constant there.
+@test JuliaLowering.include_string(test_mod, """
+cfunc_has_fcall(buf::Ptr{UInt8}, len::UInt32) = Int32(0)
+get_cf(::Type{T}) where {T} = @cfunction cfunc_has_fcall Int32 (Ref{T}, Ptr{UInt8}, UInt32)
+do_cf(stream::T) where {T <: IO} = get_cf(T)
+mutable struct Box3
+    x::IO
+end
+call_it(b::Box3) = do_cf(b.x)
+call_it(Box3(IOBuffer()))
+""") isa Ptr{Cvoid}
+
 # Test that ccall can be passed static parameters in the function name
 # Note that this only works with `@generated` functions from 1.13 onwards,
 # where the function name can be evaluated at code generation time.
@@ -458,6 +511,148 @@ ccallable_sptest_name(::Type{String}) = :strlen
 end
 """)
 @test test_mod.ccall_with_sparams_in_name("hii") == 3
+
+# Where local variables may appear in ccall / cfunction type and name positions
+@testset "(AI) local variables in ccall/cfunction type/name positions" begin
+    # fresh module per case: many of these define global methods
+    cc(code) = JuliaLowering.include_string(Module(:cc_locals), code)
+
+    # ---- ALLOWED: a top-level local interpolated into a global method ----
+    # return type
+    @test cc("""
+        begin
+            local t = Csize_t
+            g() = ccall(:strlen, t, (Cstring,), "asdfg")
+            g()
+        end""") == 5
+    # argument type
+    @test cc("""
+        begin
+            local a = Cstring
+            g(s) = ccall(:strlen, Csize_t, (a,), s)
+            g("asdfg")
+        end""") == 5
+    # library (2nd element of the name tuple): a constant string is fine
+    @test cc("""
+        begin
+            local lib = "libccalltest"
+            g() = ccall((:ctest, lib), Complex{Int}, (Complex{Int},), 10+20im)
+            g()
+        end""") == 11 + 18im
+    # still a global method (its capture still top-level) when nested in a `let`
+    @test cc("""
+        begin
+            local t = Csize_t
+            let
+                global g
+                g() = ccall(:strlen, t, (Cstring,), "asdfg")
+            end
+            g()
+        end""") == 5
+    # cfunction mirrors ccall for the return and argument types
+    @test cc("""fcb(x) = x + 1; @cfunction(fcb, Int, (Int,)) isa Ptr""")
+    @test cc("""
+        begin
+            local RT = Int
+            fcb(x) = x + 1
+            g() = @cfunction(fcb, RT, (Int,))
+            g() isa Ptr
+        end""")
+    @test cc("""
+        begin
+            local AT = Int
+            fcb(x) = x + 1
+            g() = @cfunction(fcb, Int, (AT,))
+            g() isa Ptr
+        end""")
+
+    # ---- REJECTED (`static_eval_disallowed_binding`) ----
+    @test_broken false == """
+    Note these should ideally all be LoweringError, but that's just so the error
+    prints nicely.  flisp doesn't do much validation, and leaves it to the ccall
+    machinery to reject everything it can't handle.
+    """
+
+    # A same-frame local (declared in the method that runs the ccall) is a slot.
+    @test_throws LoweringError cc("""
+        function g()
+            local rt = Csize_t
+            ccall(:strlen, rt, (Cstring,), "asdfg")
+        end
+        g()""")
+    # A genuine (local-name / escaping) closure captures the type as a *field*.
+    @test_throws ErrorException cc("""
+        let t = Csize_t
+            g() = ccall(:strlen, t, (Cstring,), "asdfg")
+            g()
+        end""")
+    @test_throws ErrorException cc("""
+        let a = Cstring
+            g(s) = ccall(:strlen, Csize_t, (a,), s)
+            g("asdfg")
+        end""")
+    # A *reassigned* (boxed) top-level local can't be baked in as a constant.
+    @test_throws LoweringError cc("""
+        begin
+            local t = Csize_t
+            t = Csize_t
+            g() = ccall(:strlen, t, (Cstring,), "asdfg")
+            g()
+        end""")
+    # cfunction rejects the same shapes.
+    @test_throws LoweringError cc("""
+        function g()
+            fcb(x) = x + 1
+            local RT = Int
+            @cfunction(fcb, RT, (Int,))
+        end
+        g()""")
+    @test_throws UndefVarError cc("""
+        let RT = Int
+            fcb(x) = x + 1
+            g() = @cfunction(fcb, RT, (Int,))
+            g()
+        end""")
+    # ...and so does the library position.
+    @test_throws LoweringError cc("""
+        function g()
+            local lib = "libccalltest"
+            ccall((:ctest, lib), Complex{Int}, (Complex{Int},), 10+20im)
+        end
+        g()""")
+    @test_throws TypeError cc("""
+        let lib = "libccalltest"
+            g() = ccall((:ctest, lib), Complex{Int}, (Complex{Int},), 10+20im)
+            g()
+        end""")
+
+    # A top-level ccall (no enclosing method) referencing a same-frame local: the
+    # static_eval can't be evaluated with no locals available.
+    @test_throws LoweringError cc("""
+        let rt = Csize_t
+            ccall(:strlen, rt, (Cstring,), "asdfg")
+        end""")
+    # The function *name* must be a literal symbol/string; a local holding a
+    # Symbol is only rejected later, at codegen.
+    @test_throws TypeError cc("""
+        function g()
+            local nm = :strlen
+            ccall(nm, Csize_t, (Cstring,), "asdfg")
+        end
+        g()""")
+    # A top-level local *library* likewise slips past lowering and fails later.
+    @test_throws LoweringError cc("""
+        let lib = "libccalltest"
+            ccall((:ctest, lib), Complex{Int}, (Complex{Int},), 10+20im)
+        end""")
+
+    @test_throws TypeError cc("""
+    begin
+        local nm = :strlen
+        g() = ccall(nm, Csize_t, (Cstring,), "asdfg")
+        g()
+    end""")
+end
 
 @testset "CodeInfo: has_image_globalref" begin
     @test lower_str(test_mod, "x + y").args[1].has_image_globalref === false
@@ -760,7 +955,7 @@ end
               :T),
               Expr(:block, Expr(:return, Expr(:static_parameter, 1))))
     local f
-    @test (f = fl_eval(test_mod, ex)) isa Function
+    @test (f = jl_eval(test_mod, ex)) isa Function
     @test f(String) == String
     @test (f = jl_eval(test_mod, ex; expr_compat_mode=true)) isa Function
     @test f(String) == String
@@ -777,10 +972,194 @@ end
                         Expr(:tuple, :x, :y,
                              Expr(:static_parameter, 1),
                              Expr(:static_parameter, 2)))))
-    @test (f = fl_eval(test_mod, ex)) isa Function
+    @test (f = jl_eval(test_mod, ex)) isa Function
     @test f(1, 'a') == (1, 'a', Int, Char)
     @test (f = jl_eval(test_mod, ex; expr_compat_mode=true)) isa Function
     @test f(1, 'a') == (1, 'a', Int, Char)
     @test (f = jl_eval(test_mod, ex; expr_compat_mode=false)) isa Function
     @test f(1, 'a') == (1, 'a', Int, Char)
+
+    ex = Expr(:function,
+         Expr(:where,
+              Expr(:tuple, Expr(:(::), Expr(:curly, :Type, :T))),
+              :T),
+              Expr(:block, Expr(:isdefined, Expr(:static_parameter, 1))))
+
+    @test (f = jl_eval(test_mod, ex)) isa Function
+    @test f(String) == true
+end
+
+# duplicated in base tests
+JuliaLowering.include_string(@__MODULE__, """
+@testset "interaction of @. with generators" begin
+   @test [(x,y,a,b) for x in 1:2, y in 3:4 for a in 5:6, b in 7:8 if true] ==
+       @. [(x,y,a,b) for x in 1:2, y in 3:4 for a in 5:6, b in 7:8 if true]
+   # + in iterspec gets dotted
+   @test [[11, 22]] == @. [x for x in [[1, 2] + [10, 20]] if true]
+   # + in body gets dotted
+   let m = @. [(x+y) for x in [[1,2],[10,20]], y in [100]]
+       @test m[1] == [101,102]
+       @test m[2] == [110,120]
+   end
+end
+""")
+
+@testset "Base.@kwdef" for expr_compat_mode in (true, false)
+    local test_mod = @newmod()
+    @eval test_mod using Test
+
+    JuliaLowering.include_string(test_mod, """
+    @kwdef struct Test27970Typed
+        a::Int
+        b::String = "hi"
+    end
+    @kwdef struct Test27970Untyped
+        a
+    end
+    @kwdef struct Test27970Empty end
+    """; expr_compat_mode)
+
+    @eval test_mod @testset "No default values" begin
+        @test Test27970Typed(a=1) == Test27970Typed(1, "hi")
+        # Implicit type conversion (no assertion on kwarg)
+        @test Test27970Typed(a=0x03) == Test27970Typed(3, "hi")
+        @test_throws UndefKeywordError Test27970Typed()
+
+        @test Test27970Untyped(a=1) == Test27970Untyped(1)
+        @test_throws UndefKeywordError Test27970Untyped()
+
+        # Just checking that this doesn't stack overflow on construction
+        @test Test27970Empty() == Test27970Empty()
+    end
+
+    JuliaLowering.include_string(test_mod, """
+    abstract type AbstractTest29307 end
+    @kwdef struct Test29307{T<:Integer} <: AbstractTest29307
+        a::T=2
+    end
+    """; expr_compat_mode)
+
+    @eval test_mod @testset "subtyped" begin
+        @test Test29307() == Test29307{Int}(2)
+        @test Test29307(a=0x03) == Test29307{UInt8}(0x03)
+        @test Test29307{UInt32}() == Test29307{UInt32}(2)
+        @test Test29307{UInt32}(a=0x03) == Test29307{UInt32}(0x03)
+    end
+    JuliaLowering.include_string(test_mod, """
+    @kwdef struct TestInnerConstructor
+        a = 1
+        TestInnerConstructor(a::Int) = (@assert a>0; new(a))
+        function TestInnerConstructor(a::String)
+            @assert length(a) > 0
+            new(a)
+        end
+    end
+    """; expr_compat_mode)
+
+    @eval test_mod @testset "inner constructor" begin
+        @test TestInnerConstructor() == TestInnerConstructor(1)
+        @test TestInnerConstructor(a=2) == TestInnerConstructor(2)
+        @test_throws AssertionError TestInnerConstructor(a=0)
+        @test TestInnerConstructor(a="2") == TestInnerConstructor("2")
+        @test_throws AssertionError TestInnerConstructor(a="")
+    end
+
+    JuliaLowering.include_string(test_mod, """
+    const outsidevar = 7
+    @kwdef struct TestOutsideVar
+        a::Int=outsidevar
+    end
+    """; expr_compat_mode)
+    @eval test_mod @test TestOutsideVar() == TestOutsideVar(7)
+
+    JuliaLowering.include_string(test_mod, """
+    @kwdef mutable struct Test_kwdef_const_atomic
+        a
+        b::Int
+        c::Int = 1
+        const d
+        const e::Int
+        const f = 1
+        const g::Int = 1
+        @atomic h::Int
+    end
+    """; expr_compat_mode)
+
+    @eval test_mod @testset "const and @atomic fields" begin
+        x = Test_kwdef_const_atomic(a = 1, b = 1, d = 1, e = 1, h = 1)
+        for f in fieldnames(Test_kwdef_const_atomic)
+            @test getfield(x, f) == 1
+        end
+        @testset "const fields" begin
+            @test_throws ErrorException x.d = 2
+            @test_throws ErrorException x.e = 2
+            @test_throws MethodError x.e = "2"
+            @test_throws ErrorException x.f = 2
+            @test_throws ErrorException x.g = 2
+        end
+        @testset "atomic fields" begin
+            @test_throws ConcurrencyViolationError x.h = 1
+            @atomic x.h = 1
+            @test @atomic(x.h) == 1
+            @atomic x.h = 2
+            @test @atomic(x.h) == 2
+        end
+    end
+
+    JuliaLowering.include_string(test_mod, """
+    module KwdefWithEsc
+        const Int1 = Int
+        const val1 = 42
+        macro define_struct()
+            quote
+                @kwdef struct $(esc(:Struct))
+                    a
+                    b = val1
+                    c::Int1
+                    d::Int1 = val1
+
+                    $(esc(quote
+                        e
+                        f = val2
+                        g::Bool1
+                        h::Bool1 = val2
+                    end))
+
+                    $(esc(:(i = val2)))
+                    $(esc(:(j::Bool1)))
+                    $(esc(:(k::Bool1 = val2)))
+
+                    l::$(esc(:Bool1))
+                    m::$(esc(:Bool1)) = $(esc(:val2))
+
+                    n = $(esc(:val2))
+                    o::Int1 = $(esc(:val2))
+
+                    $(esc(:p))
+                    $(esc(:q)) = val1
+                    $(esc(:s))::Int1
+                    $(esc(:t))::Int1 = val1
+                end
+            end
+        end
+    end
+    """; expr_compat_mode=true)
+
+    JuliaLowering.include_string(test_mod, """
+    module KwdefWithEsc_TestModule
+        using ..KwdefWithEsc
+        const Bool1 = Bool
+        const val2 = true
+        KwdefWithEsc.@define_struct()
+    end
+    """; expr_compat_mode)
+
+    @eval test_mod @test isdefined(KwdefWithEsc_TestModule, :Struct)
+    @eval test_mod @test fieldnames(KwdefWithEsc_TestModule.Struct) ==
+        (:a, :b, :c, :d, :e, :f, :g, :h, :i, :j, :k, :l, :m, :n, :o, :p, :q, :s, :t)
+    @eval test_mod @test fieldtypes(KwdefWithEsc_TestModule.Struct) ==
+        (Any, Any, Int, Int, Any, Any, Bool, Bool, Any, Bool, Bool, Bool, Bool, Any,
+         Int, Any, Any, Int, Int)
+    @eval test_mod @test KwdefWithEsc_TestModule.Struct(
+        ; a='a',c=0,e='e',g=true,j=true,l=true,p='p',s=0) isa KwdefWithEsc_TestModule.Struct
 end

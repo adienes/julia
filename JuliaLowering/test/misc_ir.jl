@@ -38,8 +38,6 @@ LoweringError:
 #= line 1 =# - invalid syntax: unknown form `.` or number of arguments 3
 Expression:
   (. x a 3)
-Containing expressions:
-  (. x a 3)
 
 ########################################
 # Error: Placeholder value used
@@ -178,7 +176,7 @@ LoweringError:
 #---------------------
 LoweringError:
 (; a."b")
-#     ╙ ── expected identifier
+#    └─┘ ── expected identifier
 
 ########################################
 # Error: Named tuple element without valid name
@@ -260,8 +258,6 @@ LoweringError:
 #= line 1 =# - expected (if cond body) or (if cond body else)
 Expression:
   (if)
-Containing expressions:
-  (if)
 
 ########################################
 # Error: @atomic in wrong position
@@ -273,8 +269,6 @@ LoweringError:
 #= none:2 =# - unimplemented or unsupported `atomic` declaration
 Expression:
   (atomic x)
-Containing expressions:
-  (let (block) (block (atomic x)))
 
 ########################################
 # GC.@preserve support
@@ -455,7 +449,7 @@ MacroExpansionError while expanding @ccall in module Main.TestMod:
 #---------------------
 MacroExpansionError while expanding @ccall in module Main.TestMod:
 @ccall foo("blah"::Cstring, "bad")::Int
-#                            └─┘ ── argument needs a type annotation
+#                           └───┘ ── argument needs a type annotation
 
 ########################################
 # Error: @ccall varargs without one fixed argument
@@ -503,7 +497,7 @@ MacroExpansionError while expanding @ccall in module Main.TestMod:
 #---------------------
 MacroExpansionError while expanding @ccall in module Main.TestMod:
 @ccall gc_safe="hi" foo(x::Int)::Int
-#               └┘ ── gc_safe must be true or false
+#              └──┘ ── gc_safe must be true or false
 
 ########################################
 # Error: unary & syntax
@@ -543,16 +537,17 @@ include("hi.jl")
 # Const function assignment syntax (legacy)
 const f(x::Int)::Int = x+1
 #---------------------
-1   (method TestMod.f)
+1   (call core.define_method TestMod :f)
 2   latestworld
 3   TestMod.f
 4   (call core.TypeEqOf %₃)
 5   TestMod.Int
 6   (call core.svec %₄ %₅)
 7   (call core.svec)
-8   SourceLocation::1:7
+8   SourceLocation::1:6
 9   (call core.svec %₆ %₇ %₈)
-10  --- method TestMod.f %₉
+10  (call core.define_method TestMod TestMod.f %₉
+    --- code_info
     slots: [slot₁/#self#(!read) slot₂/x slot₃/tmp(!read)]
     1   TestMod.Int
     2   TestMod.+
