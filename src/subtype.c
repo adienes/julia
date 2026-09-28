@@ -4988,7 +4988,7 @@ static void set_snapshot_bound(jl_value_t **slot, jl_value_t *value, jl_svec_t *
 {
     *slot = value;
     if (roots)
-        jl_gc_wb(roots, value);
+        jl_gc_wb(roots, (void*)slot, value);
 }
 
 // Substitute varval through the environment, or close and place vb if supplied.
