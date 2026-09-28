@@ -3112,6 +3112,12 @@ end
         @test W <: typeintersect(A, B)
         @test W <: typeintersect(B, A)
     end
+    let A = Tuple{Vector{Union{Nothing, S}}} where S<:Number,
+        B = Tuple{Vector{Union{Y, Z}}} where {Y<:Union{Nothing, Integer}, Z<:Union{Int, String}},
+        W = Tuple{Vector{Nothing}}
+        @test W <: typeintersect(A, B)
+        @test W <: typeintersect(B, A)
+    end
     let A = Tuple{Ref{Union{Nothing, T}}, T, Ref{Union{Nothing, T}}} where T<:Union{Nothing, Integer},
         B = Tuple{Ref{X}, Union{Nothing, Signed}, Ref{Y}} where {X, Y},
         W = Tuple{Ref{Union{Nothing, Int}}, Int, Ref{Union{Nothing, Int}}}

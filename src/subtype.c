@@ -5667,15 +5667,15 @@ static int has_intvalued_var(jl_value_t *t, jl_stenv_t *e) JL_NOTSAFEPOINT
     return 0;
 }
 
-// The least type `t` can denote given the variable bounds in `saved`, or NULL
-// when that is not determined by substitution.
+// The least type `t` can denote given the variable bounds in `saved` (or the
+// current bounds), or NULL when that is not determined by substitution.
 static jl_value_t *lower_value(jl_value_t *t, jl_stenv_t *e, jl_value_t **saved) JL_CANSAFEPOINT
 {
     jl_typeenv_t *env = NULL;
     int i = 0;
     for (jl_varbinding_t *v = e->vars; v != NULL; v = v->prev, i += 2) {
         jl_typeenv_t *newenv = (jl_typeenv_t*)alloca(sizeof(jl_typeenv_t));
-        *newenv = (jl_typeenv_t){ v->var, saved[i], env };
+        *newenv = (jl_typeenv_t){ v->var, saved ? saved[i] : v->lb, env };
         env = newenv;
     }
     int remaining = current_env_length(e);
@@ -5683,7 +5683,7 @@ static jl_value_t *lower_value(jl_value_t *t, jl_stenv_t *e, jl_value_t **saved)
     while (t != NULL && jl_has_free_typevars(t)) {
         i = 0;
         for (jl_varbinding_t *v = e->vars; t != NULL && v != NULL; v = v->prev, i += 2) {
-            if (!obviously_egal(saved[i], saved[i + 1]) && jl_has_typevar_inside(t, v->var, 1))
+            if (!(saved ? obviously_egal(saved[i], saved[i + 1]) : obviously_egal(v->lb, v->ub)) && jl_has_typevar_inside(t, v->var, 1))
                 t = NULL;
         }
         if (t != NULL)
@@ -5693,8 +5693,9 @@ static jl_value_t *lower_value(jl_value_t *t, jl_stenv_t *e, jl_value_t **saved)
     return t;
 }
 
-// Whether `x == y` leaves the single choice `ii`: the least types both can denote join to `ii`.
-static int invariant_forced(jl_value_t *x, jl_value_t *y, jl_value_t *ii, jl_stenv_t *e, jl_value_t **saved) JL_CANSAFEPOINT
+// Whether `ii` reaches down to the least type that both `x` and `y` can denote,
+// so it cannot exclude a solution of `x == y` from below.
+static int invariant_admits_least(jl_value_t *x, jl_value_t *y, jl_value_t *ii, jl_stenv_t *e, jl_value_t **saved) JL_CANSAFEPOINT
 {
     if (has_intvalued_var(x, e) || has_intvalued_var(y, e))
         return 1;
@@ -5703,13 +5704,14 @@ static int invariant_forced(jl_value_t *x, jl_value_t *y, jl_value_t *ii, jl_ste
         return 0;
     JL_GC_PUSH2(&xlo, &ylo);
     ylo = lower_value(y, e, saved);
-    int forced = 0;
+    int admits = 0;
     if (ylo != NULL) {
         xlo = simple_join(xlo, ylo);
-        forced = jl_types_equal(xlo, ii);
+        ylo = lower_value(ii, e, NULL);
+        admits = ylo != NULL && jl_subtype(ylo, xlo) && (jl_has_free_typevars(ii) || jl_subtype(xlo, ii));
     }
     JL_GC_POP();
-    return forced;
+    return admits;
 }
 
 static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
@@ -5752,7 +5754,8 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
     }
     if (!subtype_pair_in_env(x, y, y, x, e, 0))
         ii = NULL;
-    else if (!jl_has_free_typevars(ii) && !invariant_forced(x, y, ii, e, saved))
+    else if (ii != x && ii != y && (!jl_has_free_typevars(ii) || jl_is_uniontype(x) || jl_is_uniontype(y)) &&
+             !invariant_admits_least(x, y, ii, e, saved))
         ii = jl_has_free_typevars(y) ? y : x;
     JL_GC_POP();
     return ii;
