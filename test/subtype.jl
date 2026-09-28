@@ -3132,6 +3132,14 @@ end
     end
 end
 
+# Every type in both inputs lies in their intersection.
+isdefined(@__MODULE__, :IntersectionWitnesses) || include("testhelpers/IntersectionWitnesses.jl")
+@testset "intersection contains common types" begin
+    for seed in 2:4
+        @test IntersectionWitnesses.missed_witnesses(seed, 600) == []
+    end
+end
+
 # Union equality distinguishes disjoint members and preserves tuple covariance.
 @test Union{Nothing, Tuple{Int, Int}} != Union{Nothing, Tuple{String, String}}
 @test Union{Nothing, Tuple{Union{Int, String}}} == Union{Nothing, Tuple{Int}, Tuple{String}}
