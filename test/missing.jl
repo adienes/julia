@@ -119,6 +119,10 @@ end
     end
 end
 
+# Missing propagates even when an inverse's parameter permits Missing.
+struct MissingInverse63037 <: Base.MultiplicativeInverses.MultiplicativeInverse{Missing} end
+@test rem(missing, MissingInverse63037()) === missing
+
 @testset "two-argument functions" begin
     two_argument_functions = [atan, hypot, log]
 
