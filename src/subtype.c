@@ -5658,6 +5658,60 @@ static jl_value_t *intersect_sub_datatype(jl_datatype_t *xd, jl_datatype_t *yd, 
     return (jl_value_t*)xd;
 }
 
+static int has_intvalued_var(jl_value_t *t, jl_stenv_t *e) JL_NOTSAFEPOINT
+{
+    for (jl_varbinding_t *v = e->vars; v != NULL; v = v->prev) {
+        if (v->intvalued && jl_has_typevar(t, v->var))
+            return 1;
+    }
+    return 0;
+}
+
+// The least type `t` can denote given the variable bounds in `saved`, or NULL
+// when that is not determined by substitution.
+static jl_value_t *lower_value(jl_value_t *t, jl_stenv_t *e, jl_value_t **saved) JL_CANSAFEPOINT
+{
+    jl_typeenv_t *env = NULL;
+    int i = 0;
+    for (jl_varbinding_t *v = e->vars; v != NULL; v = v->prev, i += 2) {
+        jl_typeenv_t *newenv = (jl_typeenv_t*)alloca(sizeof(jl_typeenv_t));
+        *newenv = (jl_typeenv_t){ v->var, saved[i], env };
+        env = newenv;
+    }
+    int remaining = current_env_length(e);
+    JL_GC_PUSH1(&t);
+    while (t != NULL && jl_has_free_typevars(t)) {
+        i = 0;
+        for (jl_varbinding_t *v = e->vars; t != NULL && v != NULL; v = v->prev, i += 2) {
+            if (!obviously_egal(saved[i], saved[i + 1]) && jl_has_typevar_inside(t, v->var, 1))
+                t = NULL;
+        }
+        if (t != NULL)
+            t = remaining-- > 0 ? jl_instantiate_with_typeenv(t, env, 1) : NULL;
+    }
+    JL_GC_POP();
+    return t;
+}
+
+// Whether `x == y` leaves the single choice `ii`: the least types both can denote join to `ii`.
+static int invariant_forced(jl_value_t *x, jl_value_t *y, jl_value_t *ii, jl_stenv_t *e, jl_value_t **saved) JL_CANSAFEPOINT
+{
+    if (has_intvalued_var(x, e) || has_intvalued_var(y, e))
+        return 1;
+    jl_value_t *xlo = lower_value(x, e, saved), *ylo = NULL;
+    if (xlo == NULL)
+        return 0;
+    JL_GC_PUSH2(&xlo, &ylo);
+    ylo = lower_value(y, e, saved);
+    int forced = 0;
+    if (ylo != NULL) {
+        xlo = simple_join(xlo, ylo);
+        forced = jl_types_equal(xlo, ii);
+    }
+    JL_GC_POP();
+    return forced;
+}
+
 static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 {
     if (e->Loffset == 0 && !jl_has_free_typevars(x) && !jl_has_free_typevars(y)) {
@@ -5670,11 +5724,22 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
         e->invdepth--;
         return valid > 0 ? exact : NULL;
     }
+    int nvars = current_env_length(e), i = 0;
+    jl_value_t **saved;
+    JL_GC_PUSHARGS(saved, 2 * nvars + 1);
+    for (jl_varbinding_t *v = e->vars; v != NULL; v = v->prev) {
+        saved[i++] = v->lb;
+        saved[i++] = v->ub;
+    }
     jl_value_t *ii = intersect(x, y, e, PARAM_INVARIANT);
+    saved[2 * nvars] = ii;
     e->invdepth--;
-    if (jl_is_typevar(x) && jl_is_typevar(y) && jl_is_typevar(ii))
+    if (jl_is_typevar(x) && jl_is_typevar(y) && jl_is_typevar(ii)) {
+        JL_GC_POP();
         return ii; // skip the following check due to possible circular constraints.
+    }
     if (ii == jl_bottom_type) {
+        JL_GC_POP();
         if (!subtype_in_env(x, jl_bottom_type, e))
             return NULL;
         flip_vars(e); flip_offset(e);
@@ -5685,9 +5750,10 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
         flip_vars(e); flip_offset(e);
         return jl_bottom_type;
     }
-    JL_GC_PUSH1(&ii);
     if (!subtype_pair_in_env(x, y, y, x, e, 0))
         ii = NULL;
+    else if (!jl_has_free_typevars(ii) && !invariant_forced(x, y, ii, e, saved))
+        ii = jl_has_free_typevars(y) ? y : x;
     JL_GC_POP();
     return ii;
 }

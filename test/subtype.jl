@@ -3098,6 +3098,32 @@ end
         @test I <: typeintersect(A, B) <: B
         @test I <: typeintersect(B, A) <: B
     end
+
+    # A closed invariant parameter is only valid when the equality leaves no other choice.
+    let A = Tuple{Vector{Union{Nothing, T}}} where T<:Real,
+        B = Tuple{Vector{Union{Nothing, X}}} where X<:Union{Nothing, Integer},
+        W = Tuple{Vector{Nothing}}
+        @test W <: typeintersect(A, B)
+        @test W <: typeintersect(B, A)
+    end
+    let A = Tuple{Vector{S}} where S<:Union{Int, String},
+        B = Tuple{Vector{Union{Int, X}}} where X,
+        W = Tuple{Vector{Int}}
+        @test W <: typeintersect(A, B)
+        @test W <: typeintersect(B, A)
+    end
+    let A = Tuple{Ref{Union{Nothing, T}}, T, Ref{Union{Nothing, T}}} where T<:Union{Nothing, Integer},
+        B = Tuple{Ref{X}, Union{Nothing, Signed}, Ref{Y}} where {X, Y},
+        W = Tuple{Ref{Union{Nothing, Int}}, Int, Ref{Union{Nothing, Int}}}
+        @test W <: typeintersect(A, B)
+        @test W <: typeintersect(B, A)
+    end
+    let A = Tuple{Ref{Tuple{S, Ref{S}}}, S} where S<:(Union{Missing, U} where U<:Number),
+        B = Tuple{Ref{Tuple{Union{Float64, X}, Ref{Union{Y, Z}}}}, Union{Float64, Y}} where {X<:(Union{Missing, U} where U<:Number), Y, Float64<:Z<:(Union{Missing, U} where U<:Number)},
+        W = Tuple{Ref{Tuple{Union{Missing, Float64}, Ref{Union{Missing, Float64}}}}, Float64}
+        @test W <: typeintersect(A, B)
+        @test_broken W <: typeintersect(B, A)
+    end
 end
 
 # Union equality distinguishes disjoint members and preserves tuple covariance.
