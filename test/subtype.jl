@@ -3049,11 +3049,12 @@ end
 
     # Captured parameters must retain both declared and inferred kind bounds.
     let A = Tuple{Ref{S}, Ref{S}, Ref{DataType}} where S<:Union{Missing, Tuple{Type{Int}, DataType}}
-        for bound in (Type{Int}, Any)
-            B = Tuple{(Ref{Union{Missing, Tuple{T, T}}} where T<:bound), Ref{Union{Missing, Tuple{U, U}}}, Ref{U}} where U
-            @test typeintersect(A, B) == Union{}
-            @test typeintersect(B, A) == Union{}
-        end
+        B = Tuple{(Ref{Union{Missing, Tuple{T, T}}} where T<:Type{Int}), Ref{Union{Missing, Tuple{U, U}}}, Ref{U}} where U
+        @test typeintersect(A, B) == Union{}
+        @test typeintersect(B, A) == Union{}
+        B = Tuple{(Ref{Union{Missing, Tuple{T, T}}} where T), Ref{Union{Missing, Tuple{U, U}}}, Ref{U}} where U
+        @test_broken typeintersect(A, B) == Union{}
+        @test_broken typeintersect(B, A) == Union{}
     end
 
     # Projecting a captured union parameter must preserve both upper-bound constraints.

@@ -1559,8 +1559,6 @@ JL_EXTENSION struct _jl_typestack_t {
     struct _jl_typestack_t *prev;
 };
 
-enum { INST_WIDEN_BOUNDS = 2 };
-
 static jl_value_t *inst_type_w_(jl_value_t *t, jl_typeenv_t *env, jl_typestack_t *stack, int check, int nothrow, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT;
 static jl_svec_t *inst_ftypes(jl_svec_t *p, jl_typeenv_t *env, jl_typestack_t *stack, int cacheable, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT;
 
@@ -1577,7 +1575,7 @@ JL_DLLEXPORT jl_value_t *jl_instantiate_unionall(jl_unionall_t *u, jl_value_t *p
 
 jl_unionall_t *jl_rename_unionall(jl_unionall_t *u)
 {
-    jl_tvar_t *v = (jl_tvar_t*)jl_new_struct(jl_tvar_type, u->var->name, u->var->lb, u->var->ub);
+    jl_tvar_t *v = jl_new_typevar(u->var->name, u->var->lb, u->var->ub);
     jl_value_t *t = NULL;
     JL_GC_PUSH2(&v, &t);
     jl_typeenv_t env = { u->var, (jl_value_t *)v, NULL };
@@ -2978,8 +2976,7 @@ static jl_value_t *inst_type_w_(jl_value_t *t, jl_typeenv_t *env, jl_typestack_t
                     t = NULL;
             }
             else if (lb != ua->var->lb || var != ua->var->ub) {
-                var = jl_is_intersecttype(var) ? jl_new_struct(jl_tvar_type, ua->var->name, lb, var) :
-                    (jl_value_t*)jl_new_typevar(ua->var->name, lb, var);
+                var = (jl_value_t*)jl_new_typevar(ua->var->name, lb, var);
             }
             else {
                 var = (jl_value_t*)ua->var;
@@ -3036,8 +3033,6 @@ static jl_value_t *inst_type_w_(jl_value_t *t, jl_typeenv_t *env, jl_typestack_t
                 t = jl_type_union(uargs, 2);
             }
         }
-        if (meet && check == INST_WIDEN_BOUNDS)
-            t = jl_widen_intersection_bound(t);
         JL_GC_POP();
         return t;
     }
@@ -3119,12 +3114,6 @@ static jl_value_t *instantiate_with(jl_value_t *t, jl_value_t **env, size_t n, j
         return instantiate_with(t, &env[2], n-1, &en);
     }
     return inst_type_w_(t, te, NULL, 1, 0, 0);
-}
-
-jl_value_t *jl_export_intersection_type(jl_value_t *t) JL_CANSAFEPOINT
-{
-    t = inst_type_w_(t, NULL, NULL, INST_WIDEN_BOUNDS, 2, 0);
-    return t ? t : jl_bottom_type;
 }
 
 jl_value_t *jl_instantiate_with_typeenv(jl_value_t *t, jl_typeenv_t *env, int nothrow)
