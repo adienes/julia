@@ -3140,6 +3140,33 @@ isdefined(@__MODULE__, :IntersectionWitnesses) || include("testhelpers/Intersect
     end
 end
 
+# Common types that intersection still drops: members where a `Vararg` is empty, and a
+# diagonal-looking variable that also occurs in a bound.
+@testset "intersection drops common types" begin
+    let A = Tuple{Vector{T}, Vararg{T}} where T,
+        B = Tuple{Vector, Vararg{Int}},
+        W = Tuple{Vector{String}}
+        @test W <: A && W <: B
+        @test_broken W <: typeintersect(A, B)
+        @test_broken W <: typeintersect(B, A)
+    end
+    let A = Tuple{Type{T}, T} where T,
+        B = Tuple{Type{Ref{T}}, Ref{NTuple{N, T}}} where {N, T},
+        W = Tuple{Type{Ref{Tuple{}}}, Ref{Tuple{}}}
+        @test W <: A && W <: B
+        @test_broken W <: typeintersect(A, B)
+        @test_broken W <: typeintersect(B, A)
+    end
+    # issue #63345
+    let A = Tuple{T, T, Type{<:Vector{T}}} where T,
+        B = Tuple{Any, Any, Type{Union{}}, Vararg{Any}},
+        W = Tuple{Int, Float64, Type{Union{}}}
+        @test W <: A && W <: B
+        @test_broken W <: typeintersect(A, B)
+        @test_broken W <: typeintersect(B, A)
+    end
+end
+
 # Union equality distinguishes disjoint members and preserves tuple covariance.
 @test Union{Nothing, Tuple{Int, Int}} != Union{Nothing, Tuple{String, String}}
 @test Union{Nothing, Tuple{Union{Int, String}}} == Union{Nothing, Tuple{Int}, Tuple{String}}
