@@ -3277,7 +3277,7 @@ let X = Tuple{Vector{M62174{D,F,V,A}} where {D,F,V<:P62174{D},A<:P62174{F}}},
     @test p[4].ub.parameters[1] === p[2]
 end
 
-# Static-parameter values must not contain method variables left unresolved by dependent bounds.
+# Dependent static-parameter bounds resolve through outer variables' reported values and never leak unresolved method variables.
 struct DependentSparams57427{N, Tup}
     DependentSparams57427{N, Tup}() where {N, Tuple{Vararg{Nothing, N}} <: Tup <: Tuple{Vararg{Nothing, N}}} = new{N, Tup}()
 end
@@ -3288,18 +3288,28 @@ end
 dependent_sparams_unpinned_caller(r) = dependent_sparams_unpinned(1, r)
 @generated dependent_sparams_gen(::Vector{S}, ::T) where {T,S>:Vector{T}} = Base.has_free_typevars(T)
 Base.@nospecializeinfer dependent_sparams_gen_caller(@nospecialize(x::Type)) = dependent_sparams_gen(Vector{Vector}(), x)
+@noinline dependent_sparams_covariant(::T, ::S) where {T,S>:Vector{T}} = S
+@noinline dependent_sparams_chain(::T, ::U, ::S) where {T,U>:T,S>:Vector{U}} = (U, S)
+@noinline dependent_sparams_bottom(::Val{T}, ::S) where {T,S>:Vector{T}} = S
+@noinline dependent_sparams_free(::Type{T}, ::S) where {T,S>:Type{T}} = S
+@noinline dependent_sparams_widen(::T, ::T, ::Ref{S}) where {T,S>:T} = S
 @testset "dependent static parameters" begin
     @test dependent_sparams(1, Ref{Integer}(1)) === (Int, Integer)
     @test DependentSparams57427{0, Tuple{}}() isa DependentSparams57427{0, Tuple{}}
     @test_throws UndefVarError dependent_sparams_leaf(nothing, Ref(1))
     let open = Union{Int, TypeVar(:X)}
         @test dependent_sparams_open(Int, open) === (Int, open)
+        @test dependent_sparams_free(open, open) === Union
     end
-    @test_throws UndefVarError dependent_sparams_unpinned_caller(Ref{Vector}())
+    @test dependent_sparams_unpinned_caller(Ref{Vector}()) === Int
     _, env = intersection_env(Tuple{Vector{Vector}, Number}, Tuple{Vector{S}, T} where {T, S>:Vector{T}})
     @test env[1] !== Number
     Base.code_typed_by_type(Tuple{typeof(dependent_sparams_gen), Vector{Vector}, Type{P}} where P)
     @test !dependent_sparams_gen_caller(Int)
+    @test dependent_sparams_covariant(1, [1]) === Vector{Int}
+    @test dependent_sparams_chain(1, 1, [1]) === (Int, Vector{Int})
+    @test dependent_sparams_bottom(Val{Union{}}(), Union{}[]) === Vector{Union{}}
+    @test dependent_sparams_widen(Int, Int, Ref{Union{Int,Type{Int}}}(1)) === Union{Int,Type{Int}}
     _, env = intersection_env(Tuple{Integer,Vector{Integer}}, Tuple{T,S} where {T,S>:Vector{T}})
     @test env[2] !== Vector{Integer}
     _, env = intersection_env(Tuple{Integer,Vector{Integer}}, Tuple{T,S} where {T<:Integer,S>:Vector{T}})

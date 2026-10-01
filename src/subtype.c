@@ -147,6 +147,16 @@ typedef struct jl_varbinding_t {
     struct jl_varbinding_t *prev;
 } jl_varbinding_t;
 
+enum { ENVSNAP_T, ENVSNAP_U, ENVSNAP_LB, ENVSNAP_UB, ENVSNAP_WIDENED_LB, ENVSNAP_NEW_TVAR,
+       ENVSNAP_VAL, ENVSNAP_FIELDS };
+
+typedef struct jl_envdefer_t {
+    jl_varbinding_t vb;
+    int8_t deferred;
+    int8_t widen_lb;
+    int8_t constrained;
+} jl_envdefer_t;
+
 typedef struct jl_ivarbinding_t {
     jl_tvar_t **var;
     jl_value_t **lb;
@@ -165,6 +175,9 @@ typedef struct JL_GC_TRACKED_TYPE jl_stenv_t {
     jl_value_t **envout;      // for passing caller the computed bounds of right-side variables
     int envsz;                // length of envout
     int envidx;               // current index in envout
+    // N.B.: envsnap is gc-rooted
+    jl_value_t **envsnap;     // per envout slot, ENVSNAP_FIELDS values for ordered classification
+    jl_envdefer_t *envdefer;  // per envout slot, bindings of vars whose bounds mention outer vars
     int invdepth;             // current number of invariant constructors we're nested in
     int bound_channel;        // certainty (jl_bound_certainty_t) of lower-bound
                               // contributions recorded in the current context;
@@ -555,6 +568,9 @@ static void restore_env(jl_stenv_t *e, jl_savedenv_t *se, int root) JL_NOTSAFEPO
     e->Runions.depth = se->rdepth;
     if (e->envout && e->envidx < e->envsz)
         memset(&e->envout[e->envidx], 0, (e->envsz - e->envidx)*sizeof(void*));
+    if (e->envdefer)
+        for (int i = e->envidx; i < e->envsz; i++)
+            e->envdefer[i].deferred = 0;
 }
 
 #define flip_offset(e) ((e)->Loffset *= -1)
@@ -1778,6 +1794,114 @@ static jl_value_t *subtype_unionall_envout_value(jl_value_t *t, jl_unionall_t *u
     return wrap_tvar_env(*new_tvar, constrained);
 }
 
+static void set_envout(jl_stenv_t *e, int idx, jl_value_t *val, jl_tvar_t *var) JL_CANSAFEPOINT
+{
+    assert(val != NULL);
+    jl_value_t *oldval = e->envout[idx];
+    // if we try to assign different variable values (due to checking
+    // multiple union members), consider the value unknown. Use AND
+    // semantics on the `constrained` flag across iterations: the var is
+    // constrained only if every iteration (i.e., every LHS union branch)
+    // pinned it.
+    if (oldval && !jl_egal(oldval, val)) {
+        // Distinct spellings may still pin the same value: a plain value in
+        // one branch, a pinned uncertainty marker (with its own fresh
+        // typevar) in another. When both branches pin egal values, keep
+        // the weaker (`==`-pinned marker) spelling rather than degrading
+        // the variable to unbound.
+        jl_value_t *oldrep = jl_sparam_defined_value(oldval);
+        jl_value_t *newrep = jl_sparam_defined_value(val);
+        if (oldrep != NULL && newrep != NULL && jl_egal(oldrep, newrep)) {
+            if (!jl_is_svec(oldval))
+                e->envout[idx] = val;
+            // else keep oldval, which is already the marker spelling
+        }
+        else {
+            int old_iter_constrained;
+            if (jl_is_svec(oldval) && jl_svec_len((jl_svec_t*)oldval) == 2)
+                old_iter_constrained = jl_svecref(oldval, 1) == jl_true;
+            else
+                old_iter_constrained = 1; // oldval is a concrete value: iter pinned var
+            int new_iter_constrained;
+            if (jl_is_svec(val) && jl_svec_len((jl_svec_t*)val) == 2)
+                new_iter_constrained = jl_svecref(val, 1) == jl_true;
+            else
+                new_iter_constrained = 1;
+            e->envout[idx] = wrap_tvar_env((jl_value_t*)var,
+                                           old_iter_constrained && new_iter_constrained);
+        }
+    }
+    else
+        e->envout[idx] = val;
+}
+
+static int envout_value_is_plain(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    return v != NULL && !jl_is_svec(v) && !jl_is_typevar(v) && !jl_is_vararg(v);
+}
+
+static void classify_deferred_envout(jl_stenv_t *e) JL_CANSAFEPOINT
+{
+    int n = e->envsz;
+    jl_varbinding_t *outer = (jl_varbinding_t*)alloca(n * sizeof(jl_varbinding_t));
+    jl_varbinding_t *saved_vars = e->vars;
+    jl_value_t *lb = NULL, *ub = NULL, *val = NULL, *new_tvar = NULL, *sub = NULL;
+    JL_GC_PUSH5(&lb, &ub, &val, &new_tvar, &sub);
+    for (int i = 1; i < n; i++) {
+        jl_envdefer_t *d = &e->envdefer[i];
+        jl_value_t **snap = &e->envsnap[ENVSNAP_FIELDS * i];
+        if (!d->deferred)
+            continue;
+        d->deferred = 0;
+        lb = snap[ENVSNAP_LB];
+        ub = snap[ENVSNAP_UB];
+        jl_varbinding_t *env = saved_vars;
+        for (int j = 0; j < i; j++) {
+            jl_tvar_t *var = ((jl_unionall_t*)e->envsnap[ENVSNAP_FIELDS * j + ENVSNAP_U])->var;
+            jl_value_t *rep = e->envsnap[ENVSNAP_FIELDS * j + ENVSNAP_VAL];
+            memset(&outer[j], 0, sizeof(jl_varbinding_t));
+            outer[j].var = var;
+            outer[j].existential = 1;
+            outer[j].prev = env;
+            env = &outer[j];
+            if (!envout_value_is_plain(rep))
+                continue;
+            if (jl_has_typevar(lb, var)) {
+                sub = jl_substitute_var_nothrow(lb, var, rep, 1);
+                if (sub != NULL)
+                    lb = sub;
+            }
+            if (jl_has_typevar(ub, var)) {
+                sub = jl_substitute_var_nothrow(ub, var, rep, 1);
+                if (sub != NULL)
+                    ub = sub;
+            }
+        }
+        e->vars = env;
+        if (lb != snap[ENVSNAP_LB] && !jl_has_free_typevars(lb) && !jl_has_free_typevars(ub) &&
+            !jl_subtype(lb, ub)) {
+            lb = snap[ENVSNAP_LB];
+            ub = snap[ENVSNAP_UB];
+        }
+        jl_varbinding_t vb = d->vb;
+        vb.lb = lb;
+        vb.ub = ub;
+        if (vb.pinned && has_existential_typevar(lb, e) && !has_env_typevar(ub, e))
+            lb = ub;
+        else if (lb == snap[ENVSNAP_LB])
+            lb = snap[ENVSNAP_WIDENED_LB];
+        else if (d->widen_lb)
+            lb = widen_Type_if_concrete(lb, e, NULL, e->intersection);
+        jl_unionall_t *u = (jl_unionall_t*)snap[ENVSNAP_U];
+        new_tvar = snap[ENVSNAP_NEW_TVAR];
+        val = subtype_unionall_envout_value(snap[ENVSNAP_T], u, e, &vb, lb, &new_tvar, d->constrained);
+        snap[ENVSNAP_VAL] = val;
+        set_envout(e, i, val, u->var);
+    }
+    e->vars = saved_vars;
+    JL_GC_POP();
+}
+
 static int subtype_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8_t R, jl_param_pos_t param) JL_CANSAFEPOINT
 {
     u = unalias_unionall(u, e);
@@ -1800,6 +1924,9 @@ static int subtype_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8
     e->vars = &vb;
     int ans;
     if (R) {
+        if (e->envidx == 0 && e->envdefer)
+            for (int i = 0; i < e->envsz; i++)
+                e->envdefer[i].deferred = 0;
         e->envidx++;
         ans = subtype(t, u->body, e, param);
         e->envidx--;
@@ -1941,9 +2068,7 @@ static int subtype_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8
 
     // fill variable values into `envout` up to `envsz`
     if (R && ans && e->envidx < e->envsz) {
-        jl_value_t *lb = widened_lb;
-        if (vb.pinned && has_existential_typevar(vb.lb, e) && !has_env_typevar(vb.ub, e))
-            lb = vb.ub;
+        int idx = e->envidx;
         // A var bound only through another variable's declared bounds (BOUND_PROXY)
         // need not be pinned by every call: matching `Type{<:Tuple{Vararg{E}}}`
         // against `Type{S} where S<:NInt` reaches `E` through `S`'s bound, but the
@@ -1955,45 +2080,41 @@ static int subtype_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8
         int eff_constrained = (vb.occurs_inv ||
             (cov_count(&vb) && u->var->lb == jl_bottom_type &&
              (vb.lb_certainty > BOUND_PROXY || vb.lb_required)));
-        jl_value_t *val = subtype_unionall_envout_value(t, u, e, &vb, lb, &new_tvar,
-                                                        eff_constrained);
-        jl_value_t *oldval = e->envout[e->envidx];
-        // if we try to assign different variable values (due to checking
-        // multiple union members), consider the value unknown. Use AND
-        // semantics on the `constrained` flag across iterations: the var is
-        // constrained only if every iteration (i.e., every LHS union branch)
-        // pinned it.
-        if (oldval && !jl_egal(oldval, val)) {
-            // Distinct spellings may still pin the same value: a plain value in
-            // one branch, a pinned uncertainty marker (with its own fresh
-            // typevar) in another. When both branches pin egal values, keep
-            // the weaker (`==`-pinned marker) spelling rather than degrading
-            // the variable to unbound.
-            jl_value_t *oldrep = jl_sparam_defined_value(oldval);
-            jl_value_t *newrep = jl_sparam_defined_value(val);
-            if (oldrep != NULL && newrep != NULL && jl_egal(oldrep, newrep)) {
-                if (!jl_is_svec(oldval))
-                    e->envout[e->envidx] = val;
-                // else keep oldval, which is already the marker spelling
-            }
-            else {
-                int old_iter_constrained;
-                if (jl_is_svec(oldval) && jl_svec_len((jl_svec_t*)oldval) == 2)
-                    old_iter_constrained = jl_svecref(oldval, 1) == jl_true;
-                else
-                    old_iter_constrained = 1; // oldval is a concrete value: iter pinned var
-                int new_iter_constrained;
-                if (jl_is_svec(val) && jl_svec_len((jl_svec_t*)val) == 2)
-                    new_iter_constrained = jl_svecref(val, 1) == jl_true;
-                else
-                    new_iter_constrained = 1;
-                e->envout[e->envidx] = wrap_tvar_env((jl_value_t*)u->var,
-                                                     old_iter_constrained && new_iter_constrained);
-            }
+        if (e->envdefer) {
+            jl_value_t **snap = &e->envsnap[ENVSNAP_FIELDS * idx];
+            snap[ENVSNAP_U] = (jl_value_t*)u;
+            snap[ENVSNAP_VAL] = NULL;
         }
-        else
-            e->envout[e->envidx] = val;
-        // TODO: substitute the value (if any) of this variable into previous envout entries
+        if (e->envdefer && idx > 0 &&
+            (has_existential_typevar(vb.lb, e) || has_existential_typevar(vb.ub, e))) {
+            jl_envdefer_t *d = &e->envdefer[idx];
+            jl_value_t **snap = &e->envsnap[ENVSNAP_FIELDS * idx];
+            snap[ENVSNAP_T] = t;
+            snap[ENVSNAP_LB] = vb.lb;
+            snap[ENVSNAP_UB] = vb.ub;
+            snap[ENVSNAP_WIDENED_LB] = widened_lb;
+            snap[ENVSNAP_NEW_TVAR] = new_tvar;
+            d->vb = vb;
+            d->vb.innervars = NULL;
+            d->vb.prev = NULL;
+            d->widen_lb = widen_lb;
+            d->constrained = eff_constrained;
+            d->deferred = 1;
+        }
+        else {
+            jl_value_t *lb = widened_lb;
+            if (vb.pinned && has_existential_typevar(vb.lb, e) && !has_env_typevar(vb.ub, e))
+                lb = vb.ub;
+            jl_value_t *val = subtype_unionall_envout_value(t, u, e, &vb, lb, &new_tvar,
+                                                            eff_constrained);
+            JL_GC_PUSH1(&val);
+            if (e->envdefer)
+                e->envsnap[ENVSNAP_FIELDS * idx + ENVSNAP_VAL] = val;
+            set_envout(e, idx, val, u->var);
+            JL_GC_POP();
+            if (idx == 0 && e->envdefer)
+                classify_deferred_envout(e);
+        }
     }
 
     JL_GC_POP();
@@ -3420,6 +3541,8 @@ static void init_stenv(jl_stenv_t *e, jl_value_t **env, int envsz)
         memset(env, 0, envsz*sizeof(void*));
     }
     e->envidx = 0;
+    e->envsnap = NULL;
+    e->envdefer = NULL;
     e->invdepth = 0;
     e->bound_channel = BOUND_EGAL;
     e->spell_channel = BOUND_EGAL;
@@ -3890,6 +4013,25 @@ JL_DLLEXPORT int jl_obvious_subtype(jl_value_t *x, jl_value_t *y, int *subtype)
 // points to a rooted array of length `jl_subtype_env_size(y)`.
 // This will be populated with the values of variables from unionall
 // types at the outer level of `y`.
+static int env_has_dependent_bounds(jl_value_t *y, int envsz) JL_NOTSAFEPOINT
+{
+    jl_value_t *ua = y;
+    for (int i = 0; i < envsz && jl_is_unionall(ua); i++) {
+        jl_tvar_t *v = ((jl_unionall_t*)ua)->var;
+        if (v->lb != jl_bottom_type || v->ub != (jl_value_t*)jl_any_type) {
+            jl_value_t *outer = y;
+            for (int j = 0; j < i; j++) {
+                jl_tvar_t *w = ((jl_unionall_t*)outer)->var;
+                if (jl_has_typevar(v->lb, w) || jl_has_typevar(v->ub, w))
+                    return 1;
+                outer = ((jl_unionall_t*)outer)->body;
+            }
+        }
+        ua = ((jl_unionall_t*)ua)->body;
+    }
+    return 0;
+}
+
 JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, int envsz)
 {
     jl_stenv_t e;
@@ -3927,7 +4069,20 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
     }
     init_stenv(&e, env, envsz);
     e.closed_inputs = !jl_has_free_typevars(x) && !jl_has_free_typevars(y);
-    int subtype = forall_exists_subtype(x, y, &e, PARAM_NONE);
+    int subtype;
+    if (envsz > 1 && env_has_dependent_bounds(y, envsz)) {
+        jl_value_t **envsnap;
+        JL_GC_PUSHARGS(envsnap, ENVSNAP_FIELDS * envsz);
+        jl_envdefer_t *envdefer = (jl_envdefer_t*)alloca(envsz * sizeof(jl_envdefer_t));
+        memset(envdefer, 0, envsz * sizeof(jl_envdefer_t));
+        e.envsnap = envsnap;
+        e.envdefer = envdefer;
+        subtype = forall_exists_subtype(x, y, &e, PARAM_NONE);
+        JL_GC_POP();
+    }
+    else {
+        subtype = forall_exists_subtype(x, y, &e, PARAM_NONE);
+    }
     free_stenv(&e);
     assert(obvious_subtype == 3 || obvious_subtype == subtype || jl_has_free_typevars(x) || jl_has_free_typevars(y));
 #ifndef NDEBUG
