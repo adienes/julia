@@ -85,6 +85,7 @@ typedef struct jl_varbinding_t {
     jl_value_t *JL_NONNULL ub;
     int8_t existential; // whether this variable should be treated as existential
     int8_t occurs_inv;  // occurs in invariant position
+    int8_t pinned;      // an invariant occurrence matched a term free of existential vars
     int8_t occurs_cov;  // # of occurrences in covariant position within the
                         // current consistency-check scope (reset on entry to
                         // `subtype_ccheck` / `intersect_aside`, restored on
@@ -378,8 +379,8 @@ static int current_env_length(jl_stenv_t *e)
 }
 
 // Per-var saved env layout:
-// [occurs_inv, occurs_cov, cov_diag, max_offset, lb_certainty, lb_required, lb_spell].
-#define JL_SAVEDENV_BYTES_PER_VAR 7
+// [occurs_inv, occurs_cov, cov_diag, max_offset, lb_certainty, lb_required, lb_spell, pinned].
+#define JL_SAVEDENV_BYTES_PER_VAR 8
 
 // Combined covariance count used for diagonal-rule decisions: the max of the
 // counter for the current consistency-check scope and the largest count
@@ -393,7 +394,7 @@ static inline int8_t cov_count(const jl_varbinding_t *vb) JL_NOTSAFEPOINT
 typedef struct {
     int8_t *buf;
     int rdepth;
-    int8_t _space[56]; // == 8 * JL_SAVEDENV_BYTES_PER_VAR
+    int8_t _space[64]; // == 8 * JL_SAVEDENV_BYTES_PER_VAR
     jl_gcframe_t gcframe;
     jl_value_t *roots[24]; // == 8 * 3 (lb, ub, innervars)
 } jl_savedenv_t;
@@ -441,6 +442,7 @@ static void re_save_env(jl_stenv_t *e, jl_savedenv_t *se, int root)
         se->buf[j++] = v->lb_certainty;
         se->buf[j++] = v->lb_required;
         se->buf[j++] = v->lb_spell;
+        se->buf[j++] = v->pinned;
         v = v->prev;
     }
     assert(i == nroots); (void)nroots;
@@ -544,6 +546,7 @@ static void restore_env(jl_stenv_t *e, jl_savedenv_t *se, int root) JL_NOTSAFEPO
         v->lb_certainty = se->buf[j++];
         v->lb_required = se->buf[j++];
         v->lb_spell = se->buf[j++];
+        v->pinned = se->buf[j++];
         v = v->prev;
     }
     assert(i == nroots); (void)nroots;
@@ -1025,6 +1028,15 @@ static int subtype_left_var(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_para
 
 // use the current context to record where a variable occurred, for the purpose
 // of determining whether the variable is concrete.
+static int has_existential_typevar(jl_value_t *x, jl_stenv_t *e) JL_NOTSAFEPOINT;
+
+static void record_var_pin(jl_varbinding_t *vb, jl_value_t *a, jl_stenv_t *e, jl_param_pos_t param) JL_NOTSAFEPOINT
+{
+    if (e->envsz > 0 && param == PARAM_INVARIANT && e->invdepth > vb->depth0 && !vb->pinned &&
+        (!jl_has_free_typevars(a) || !has_existential_typevar(a, e)))
+        vb->pinned = 1;
+}
+
 static void record_var_occurrence(jl_varbinding_t *vb, jl_stenv_t *e, jl_param_pos_t param) JL_NOTSAFEPOINT
 {
     if (vb != NULL && param != PARAM_NONE) {
@@ -1177,6 +1189,7 @@ static int var_lt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, jl_param_pos_t par
         pop_forall_bound_scope(e, saved_fb, nsaved_fb);
         return sub;
     }
+    record_var_pin(bb, a, e, param);
     if (bb->ub == a)
         return 1;
     if (!((bb->lb == jl_bottom_type && !jl_is_type(a) && !jl_is_typevar(a)) || subtype_ccheck(bb->lb, a, e)))
@@ -1227,6 +1240,7 @@ static int var_gt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, jl_param_pos_t par
         pop_forall_bound_scope(e, saved_fb, nsaved_fb);
         return sub;
     }
+    record_var_pin(bb, a, e, param);
     if (a != jl_bottom_type && bb->lb_certainty < e->bound_channel)
         bb->lb_certainty = e->bound_channel;
     if (bb->lb == a) {
@@ -1706,7 +1720,9 @@ static jl_value_t *subtype_unionall_envout_value(jl_value_t *t, jl_unionall_t *u
 {
     if (vb->intvalued && lb == (jl_value_t*)jl_any_type)
         return (jl_value_t*)jl_wrap_vararg(NULL, NULL, 0, 0); // special token result that represents N::Int in the envout
-    if (!vb->occurs_inv && lb != jl_bottom_type) {
+    if (!vb->pinned && lb != jl_bottom_type) {
+        if (vb->occurs_inv && (vb->tainted_inner || has_universal_typevar(lb, e)))
+            return wrap_tvar_env(lb, constrained);
         if (is_leaf_bound(lb)) {
             jl_value_t *marker = eq_pinned_envout_marker(u, vb, lb, new_tvar, constrained);
             if (marker)
@@ -3246,6 +3262,7 @@ static int equal_var(jl_tvar_t *v, jl_value_t *x, jl_stenv_t *e) JL_CANSAFEPOINT
     if (!vb->existential)
         return local_forall_exists_subtype(x, vb->lb, e, PARAM_INVARIANT, !jl_has_free_typevars(x)) &&
                local_forall_exists_subtype(vb->ub, x, e, PARAM_NONE, 0);
+    record_var_pin(vb, x, e, PARAM_INVARIANT);
     if (x != jl_bottom_type && vb->lb_certainty < e->bound_channel)
         vb->lb_certainty = e->bound_channel;
     if (vb->lb == x) {
@@ -6109,6 +6126,8 @@ static int merge_env(jl_stenv_t *e, jl_savedenv_t *me, jl_savedenv_t *se, int co
         // weakest contributor
         if (v->lb_spell < me->buf[m+6])
             me->buf[m+6] = v->lb_spell;
+        if (!v->pinned)
+            me->buf[m+7] = 0;
         m = m + JL_SAVEDENV_BYTES_PER_VAR;
         n = n + 3;
         v = v->prev;
