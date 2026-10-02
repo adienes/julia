@@ -63,6 +63,21 @@ New language features
 Language changes
 ----------------
 
+  - The implementation of non-scalar indexed assignment (`A[I...] = X`) now matches its
+    documentation, throwing `DimensionMismatch` on incompatible shapes that the previous
+    implementation would permit, and allowing non-1-based axes on the right-hand value (`X`)
+    that would previously have been forbidden ([#59025]).
+  - `Type{T} <: S` now holds only if every type `==` to `T` is an instance of `S`, fixing a
+    long-standing soundness hole where e.g. `Type{Int} <: DataType` held even though types like
+    `Tuple{S} where S<:Int` are `==` (and `isa`) their canonical spelling without being `DataType`s.
+    In particular `Type{T}` is no longer a subtype of any single kind: use a union of kinds instead
+    (e.g. `Type{Int} <: Union{DataType,UnionAll}` holds). `isa` and dispatch of type *values* are
+    unaffected, and a method on `Type{Int}` remains more specific than one on `DataType`
+    ([#33136], [#62141]).
+  - Introduced explicitly wrapping arithmetic operators `+%`, `-%`, `*%` to annotate arithmetic operations
+    that are semantically safe to wrap/overflow. Their behavior is currently identical to the default `+`, `-`, `*`
+    operators. However, in a future version, there may be opt-in support to detect unannotated wrapping
+    in the default operators ([#50790]).
 * `Type{T} <: S` now holds only if every type `==` to `T` is an instance of `S`, fixing a
   long-standing soundness hole where e.g. `Type{Int} <: DataType` held even though types like
   `Tuple{S} where S<:Int` are `==` (and `isa`) their canonical spelling without being `DataType`s.
