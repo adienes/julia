@@ -3544,3 +3544,13 @@ end
         end
     end
 end
+
+# `T` occurs invariantly only while `S`'s bound is checked against `Vector`, which doesn't pin it
+let (_, env) = intersection_env(Tuple{Vector{Vector}, Number}, Tuple{Vector{S}, T} where {T, S>:Vector{T}})
+    @test env[1] !== Number
+end
+# nor may its unpinned `Type{P}` bound reach a generator with `P` still free
+@generated pinned_sparam_gen(::Vector{S}, ::T) where {T, S>:Vector{T}} = Base.has_free_typevars(T)
+Base.@nospecializeinfer pinned_sparam_gen_caller(@nospecialize(x::Type)) = pinned_sparam_gen(Vector{Vector}(), x)
+Base.code_typed_by_type(Tuple{typeof(pinned_sparam_gen), Vector{Vector}, Type{P}} where P)
+@test !pinned_sparam_gen_caller(Int)
