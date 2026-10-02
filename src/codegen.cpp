@@ -3390,8 +3390,7 @@ static std::pair<bool, bool> uses_specsig(jl_value_t *abi, jl_method_instance_t 
         if ((size_t)jl_subtype_env_size(lam->def.method->sig) != jl_svec_len(lam->sparam_vals))
             needsparams = true;
         for (size_t i = 0; i < jl_svec_len(lam->sparam_vals); ++i) {
-            jl_value_t *sp = jl_svecref(lam->sparam_vals, i);
-            if (jl_is_svec(sp) || jl_has_free_typevars(sp))
+            if (!static_sparam_value(lam, i) && !jl_sparam_is_undef(lam, i))
                 needsparams = true;
         }
     }
@@ -6551,6 +6550,15 @@ static jl_cgval_t emit_sparam(jl_codectx_t &ctx, size_t i)
             return mark_julia_const(ctx, e);
         }
     }
+    jl_unionall_t *sparam = (jl_unionall_t*)ctx.linfo->def.method->sig;
+    for (size_t j = 0; j < i; j++) {
+        sparam = (jl_unionall_t*)sparam->body;
+        assert(jl_is_unionall(sparam));
+    }
+    if (jl_sparam_is_undef(ctx.linfo, i)) {
+        undef_var_error_ifnot(ctx, ConstantInt::getFalse(ctx.builder.getContext()), sparam->var->name, (jl_value_t*)jl_static_parameter_sym);
+        return jl_cgval_t();
+    }
     Value *bp = emit_ptrgep(ctx, maybe_decay_tracked(ctx, ctx.spvals_ptr), i * sizeof(jl_value_t*) + sizeof(jl_svec_t));
     jl_aliasinfo_t ai = ctx.alias().constant;
     Value *sp = ai.decorateInst(ctx.builder.CreateAlignedLoad(ctx.types().T_prjlvalue, bp, Align(sizeof(void*))));
@@ -6571,11 +6579,6 @@ static jl_cgval_t emit_sparam(jl_codectx_t &ctx, size_t i)
     spval->addIncoming(resolved, resolveBB);
     setName(ctx.emission_context, spval, "sparam_value");
     Value *isdef = ctx.builder.CreateICmpNE(spval, Constant::getNullValue(ctx.types().T_prjlvalue));
-    jl_unionall_t *sparam = (jl_unionall_t*)ctx.linfo->def.method->sig;
-    for (size_t j = 0; j < i; j++) {
-        sparam = (jl_unionall_t*)sparam->body;
-        assert(jl_is_unionall(sparam));
-    }
     undef_var_error_ifnot(ctx, isdef, sparam->var->name, (jl_value_t*)jl_static_parameter_sym);
     return mark_julia_type(ctx, spval, true, jl_any_type);
 }
@@ -6616,6 +6619,9 @@ static jl_cgval_t emit_isdefined(jl_codectx_t &ctx, jl_value_t *sym, int allow_i
             jl_value_t *e = jl_svecref(ctx.linfo->sparam_vals, i);
             if (jl_sparam_defined_value(e) != NULL) {
                 return mark_julia_const(ctx, jl_true);
+            }
+            if (jl_sparam_is_undef(ctx.linfo, i)) {
+                return mark_julia_const(ctx, jl_false);
             }
         }
         Value *bp = emit_ptrgep(ctx, maybe_decay_tracked(ctx, ctx.spvals_ptr), i * sizeof(jl_value_t*) + sizeof(jl_svec_t));
