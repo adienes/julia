@@ -2517,4 +2517,39 @@ let m = Module()
     @test store_cost == Compiler.T_FFUNC_COST[Compiler.find_tfunc(Core.setglobal_partition)]
     @test assign_cost == Compiler.T_FFUNC_COST[Compiler.find_tfunc(Core.setglobal!)]
 end
+
+# issue #63037: an abstract field type must not exclude a valid dispatch case.
+struct Holder63037
+    x::Matrix{S} where S<:(Union{Missing, U} where U<:Number)
+end
+f63037(::Array{Union{Missing, T}, N} where {N, T<:Number}) = 1
+g63037(h::Holder63037) = f63037(h.x)
+f63037_unbounded(::Array{Union{Missing, T}, N} where {N, T}) = 1
+g63037_unbounded(h::Holder63037) = f63037_unbounded(h.x)
+@testset "issue #63037" begin
+    A = Matrix{Union{Missing, Float64}}(undef, 1, 1)
+    h = Holder63037(A)
+    @test g63037(h) == 1
+    @test g63037_unbounded(h) == 1
+end
+
+# Dependent parameters must agree with inference on values and definedness, including after inlining and DCE.
+@noinline dependent_read(::Union{Nothing,T}, ::Ref{S}) where {T,S>:T} = S
+@inline dependent_lower(::T, ::Ref{S}) where {T>:Int,S>:T} = S
+dependent_lower_caller(r) = dependent_lower(1, r)
+@noinline dependent_leaf(::Union{Nothing,S}, ::Ref{T}) where {T,S>:Type{T}} = S
+dependent_leaf_catch(r) = try dependent_leaf(nothing, r); 1 catch err; err end
+@noinline dependent_open(::Type{T}, ::Type{S}) where {T,S>:T} = (T, S)
+dependent_open_catch(t, s) = try dependent_open(t, s) catch err; err end
+@noinline dependent_widen(::T, ::T, ::Ref{S}) where {T,S>:T} = S
+@testset "dependent static parameters" begin
+    @test dependent_read(nothing, Ref{Integer}(1)) === Integer
+    @test dependent_lower_caller(Ref{Integer}(1)) === Integer
+    @test dependent_leaf_catch(Ref(1)) isa UndefVarError
+    tv = TypeVar(:X)
+    open = Union{Int, tv}
+    @test dependent_open_catch(Int, open) === (Int, open)
+    @test (@inferred dependent_widen(Int, Int, Ref{Union{Int,Type{Int}}}(1))) === Union{Int,Type{Int}}
+end
+
 end # module inline_tests

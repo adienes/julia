@@ -2536,7 +2536,7 @@ end
 @test string(Union{Nothing, Number, Vector}) == "Union{Nothing, Number, Vector}"
 @test string(Union{Nothing, Number, Vector{<:Integer}}) == "Union{Nothing, Number, Vector{<:Integer}}"
 @test string(Union{Nothing, AbstractVecOrMat}) == "Union{Nothing, AbstractVecOrMat}"
-@test string(Union{Nothing, AbstractVecOrMat{<:Integer}}) == "Union{Nothing, AbstractVecOrMat{<:Integer}}"
+@test string(Union{Nothing, AbstractVecOrMat{<:Integer}}) == "Union{Nothing, AbstractVecOrMat{T} where T<:Integer}"
 @test string(M37012.BStruct{T, T} where T) == "$(curmod_prefix)M37012.B2{T, T} where T"
 @test string(M37012.BStruct{T, S} where {T<:Unsigned, S<:Signed}) == "$(curmod_prefix)M37012.B2{S, T} where {T<:Unsigned, S<:Signed}"
 @test string(M37012.BStruct{T, S} where {T<:Signed, S<:T}) == "$(curmod_prefix)M37012.B2{S, T} where {T<:Signed, S<:T}"
