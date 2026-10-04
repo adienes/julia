@@ -66,7 +66,7 @@ SRCS := \
 	dlload sys init task array genericmemory staticdata toplevel jl_uv datatype \
 	simplevector runtime_intrinsics precompile jloptions mtarraylist \
 	threading scheduler stackwalk static_exports \
-	method jlapi signal-handling safepoint timing subtype rtutils \
+	method jlapi signal-handling safepoint timing subtype intersection rtutils \
 	crc32c APInt processor ircode opaque_closure codegen-stubs coverage runtime_ccall engine \
 	$(GC_SRCS)
 

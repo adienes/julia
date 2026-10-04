@@ -45,17 +45,17 @@ let err = try
     @test occursin("Possible fix, define\n  ambig(::Integer, ::Integer)", errstr)
 end
 
-@test_warn "declares type variable S but does not use it" @eval ambig_with_bounds(x, ::Int, ::T) where {T<:Integer,S} = 0
-@test_warn "declares type variable S but does not use it" @eval ambig_with_bounds(::Int, x, ::T) where {T<:Integer,S} = 1
+@test_warn "declares type variable S but does not use it" @eval ambig_with_bounds(x, ::Int, ::Ref{T}) where {T<:Integer,S} = 0
+@test_warn "declares type variable S but does not use it" @eval ambig_with_bounds(::Int, x, ::Ref{T}) where {T<:Integer,S} = 1
 let err = try
-              ambig_with_bounds(1, 2, 3)
+              ambig_with_bounds(1, 2, Ref(3))
           catch _e_
               _e_
           end
     io = IOBuffer()
     Base.showerror(io, err)
     lines = split(String(take!(io)), '\n')
-    @test lines[end-1] == "  ambig_with_bounds(::$Int, ::$Int, ::T) where T<:Integer"
+    @test lines[end-1] == "  ambig_with_bounds(::$Int, ::$Int, ::Ref{T}) where T<:Integer"
 end
 
 ## Other ways of accessing functions

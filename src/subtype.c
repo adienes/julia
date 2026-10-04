@@ -6360,6 +6360,21 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 
 // type intersection entry points
 
+JL_DLLEXPORT int jl_typeeq_meets_kind(jl_value_t *x, jl_value_t *k) JL_CANSAFEPOINT
+{
+    if (jl_has_free_typevars(x))
+        return jl_subtype(jl_typeof(x), k);
+    return typeeq_mask_meets(typeeq_kind_mask(x), k);
+}
+
+static int type_meet_enabled(void) JL_NOTSAFEPOINT
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("JULIA_TYPE_MEET") != NULL;
+    return enabled;
+}
+
 static jl_value_t *intersect_types(jl_value_t *x, jl_value_t *y, int emptiness_only) JL_CANSAFEPOINT
 {
     jl_stenv_t e;
@@ -6372,6 +6387,11 @@ static jl_value_t *intersect_types(jl_value_t *x, jl_value_t *y, int emptiness_o
             return y;
         else
             return jl_bottom_type;
+    }
+    if (type_meet_enabled()) {
+        jl_value_t *m = jl_type_meet(x, y);
+        if (m != NULL)
+            return m;
     }
     init_stenv(&e, NULL, 0);
     e.intersection = 1;
@@ -6554,15 +6574,20 @@ jl_value_t *jl_type_intersection_env_s(jl_value_t *a, jl_value_t *b, jl_svec_t *
         // having failed, the intersection must be empty.
         if (jl_is_dispatch_tupletype(a) || jl_is_dispatch_tupletype(b))
             goto bot;
-        jl_stenv_t e;
-        init_stenv(&e, NULL, 0);
-        e.intersection = 1;
-        e.envout = env;
-        if (szb)
-            memset(env, 0, szb*sizeof(void*));
-        e.envsz = szb;
-        *ans = intersect_all(a, b, &e);
-        free_stenv(&e);
+        *ans = NULL;
+        if (type_meet_enabled() && !(szb > 0 && jl_types_equal(b, (jl_value_t*)jl_type_type)))
+            *ans = jl_type_meet_unrelated(a, b);
+        if (*ans == NULL) {
+            jl_stenv_t e;
+            init_stenv(&e, NULL, 0);
+            e.intersection = 1;
+            e.envout = env;
+            if (szb)
+                memset(env, 0, szb*sizeof(void*));
+            e.envsz = szb;
+            *ans = intersect_all(a, b, &e);
+            free_stenv(&e);
+        }
         if (*ans == jl_bottom_type) goto bot;
         // TODO: code dealing with method signatures is not able to handle unions, so if
         // `a` and `b` are both tuples, we need to be careful and may not return a union,
