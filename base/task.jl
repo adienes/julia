@@ -26,6 +26,9 @@ end
 
 CapturedException(ex) = CapturedException(ex, Any[], ExceptionStack())
 
+CapturedException(ex, bt::Backtrace) =
+    CapturedException(ex, stacktrace(bt))
+
 CapturedException(ex, bt_raw::Vector) =
     CapturedException(ex, stacktrace(bt_raw))
 

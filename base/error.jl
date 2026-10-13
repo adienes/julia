@@ -80,7 +80,18 @@ struct InterpreterIP
 end
 
 const BacktraceEntry = Union{Ptr{Cvoid}, InterpreterIP}
-const Backtrace = Array{<:BacktraceEntry, 1}
+
+"""
+    Backtrace
+
+An opaque buffer of raw backtrace entries, as returned by [`backtrace`](@ref)
+and [`catch_backtrace`](@ref). Look up the program locations it describes with
+[`StackTraces.stacktrace`](@ref), or display them directly by `show`ing it.
+"""
+struct Backtrace <: AbstractArray{BacktraceEntry, 1}
+    entries::Array{BacktraceEntry, 1}
+end
+Backtrace() = Backtrace(BacktraceEntry[])
 
 # convert dual arrays (raw bt buffer, array of GC managed values) to a single
 # array of locations
@@ -113,7 +124,7 @@ function _reformat_bt(bt::Array{Ptr{Cvoid},1}, bt2::Array{Any,1})
         j += Int(njlvalues)
         i += 2 + Int(njlvalues + nuintvals)
     end
-    ret
+    Backtrace(ret)
 end
 
 """

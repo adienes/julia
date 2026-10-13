@@ -288,9 +288,9 @@ end
     nothing
 end
 
-firstcaller(bt::Vector, ::Nothing) = Ptr{Cvoid}(0), StackTraces.UNKNOWN
-firstcaller(bt::Vector, funcsym::Symbol) = firstcaller(bt, (funcsym,))
-function firstcaller(bt::Vector, funcsyms)
+firstcaller(bt::Backtrace, ::Nothing) = Ptr{Cvoid}(0), StackTraces.UNKNOWN
+firstcaller(bt::Backtrace, funcsym::Symbol) = firstcaller(bt, (funcsym,))
+function firstcaller(bt::Backtrace, funcsyms)
     # Identify the calling line
     found = false
     for ip in bt

@@ -13,6 +13,7 @@ public
     AbstractOneTo,
     AbstractPipe,
     AsyncCondition,
+    Backtrace,
     CodeUnits,
     Event,
     Fix,

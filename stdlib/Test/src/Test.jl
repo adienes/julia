@@ -96,7 +96,7 @@ function scrub_backtrace(bt, file_ts, file_t)
 end
 
 function scrub_exc_stack(stack, file_ts, file_t)
-    return Any[ (x[1], scrub_backtrace(x[2]::Vector{Union{Ptr{Nothing},Base.InterpreterIP}}, file_ts, file_t)) for x in stack ]
+    return Any[ (x[1], scrub_backtrace(x[2]::Base.Backtrace, file_ts, file_t)) for x in stack ]
 end
 
 # define most of the test infrastructure without type specialization

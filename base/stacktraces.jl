@@ -251,13 +251,13 @@ function lookup(ip::Base.InterpreterIP)
 end
 
 """
-    stacktrace([trace::Vector{Ptr{Cvoid}},] [c_funcs::Bool=false])::StackTrace
+    stacktrace([trace::Backtrace,] [c_funcs::Bool=false])::StackTrace
 
 Return a stack trace in the form of a vector of `StackFrame`s. (By default stacktrace
 doesn't return C functions, but this can be enabled.) When called without specifying a
 trace, `stacktrace` first calls `backtrace`.
 """
-Base.@constprop :none function stacktrace(trace::Base.Backtrace, c_funcs::Bool=false)
+Base.@constprop :none function stacktrace(trace::Vector{<:Base.BacktraceEntry}, c_funcs::Bool=false)
     stack = StackTrace()
     for ip in trace
         for frame in lookup(ip)
@@ -269,6 +269,8 @@ Base.@constprop :none function stacktrace(trace::Base.Backtrace, c_funcs::Bool=f
     end
     return stack
 end
+
+stacktrace(bt::Base.Backtrace, c_funcs::Bool=false) = stacktrace(bt.entries, c_funcs)
 
 Base.@constprop :none function stacktrace(c_funcs::Bool=false)
     stack = stacktrace(backtrace(), c_funcs)

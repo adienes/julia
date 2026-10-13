@@ -1119,6 +1119,8 @@ Stacktrace processing pipeline:
 
 =#
 
+show_backtrace(io::IO, bt::Backtrace; prefix = nothing) = show_backtrace(io, bt.entries; prefix)
+
 function show_backtrace(io::IO, t::Vector; prefix = nothing)
     if haskey(io, :last_shown_line_infos)
         empty!(io[:last_shown_line_infos])
@@ -1591,6 +1593,27 @@ function _UndefVarError_warnfor(io::IO, modules, var::Symbol)
 end
 
 Base.Experimental.register_error_hint(UndefVarError_hint, UndefVarError)
+
+# Backtrace implementation
+size(bt::Backtrace) = size(bt.entries)
+getindex(bt::Backtrace, i::Int) = bt.entries[i]
+getindex(bt::Backtrace, r::AbstractUnitRange{<:Integer}) = Backtrace(bt.entries[r])
+setindex!(bt::Backtrace, v, i::Int) = (bt.entries[i] = v; bt)
+push!(bt::Backtrace, ip) = (push!(bt.entries, ip); bt)
+pop!(bt::Backtrace) = pop!(bt.entries)
+empty!(bt::Backtrace) = (empty!(bt.entries); bt)
+resize!(bt::Backtrace, n::Integer) = (resize!(bt.entries, n); bt)
+deleteat!(bt::Backtrace, inds) = (deleteat!(bt.entries, inds); bt)
+keepat!(bt::Backtrace, inds) = (keepat!(bt.entries, inds); bt)
+copy(bt::Backtrace) = Backtrace(copy(bt.entries))
+
+function show(io::IO, ::MIME"text/plain", bt::Backtrace)
+    print(io, length(bt.entries), "-entry Backtrace")
+    isempty(bt.entries) && return
+    print(io, ":")
+    show_backtrace(io, bt)
+end
+show(io::IO, bt::Backtrace) = print(io, length(bt.entries), "-entry Backtrace")
 
 # ExceptionStack implementation
 size(s::ExceptionStack) = size(s.stack)
