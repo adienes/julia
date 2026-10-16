@@ -2230,6 +2230,10 @@ end
     for T = (Base.OneTo{Int}, UnitRange{Int}, StepRange{Int,Int}, StepRangeLen{Int}, LinRange{Int})
         @test eltype(T(1:5)) === eltype(T(1:5)[1:2])
     end
+    @test (UInt(0):UInt(2):UInt(10))[3:-1:1] === UInt(4):-2:UInt(0)
+    let h = typemax(Int) ÷ 2 + 1
+        @test_throws OverflowError (-h:h:h)[1:2:3]
+    end
 end
 
 @testset "Type-stable intersect (#32410)" begin

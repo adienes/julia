@@ -38,6 +38,9 @@ _range_wrapping_sub(x, y) = x - y
 _range_wrapping_mul(x::_RangeWrappingInteger, y::_RangeWrappingInteger) = x *% y
 _range_wrapping_mul(x, y) = x * y
 
+_signed_int(x::Unsigned) = convert(signed(promote_type(typeof(x), Int)), x)
+_signed_int(x) = x
+
 """
     (:)(start, [step], stop)
 
@@ -1010,6 +1013,9 @@ function _empty_stop(start, step)
     throw(OverflowError(LazyString("cannot represent an empty range starting at ", start)))
 end
 
+_range_checked_mul(x::Integer, y::Integer) = checked_mul(x, y)
+_range_checked_mul(x, y) = x * y
+
 function getindex(r::AbstractUnitRange, s::AbstractUnitRange{T}) where {T<:Integer}
     @inline
     @boundscheck checkbounds(r, s)
@@ -1063,9 +1069,9 @@ function getindex(r::StepRange, s::AbstractRange{T}) where {T<:Integer}
     else
         f = r.start
         fs = first(s)
-        st = r.step
+        st = _signed_int(r.step)
         start = oftype(f, f + (fs - firstindex(r)) * st)
-        st *= step(s)
+        st = _range_checked_mul(st, step(s))
         len = length(s)
         stop = oftype(f, isempty(s) ? _empty_stop(start, st) : start + (len - oneunit(len)) * st)
         return range(start, stop; step=st)
