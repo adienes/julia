@@ -514,8 +514,7 @@ function getindex(r::StepRangeLen{T,<:TwicePrecision,<:TwicePrecision}, s::Ordin
             return StepRangeLen{T}(last(r), step(r), oneunit(L), oneunit(L))
         end
     else
-        soffset = round(L, (r.offset - first(s))/sstep + 1)
-        soffset = clamp(soffset, oneunit(L), len)
+        soffset = _closest_offset(r.offset, s, len)
         ioffset = L(first(s) + (soffset - oneunit(L)) * sstep)
         if sstep == 1 || len < 2
             newstep = rstep #* one(sstep)
@@ -523,7 +522,6 @@ function getindex(r::StepRangeLen{T,<:TwicePrecision,<:TwicePrecision}, s::Ordin
             newstep = rstep * sstep
             newstep = twiceprecision(newstep, nbitslen(T, len, soffset))
         end
-        soffset = max(oneunit(L), soffset)
         if ioffset == r.offset
             return StepRangeLen{T}(r.ref, newstep, len, soffset)
         else

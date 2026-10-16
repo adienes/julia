@@ -2093,6 +2093,7 @@ end
 
 @testset "getindex" begin
     @test getindex((typemax(UInt64)//one(UInt64):typemax(UInt64)//one(UInt64)), 1) == typemax(UInt64)//one(UInt64)
+    @test StepRangeLen(0, 1, typemax(Int), typemax(Int))[1:3] == (1:3) .- typemax(Int)
 end
 
 @testset "Issue #30006" begin
@@ -2716,6 +2717,7 @@ end
 @testset "unsigned index #44895" begin
     x = range(-1,1,length=11)
     @test x[UInt(1)] == -1.0
+    @test x[UInt(7):UInt(9)] == x[7:9]
     a = StepRangeLen(1,2,3,2)
     @test a[UInt(1)] == -1
 end

@@ -1062,6 +1062,15 @@ function getindex(r::StepRange, s::AbstractRange{T}) where {T<:Integer}
     end
 end
 
+function _closest_offset(o, s::OrdinalRange, len)
+    @inline
+    f, l, st = first(s), last(s), step(s)
+    up = st > zero(st)
+    (up ? o <= f : o >= f) && return oneunit(len)
+    (up ? o >= l : o <= l) && return max(len, oneunit(len))
+    return oftype(len, 1 + @inline div(up ? o - f : f - o, uabs(st), RoundNearest))
+end
+
 function getindex(r::StepRangeLen{T}, s::OrdinalRange{S}) where {T, S<:Integer}
     @inline
     @boundscheck checkbounds(r, s)
@@ -1084,9 +1093,7 @@ function getindex(r::StepRangeLen{T}, s::OrdinalRange{S}) where {T, S<:Integer}
             return StepRangeLen{T}(last(r), rstep, oneunit(L), oneunit(L))
         end
     else
-        # Find closest approach to offset by s
-        ind = LinearIndices(s)
-        offset = L(max(min(1 + round(L, (r.offset - first(s))/sstep), last(ind)), first(ind)))
+        offset = _closest_offset(r.offset, s, len)
         ref = _getindex_hiprec(r, first(s) + (offset - oneunit(offset)) * sstep)
         return StepRangeLen{T}(ref, rstep*sstep, len, offset)
     end
