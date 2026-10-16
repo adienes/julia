@@ -2197,6 +2197,7 @@ end
     for T = (Base.OneTo{Int}, UnitRange{Int}, StepRange{Int,Int}, StepRangeLen{Int}, LinRange{Int})
         @test eltype(T(1:5)) === eltype(T(1:5)[1:2])
     end
+    @test (UInt(0):UInt(2):UInt(10))[3:-1:1] === UInt(4):-2:UInt(0)
 end
 
 @testset "Type-stable intersect (#32410)" begin
