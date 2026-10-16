@@ -1441,8 +1441,8 @@ let a = Tuple{T1,Val{T2},T2} where T2 where T1,
     I2 = typeintersect(b, a)
     @test I1 <: I2
     @test I2 <: I1
-    @test_broken I1 <: a
-    @test_broken I2 <: a
+    @test I1 <: a
+    @test I2 <: a
     @test I1 <: b
     @test I2 <: b
 end
@@ -1452,8 +1452,8 @@ let a = Tuple{T1,Val{T2},T2} where T2 where T1,
     I2 = typeintersect(b, a)
     @test I1 <: I2
     @test I2 <: I1
-    @test_broken I1 <: a
-    @test_broken I2 <: a
+    @test I1 <: a
+    @test I2 <: a
     @test I1 <: b
     @test I2 <: b
 end
@@ -2693,8 +2693,29 @@ let A = W61602{T, 1} where T<:(Union{Missing, S} where S),
     @test !(Tuple{C, String} <: E)
     @test Tuple{C, Int64} <: typeintersect(D, E)
     @test Tuple{C, Int64} <: typeintersect(E, D)
-    @test_broken !(Tuple{C, String} <: typeintersect(D, E))
-    @test_broken !(Tuple{C, String} <: typeintersect(E, D))
+    @test !(Tuple{C, String} <: typeintersect(D, E))
+    @test !(Tuple{C, String} <: typeintersect(E, D))
+end
+
+let A = Tuple{Tuple{T1, T1}, Real, T2} where {T1>:Float64, T2>:Int},
+    B = Tuple{Tuple{S1, S1}, Any, Tuple{S1, S1}} where S1
+    @test !(Tuple{Tuple{Int, Int}, Real, Tuple{Int, Int}} <: typeintersect(A, B))
+end
+let A = Tuple{X, Y, Y} where {X, Y},
+    B = Tuple{S, S2, S} where {S, S2}
+    @test !(Tuple{Float64, Int, Int} <: typeintersect(A, B))
+end
+let A = Tuple{Tuple{T1, T1}, Real, T1, Vararg{Tuple{Tuple{T1}, Ref{T1}, Tuple{Any, Float64}}}} where T1<:Integer,
+    B = Tuple{Tuple{S2, S1}, S1, S1, Vararg{Tuple{Tuple{Int, S1}, Val{S1}, String}}} where {S1, S2<:Integer}
+    @test Tuple{Tuple{Int, Integer}, Real, Integer} <: typeintersect(B, A)
+end
+let A = Tuple{T1, T1, Val{T1}, Real} where T1,
+    B = Tuple{S2, Tuple{Tuple{S2}}, Any, S1} where {S1, S2<:S1}
+    @test !(Tuple{Int, Tuple{Tuple{Float64}}, Val{Any}, Real} <: typeintersect(B, A))
+end
+let A = Tuple{T3, Vararg{T2}} where {T1, T2, T3<:T1},
+    B = Tuple{S1, Vararg{Tuple{Val{S2}, Int, Any}}} where {S1<:Number, S2<:S1}
+    @test !(Tuple{String} <: typeintersect(B, A))
 end
 
 # try to fool a greedy algorithm that picks X=Int, Y=String here

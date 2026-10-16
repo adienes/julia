@@ -1203,6 +1203,13 @@ static jl_value_t *intersect_aside(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, 
 
 static int reachable_var(jl_value_t *x, jl_tvar_t *y, jl_stenv_t *e);
 
+static int bound_fits(jl_value_t *inner, jl_value_t *outer) JL_CANSAFEPOINT
+{
+    if (outer == (jl_value_t*)jl_any_type || inner == outer)
+        return 1;
+    return !jl_has_free_typevars(inner) && !jl_has_free_typevars(outer) && jl_subtype(inner, outer);
+}
+
 static int singleton_typevar_subtype(jl_tvar_t *v, jl_value_t *a) JL_NOTSAFEPOINT
 {
     if (a == (jl_value_t*)v || a == (jl_value_t*)jl_any_type)
@@ -4968,7 +4975,9 @@ static jl_value_t *finish_unionall(jl_value_t *res JL_MAYBE_UNROOTED, jl_varbind
                 else
                     *btemp->ub = iub;
             }
-            else if (iub == (jl_value_t*)vb->var) {
+            else if (iub == (jl_value_t*)vb->var &&
+                     (vb->concrete || vb->body_occurs_inv <= 0 || jl_has_free_typevars(vb->lb) ||
+                      jl_has_free_typevars(vb->ub) || !bound_fits(vb->ub, ivar->ub))) {
                 // TODO: this loses some constraints, such as in this test, where we replace T4<:S3 (e.g. T4==S3 since T4 only appears covariantly once) with T4<:Any
                 // a = Tuple{Float64,T3,T4} where T4 where T3
                 // b = Tuple{S2,Tuple{S3},S3} where S2 where S3
@@ -6060,7 +6069,9 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_par
             assert(e->Loffset == 0);
             record_var_occurrence(xx, e, param);
             record_var_occurrence(yy, e, param);
-            if (xx && yy && ((xx->concrete && !yy->concrete) || (xx->lb == xx->ub && xx->lb == y))) {
+            if (xx && yy && ((xx->concrete && !yy->concrete) || (xx->lb == xx->ub && xx->lb == y) ||
+                             (param == PARAM_COVARIANT && xx->constraintkind == 1 && yy->constraintkind == 0 &&
+                              bound_fits(yy->ub, xx->ub)))) {
                 return intersect_var((jl_tvar_t*)x, y, e, R, param);
             }
             return intersect_var((jl_tvar_t*)y, x, e, !R, param);
