@@ -1080,7 +1080,7 @@ end
 function _copyto_checked!(dest::AbstractArray, src::AbstractArray)
     @_propagate_inbounds_meta
     if _is_storage_pair(_unwrap_contiguous(dest)[1], _unwrap_contiguous(src)[1])
-        return _copyto_dense!(dest, src)
+        return _copyto2arg!(dest, src)
     end
     src′ = unalias(dest, src)
     return copyto_unaliased!(_copyto_style(dest, src′), dest, src′)
@@ -1182,10 +1182,12 @@ function _copyto_loops!(deststyle::IndexStyle, dest::AbstractArray, srcstyle::In
     Δi = idf - isf
     if deststyle isa IndexLinear
         if srcstyle isa IndexLinear
+            # Single-index implementation
             @inbounds for i in srcinds
                 dest[i + Δi] = src[i]
             end
         else
+            # Dual-index implementation
             i = idf - 1
             @inbounds for a in src
                 dest[i+=1] = a
@@ -1194,10 +1196,12 @@ function _copyto_loops!(deststyle::IndexStyle, dest::AbstractArray, srcstyle::In
     else
         iterdest, itersrc = eachindex(dest), eachindex(src)
         if iterdest == itersrc
+            # Shared-iterator implementation
             for I in iterdest
                 @inbounds dest[I] = src[I]
             end
         else
+            # Dual-iterator implementation
             for (Idest, Isrc) in zip(iterdest, itersrc)
                 @inbounds dest[Idest] = src[Isrc]
             end

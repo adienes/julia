@@ -279,10 +279,16 @@ function unsafe_copyto!(dest::Array, doffs, src::Array, soffs, n)
     return dest
 end
 
-# Outlining this because otherwise a catastrophic inference slowdown
-# occurs, see discussion in #27874.
-# It is also mitigated by using a constant string.
-_throw_argerror(s) = (@noinline; throw(ArgumentError(s)))
+copyto!(dest::Array, doffs::Integer, src::Array, soffs::Integer, n::Integer) =
+    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
+copyto!(dest::Array, doffs::Integer, src::Memory, soffs::Integer, n::Integer) =
+    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
+copyto!(dest::Memory, doffs::Integer, src::Array, soffs::Integer, n::Integer) =
+    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
+
+# this is only needed to avoid possible ambiguities with methods added in some packages
+copyto!(dest::Array{T}, doffs::Integer, src::Array{T}, soffs::Integer, n::Integer) where {T} =
+    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
 
 function _check_copyto_args(dest, doffs, src, soffs, n)
     @inline
@@ -293,24 +299,6 @@ function _check_copyto_args(dest, doffs, src, soffs, n)
     @boundscheck n <= lastindex(src) - soffs + 1 || throw(BoundsError(src, lastindex(src) + 1))
     return nothing
 end
-
-copyto!(dest::Array, doffs::Integer, src::Array, soffs::Integer, n::Integer) =
-    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
-copyto!(dest::Array, doffs::Integer, src::Memory, soffs::Integer, n::Integer) =
-    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
-copyto!(dest::Memory, doffs::Integer, src::Array, soffs::Integer, n::Integer) =
-    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
-copyto!(dest::Array{T}, doffs::Integer, src::Array{T}, soffs::Integer, n::Integer) where {T} =
-    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
-
-copyto!(dest::Array, src::Array) = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
-copyto!(dest::Array, src::Memory) = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
-copyto!(dest::Memory, src::Array) = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
-copyto!(dest::Array{T}, src::Array{T}) where {T} = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
-copyto!(dest::Array{T}, src::Memory{T}) where {T} = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
-copyto!(dest::Memory{T}, src::Array{T}) where {T} = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
-
-_copyto_dense!(dest, src) = (@_propagate_inbounds_meta; copyto!(dest, firstindex(dest), src, firstindex(src), length(src)))
 
 function _copyto_ranged!(dest::AbstractArray, doffs::Integer, src::AbstractArray, soffs::Integer, n::Integer)
     @_propagate_inbounds_meta
@@ -330,6 +318,22 @@ function _copyto_storage!(dest::Union{Array,Memory}, doffs::Int, src::Union{Arra
     end
     return dest
 end
+
+# Outlining this because otherwise a catastrophic inference slowdown
+# occurs, see discussion in #27874.
+# It is also mitigated by using a constant string.
+_throw_argerror(s) = (@noinline; throw(ArgumentError(s)))
+
+_copyto2arg!(dest, src) = (@_propagate_inbounds_meta; copyto!(dest, firstindex(dest), src, firstindex(src), length(src)))
+
+copyto!(dest::Array, src::Array) = (@_propagate_inbounds_meta; _copyto2arg!(dest, src))
+copyto!(dest::Array, src::Memory) = (@_propagate_inbounds_meta; _copyto2arg!(dest, src))
+copyto!(dest::Memory, src::Array) = (@_propagate_inbounds_meta; _copyto2arg!(dest, src))
+
+# also to avoid ambiguities in packages
+copyto!(dest::Array{T}, src::Array{T}) where {T} = (@_propagate_inbounds_meta; _copyto2arg!(dest, src))
+copyto!(dest::Array{T}, src::Memory{T}) where {T} = (@_propagate_inbounds_meta; _copyto2arg!(dest, src))
+copyto!(dest::Memory{T}, src::Array{T}) where {T} = (@_propagate_inbounds_meta; _copyto2arg!(dest, src))
 
 # N.B: This generic definition in for multidimensional arrays is here instead of
 # `multidimensional.jl` for bootstrapping purposes.
