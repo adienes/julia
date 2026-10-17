@@ -289,6 +289,101 @@ end
     @test copyto!(a, 2:3, 1:1, a, 1:2, 1:1) == [1;1:2;]
 end
 
+struct BoolFlag
+    b::Bool
+end
+Base.convert(::Type{Bool}, x::BoolFlag) = x.b
+
+struct CopyLog <: AbstractVector{Int}
+    data::Vector{Int}
+end
+Base.size(a::CopyLog) = size(a.data)
+Base.getindex(a::CopyLog, i::Int) = a.data[i]
+Base.setindex!(a::CopyLog, x, i::Int) = (a.data[i] = x; a)
+Base.dataids(a::CopyLog) = Base.dataids(a.data)
+Base.unaliascopy(a::CopyLog) = CopyLog(copy(a.data))
+
+struct OtherLog <: AbstractVector{Int}
+    data::Vector{Int}
+end
+Base.size(a::OtherLog) = size(a.data)
+Base.getindex(a::OtherLog, i::Int) = a.data[i]
+Base.setindex!(a::OtherLog, x, i::Int) = (a.data[i] = x; a)
+
+const copylog_calls = Any[]
+struct CopyLogStyle <: Base.CopyToStyle end
+struct OtherLogStyle <: Base.CopyToStyle end
+Base.CopyToStyle(::Type{CopyLog}) = CopyLogStyle()
+Base.CopyToStyle(::Type{OtherLog}) = OtherLogStyle()
+function Base.copyto_unaliased!(::CopyLogStyle, dest::AbstractArray, src::AbstractArray)
+    push!(copylog_calls, (:whole, dest, src))
+    return Base.copyto_unaliased!(Base.DefaultCopyToStyle(), dest, src)
+end
+function Base.copyto_unaliased!(::CopyLogStyle, dest::AbstractArray, Rdest, src::AbstractArray, Rsrc)
+    push!(copylog_calls, (:region, Rdest, Rsrc))
+    return Base.copyto_unaliased!(Base.DefaultCopyToStyle(), dest, Rdest, src, Rsrc)
+end
+
+@testset "CopyToStyle" begin
+    empty!(copylog_calls)
+    @test copyto!(CopyLog(zeros(Int, 4)), [1, 2, 3]) == [1, 2, 3, 0]
+    @test copylog_calls[end][1] === :whole
+    @test copyto!(zeros(Int, 4), CopyLog([1, 2, 3])) == [1, 2, 3, 0]
+    @test copylog_calls[end][1] === :whole
+    @test collect(CopyLog([1, 2])) == [1, 2]
+    @test copylog_calls[end][1] === :whole
+    @test copyto!(CopyLog(zeros(Int, 5)), 2, [1, 2, 3], 1, 3) == [0, 1, 2, 3, 0]
+    @test copylog_calls[end] == (:region, 2:4, 1:3)
+    @test copyto!(CopyLog(zeros(Int, 3)), CartesianIndices((2:3,)), [1, 2], CartesianIndices((1:2,))) == [0, 1, 2]
+    @test copylog_calls[end] == (:region, CartesianIndices((2:3,)), CartesianIndices((1:2,)))
+
+    empty!(copylog_calls)
+    @test copyto!(CopyLog([1, 2]), Int[]) == [1, 2]
+    @test copyto!(CopyLog([1, 2]), 1, Int[], 1, 0) == [1, 2]
+    @test isempty(copylog_calls)
+    @test_throws BoundsError copyto!(CopyLog([1, 2]), [1, 2, 3])
+    @test_throws ArgumentError copyto!(CopyLog([1, 2]), 1, [1], 1, -1)
+    @test isempty(copylog_calls)
+
+    x = CopyLog([1, 2, 3, 4])
+    @test copyto!(x, 2, x, 1, 3) == [1, 1, 2, 3]
+    @test copylog_calls[end][1] === :region
+
+    empty!(copylog_calls)
+    @test copyto!(OtherLog(zeros(Int, 2)), CopyLog([1, 2])) == [1, 2]
+    @test isempty(copylog_calls)
+    @test copyto!(CopyLog(zeros(Int, 2)), CopyLog([1, 2])) == [1, 2]
+    @test copylog_calls[end][1] === :whole
+
+    let a = PermutedDimsArray(zeros(3, 3), (2, 1))
+        @test copyto!(a, ones(2, 2)) == copyto!(zeros(3, 3), ones(2, 2))
+    end
+    let a = PermutedDimsArray(zeros(2, 3), (2, 1))
+        @test copyto!(a, reshape(1:6, 3, 2)) == reshape(1:6, 3, 2)
+    end
+
+    let b = falses(70)
+        @test copyto!(b, trues(65)) == [trues(65); falses(5)]
+        @test copyto!(falses(5), view(trues(10), 2:6)) == trues(5)
+        @test copyto!(falses(4), Bool[1, 0, 1]) == [true, false, true, false]
+        @test copyto!(falses(4), PermutedDimsArray(Bool[1 0; 1 1], (2, 1))) == [true, false, true, true]
+        @test copyto!(zeros(Bool, 3), BitVector([true, false, true])) == [true, false, true]
+        flags = [BoolFlag(true), BoolFlag(false)]
+        @test copyto!(falses(2), view(flags, :)) == [true, false]
+        @test copyto!(falses(3), 2, view(flags, :), 1, 2) == [false, true, false]
+    end
+end
+
+Base.CopyToStyle(::OtherLogStyle, ::CopyLogStyle) = CopyLogStyle()
+
+@testset "CopyToStyle rules" begin
+    empty!(copylog_calls)
+    @test copyto!(OtherLog(zeros(Int, 2)), CopyLog([1, 2])) == [1, 2]
+    @test copylog_calls[end][1] === :whole
+    @test copyto!(CopyLog(zeros(Int, 2)), OtherLog([1, 2])) == [1, 2]
+    @test length(copylog_calls) == 1
+end
+
 @testset "`deepcopy` a `GenericCondition`" begin
     a = Base.GenericCondition(ReentrantLock())
     # Test printing

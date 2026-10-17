@@ -292,18 +292,12 @@ end
 
 struct PermutedDimsCopyToStyle <: Base.CopyToStyle end
 Base.CopyToStyle(::Type{<:PermutedDimsArray}) = PermutedDimsCopyToStyle()
-# Wins as dest via the base LHS-wins combination rule — no explicit rule needed.
 
-Base.@propagate_inbounds function Base._copyto!(::PermutedDimsCopyToStyle, dest::PermutedDimsArray{T,N}, src::AbstractArray{S,N}) where {T,S,N}
-    @boundscheck checkbounds(dest, axes(src)...)
-    src = Base.unalias(dest, src)
-    _copy!(dest, src)
-    return dest
-end
-# Different-N: fall through to generic algorithm (via Default style dispatch).
-# The public 2-arg `copyto!` already did isempty + length checks.
-Base.@propagate_inbounds function Base._copyto!(::PermutedDimsCopyToStyle, dest::PermutedDimsArray, src::AbstractArray)
-    Base._copyto!(Base.DefaultCopyToStyle(), dest, src)
+function Base.copyto_unaliased!(::PermutedDimsCopyToStyle, dest::AbstractArray, src::AbstractArray)
+    if dest isa PermutedDimsArray && axes(dest) == axes(src)
+        return _copy!(dest, src)
+    end
+    return Base.copyto_unaliased!(Base.DefaultCopyToStyle(), dest, src)
 end
 
 function _copy!(P::PermutedDimsArray{T,N,perm}, src) where {T,N,perm}
@@ -314,8 +308,7 @@ function _copy!(P::PermutedDimsArray{T,N,perm}, src) where {T,N,perm}
         d += 1
     end
     if d == ndims(src)
-        # axes already validated by caller
-        Base._copyto!(IndexStyle(parent(P)), parent(P), IndexStyle(src), src)
+        copyto!(parent(P), src) # it's not permuted
     else
         R1 = CartesianIndices(axes(src)[1:d])
         d1 = findfirst(isequal(d+1), perm)::Int  # first permuted dim of dest

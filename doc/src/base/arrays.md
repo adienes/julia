@@ -96,6 +96,13 @@ Base.Broadcast.combine_styles
 Base.Broadcast.result_style
 ```
 
+For specializing `copyto!` on custom types, see
+```@docs
+Base.CopyToStyle
+Base.DefaultCopyToStyle
+Base.copyto_unaliased!
+```
+
 ## Indexing and assignment
 
 ```@docs

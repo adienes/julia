@@ -430,7 +430,10 @@ function isassigned(V::FastSubArray{<:Any, 1}, i::Int)
     r
 end
 
-_unwrap_with_offset(a::FastContiguousSubArray{<:Any,<:Any,P}) where {P} = (parent(a)::P, a.offset1)
+function _unwrap_contiguous(a::FastContiguousSubArray{<:Any,<:Any,P}) where {P}
+    p, offset = _unwrap_contiguous(parent(a)::P)
+    return (p, offset + a.offset1)
+end
 
 IndexStyle(::Type{<:FastSubArray}) = IndexLinear()
 

@@ -429,52 +429,30 @@ function unsafe_copyto!(dest::BitArray, doffs::Integer, src::Union{BitArray,Arra
     return dest
 end
 
-"""
-    BitArrayCopyToStyle <: CopyToStyle
+_is_storage_pair(::BitArray, ::Union{BitArray,Array{Bool}}) = true
 
-Style for `copyto!` specializations that exploit BitArray's chunk packing.
-Wins as dest via the base LHS-wins combination rule; a future expansion could
-add a chunk-read fast path when BitArray is the source (would require declaring
-`CopyToStyle(::DefaultCopyToStyle, ::BitArrayCopyToStyle) = BitArrayCopyToStyle()`).
-"""
+function _copyto_storage!(dest::BitArray, doffs::Int, src::Union{BitArray,Array{Bool}}, soffs::Int, n::Int)
+    if src isa BitArray && doffs == 1 && soffs == 1
+        destc = dest.chunks; srcc = src.chunks
+        nc = num_bit_chunks(n)
+        @inbounds begin
+            for i = 1 : nc - 1
+                destc[i] = srcc[i]
+            end
+            msk = _msk_end(n)
+            destc[nc] = (~msk & destc[nc]) | (msk & srcc[nc])
+        end
+        return dest
+    end
+    return unsafe_copyto!(dest, doffs, src, soffs, n)
+end
+
 struct BitArrayCopyToStyle <: CopyToStyle end
 CopyToStyle(::Type{<:BitArray}) = BitArrayCopyToStyle()
 
-function _copyto!(::BitArrayCopyToStyle, dest::BitArray, src::AbstractArray)
-    @_propagate_inbounds_meta
-    sp, soff = _unwrap_with_offset(src)
-    if sp isa Union{BitArray,Array}
-        _copyto!(dest, firstindex(dest), sp, firstindex(src) + soff, length(src))
-    else
-        _copyto_bitarray!(dest, src)
-    end
-    return dest
-end
-function _copyto!(::BitArrayCopyToStyle, dest::BitArray, src::BitArray)
-    destc = dest.chunks; srcc = src.chunks
-    nc = min(length(destc), length(srcc))
-    nc == 0 && return dest
-    @inbounds begin
-        for i = 1 : nc - 1
-            destc[i] = srcc[i]
-        end
-        if length(src) == length(dest)
-            destc[nc] = srcc[nc]
-        else
-            msk_s = _msk_end(src)
-            msk_d = ~msk_s
-            destc[nc] = (msk_d & destc[nc]) | (msk_s & srcc[nc])
-        end
-    end
-    return dest
-end
-
-function _copyto!(dest::BitArray, doffs::Integer, src::Union{BitArray,Array}, soffs::Integer, n::Integer)
-    @inline
-    n == 0 && return dest
-    _check_copyto_args(dest, doffs, src, soffs, n)
-    unsafe_copyto!(dest, doffs, src, soffs, n)
-    return dest
+function copyto_unaliased!(::BitArrayCopyToStyle, dest::AbstractArray, src::AbstractArray)
+    dest isa BitArray || return copyto_unaliased!(DefaultCopyToStyle(), dest, src)
+    return _copyto_bitarray!(dest, src)
 end
 
 function reshape(B::BitArray{N}, dims::NTuple{N,Int}) where N
@@ -513,10 +491,9 @@ function BitArray{N}(A::AbstractArray{T,N}) where N where T
 end
 
 function _copyto_bitarray!(B::BitArray, A::AbstractArray)
-    @_propagate_inbounds_meta
     l = length(A)
     l == 0 && return B
-    @boundscheck l <= length(B) || throw(BoundsError(B, LinearIndices(A)))
+    l > length(B) && throw(BoundsError(B, length(B)+1))
     Bc = B.chunks
     nc = num_bit_chunks(l)
     Ai = first(eachindex(A))

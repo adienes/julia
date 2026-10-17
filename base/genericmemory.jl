@@ -262,8 +262,9 @@ function copy(a::T) where {T<:Memory}
     @inbounds unsafe_copyto!(newmem, 1, a, 1, length(a))
 end
 
+copyto!(dest::Memory, src::Memory) = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
 copyto!(dest::Memory, doffs::Integer, src::Memory, soffs::Integer, n::Integer) =
-    _copyto!(dest, doffs, src, soffs, n)
+    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
 
 
 ## Constructors ##

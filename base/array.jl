@@ -294,23 +294,36 @@ function _check_copyto_args(dest, doffs, src, soffs, n)
     return nothing
 end
 
-# these methods are not necessary, but they help inference since we set max_methods=1 on copyto!
-copyto!(dest::Array, src::Array) =
-    (@_propagate_inbounds_meta; _copyto!(dest, firstindex(dest), src, firstindex(src), length(src)))
-copyto!(dest::Array, src::Memory) =
-    (@_propagate_inbounds_meta; _copyto!(dest, firstindex(dest), src, firstindex(src), length(src)))
-copyto!(dest::Memory, src::Array) =
-    (@_propagate_inbounds_meta; _copyto!(dest, firstindex(dest), src, firstindex(src), length(src)))
-copyto!(dest::Array{T}, src::Array{T}) where {T} =
-    (@_propagate_inbounds_meta; _copyto!(dest, firstindex(dest), src, firstindex(src), length(src)))
+copyto!(dest::Array, doffs::Integer, src::Array, soffs::Integer, n::Integer) =
+    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
+copyto!(dest::Array, doffs::Integer, src::Memory, soffs::Integer, n::Integer) =
+    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
+copyto!(dest::Memory, doffs::Integer, src::Array, soffs::Integer, n::Integer) =
+    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
+copyto!(dest::Array{T}, doffs::Integer, src::Array{T}, soffs::Integer, n::Integer) where {T} =
+    (@_propagate_inbounds_meta; _copyto_ranged!(dest, doffs, src, soffs, n))
 
-function _copyto!(dest::Union{Array,Memory}, doffs::Integer, src::Union{Array,Memory}, soffs::Integer, n::Integer)
-    @inline
+copyto!(dest::Array, src::Array) = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
+copyto!(dest::Array, src::Memory) = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
+copyto!(dest::Memory, src::Array) = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
+copyto!(dest::Array{T}, src::Array{T}) where {T} = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
+copyto!(dest::Array{T}, src::Memory{T}) where {T} = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
+copyto!(dest::Memory{T}, src::Array{T}) where {T} = (@_propagate_inbounds_meta; _copyto_dense!(dest, src))
+
+_copyto_dense!(dest, src) = (@_propagate_inbounds_meta; copyto!(dest, firstindex(dest), src, firstindex(src), length(src)))
+
+function _copyto_ranged!(dest::AbstractArray, doffs::Integer, src::AbstractArray, soffs::Integer, n::Integer)
+    @_propagate_inbounds_meta
     n == 0 && return dest
     _check_copyto_args(dest, doffs, src, soffs, n)
-    doffs = Int(doffs)
-    soffs = Int(soffs)
-    n = Int(n)
+    _copyto_checked!(dest, Int(doffs), src, Int(soffs), Int(n))
+    return dest
+end
+
+_is_storage_pair(::Union{Array,Memory}, ::Union{Array,Memory}) = true
+
+function _copyto_storage!(dest::Union{Array,Memory}, doffs::Int, src::Union{Array,Memory}, soffs::Int, n::Int)
+    @inline
     @inbounds let dref = memoryref(dest isa Array ? getfield(dest, :ref) : dest, doffs),
                   sref = memoryref(src isa Array ? getfield(src, :ref) : src, soffs)
         unsafe_copyto!(dref, sref, n)
@@ -775,13 +788,13 @@ end
 function _collect_indices(::Tuple{}, A)
     dest = Array{eltype(A),0}(undef)
     isempty(A) && return dest
-    _copyto!(IndexStyle(dest), dest, IndexStyle(A), A)
+    _copyto_checked!(dest, A)
     return dest
 end
 function _collect_indices(indsA::Tuple{Vararg{OneTo}}, A)
     dest = Array{eltype(A)}(undef, length.(indsA))
     isempty(A) && return dest
-    _copyto!(IndexStyle(dest), dest, IndexStyle(A), A)
+    _copyto_checked!(dest, A)
     return dest
 end
 function _collect_indices(indsA, A)
