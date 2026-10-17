@@ -246,7 +246,7 @@ function show_convert_error(io::IO, ex::MethodError, arg_types_param)
     if T === nothing
         print(io, "First argument to `convert` must be a Type, got ", ex.args[1])
     else
-        p2 = arg_types_param[2]
+        p2 = argtype_for_display(arg_types_param[2])
         print_one_line = isa(T, DataType) && isa(p2, DataType) && T.name != p2.name
         printstyled(io, "Cannot `convert` an object of type ")
         print_one_line || printstyled(io, "\n  ")
@@ -785,10 +785,16 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs=[])
                         show_separator(iob, use_color)
                     end
                     if k == 1 && Base.isvarargtype(sigtype)
-                        # There wasn't actually a mismatch - the method match failed for
-                        # some other reason, e.g. world age. Just print the sigstr.
-                        print(iob, sigstr...)
-                    elseif get(io, :color, false)::Bool
+                        # There wasn't actually a mismatch - the trailing vararg can
+                        # accept zero arguments (or the method match failed for some
+                        # other reason, e.g. world age), so print the sigstr like a
+                        # matching parameter rather than in the error color.
+                        if use_color
+                            print(iob, text_colors[:light_black], sigstr..., text_colors[:default])
+                        else
+                            print(iob, sigstr...)
+                        end
+                    elseif use_color
                         let sigstr=sigstr
                             Base.with_output_color(Base.error_color(), iob) do iob
                                 print(iob, "::", sigstr...)

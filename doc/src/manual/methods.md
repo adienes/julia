@@ -640,12 +640,13 @@ supertypes:
 ```julia-repl
 julia> eltype_wrong(Union{Vector{Int}, Matrix{Int}})
 ERROR: MethodError: no method matching supertype(::Type{VecOrMat{Int64}})
+The function `supertype` exists, but no method is defined for this combination of argument types.
 
 Closest candidates are:
   supertype(::UnionAll)
-   @ Base operators.jl:44
+   @ Base operators.jl:87
   supertype(::DataType)
-   @ Base operators.jl:43
+   @ Base operators.jl:86
 ```
 
 ### Building a similar type with a different type parameter
