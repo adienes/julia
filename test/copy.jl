@@ -371,6 +371,23 @@ end
         flags = [BoolFlag(true), BoolFlag(false)]
         @test copyto!(falses(2), view(flags, :)) == [true, false]
         @test copyto!(falses(3), 2, view(flags, :), 1, 2) == [false, true, false]
+        @test copyto!(falses(3), flags) == [true, false, false]
+        @test copyto!(falses(3), 2, flags, 1, 2) == [false, true, false]
+    end
+    let src = [isodd(i ÷ 3) for i in 1:130]
+        for T in (Int, Int8, Float64)
+            @test copyto!(falses(130), T.(src)) == src
+            @test copyto!(trues(140), 7, T.(src), 3, 120) == [trues(6); src[3:122]; trues(14)]
+        end
+        @test_throws InexactError copyto!(falses(3), [0, 2, 1])
+        @test_throws InexactError copyto!(falses(3), 1, [0.0, 0.5, 1.0], 1, 3)
+    end
+    let bits = BitMatrix([isodd(i + 2j) for i in 1:5, j in 1:7])
+        @test Base._copyto_style(falses(7, 5), PermutedDimsArray(bits, (2, 1))) isa Base.BitArrayCopyToStyle
+        @test copyto!(falses(7, 5), PermutedDimsArray(bits, (2, 1))) == permutedims(bits)
+        dest = PermutedDimsArray(falses(5, 7), (2, 1))
+        @test Base._copyto_style(dest, permutedims(bits)) isa Base.PermutedDimsArrays.PermutedDimsCopyToStyle
+        @test copyto!(dest, permutedims(bits)) == permutedims(bits)
     end
 end
 

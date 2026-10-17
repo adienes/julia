@@ -452,7 +452,19 @@ CopyToStyle(::Type{<:BitArray}) = BitArrayCopyToStyle()
 
 function copyto_unaliased!(::BitArrayCopyToStyle, dest::AbstractArray, src::AbstractArray)
     dest isa BitArray || return copyto_unaliased!(DefaultCopyToStyle(), dest, src)
+    if src isa Array{<:Real}
+        copy_to_bitarray_chunks!(dest.chunks, 1, src, 1, length(src))
+        return dest
+    end
     return _copyto_bitarray!(dest, src)
+end
+
+function copyto_unaliased!(::BitArrayCopyToStyle, dest::AbstractArray, Rdest::UnitRange{Int}, src::AbstractArray, Rsrc::UnitRange{Int})
+    if dest isa BitArray && src isa Array{<:Real}
+        copy_to_bitarray_chunks!(dest.chunks, first(Rdest), src, first(Rsrc), length(Rdest))
+        return dest
+    end
+    return copyto_unaliased!(DefaultCopyToStyle(), dest, Rdest, src, Rsrc)
 end
 
 function reshape(B::BitArray{N}, dims::NTuple{N,Int}) where N

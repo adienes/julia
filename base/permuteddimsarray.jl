@@ -292,6 +292,8 @@ end
 
 struct PermutedDimsCopyToStyle <: Base.CopyToStyle end
 Base.CopyToStyle(::Type{<:PermutedDimsArray}) = PermutedDimsCopyToStyle()
+Base.CopyToStyle(::PermutedDimsCopyToStyle, ::Base.BitArrayCopyToStyle) = PermutedDimsCopyToStyle()
+Base.CopyToStyle(::Base.BitArrayCopyToStyle, ::PermutedDimsCopyToStyle) = Base.BitArrayCopyToStyle()
 
 function Base.copyto_unaliased!(::PermutedDimsCopyToStyle, dest::AbstractArray, src::AbstractArray)
     if dest isa PermutedDimsArray && axes(dest) == axes(src)
