@@ -287,6 +287,8 @@ end
     @test copyto!(a, 2, a, 1, 2) == [1;1:2;]
     a = [1:3;]
     @test copyto!(a, 2:3, 1:1, a, 1:2, 1:1) == [1;1:2;]
+    b = falses(65); b[1] = true
+    @test copyto!(b, view(b, 65:-1:1))[65]
 end
 
 struct BoolFlag
