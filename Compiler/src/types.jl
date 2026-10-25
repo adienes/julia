@@ -79,8 +79,11 @@ If `v.typ === Bottom` it means that the variable is strictly undefined.
 If zero, then the value comes from an argument.
 If negative, this refers to a "virtual ϕ-block" preceding the given index,
 that would have been inserted as the value of this slot in a truly SSA-form IR.
-If a slot has the same `ssadef` at two different points of execution,
-the slot contents are guaranteed to share identity (`x₀ === x₁`).
+A definition can execute more than once (e.g. in a loop), so equal `ssadef`s only
+guarantee shared identity (`x₀ === x₁`) within a single pass through a basic block.
+When merging block-entry states, `stupdate!` drops `Conditional`s and `MustAlias`es
+that are stale on their incoming path and renames the others to the merged
+definitions, except those on arguments (`ssadef == 0`), which are left as is.
 """
 struct VarState
     typ

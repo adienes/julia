@@ -8299,6 +8299,131 @@ stale_cond4(n, m) = (h = n isa Int; n = m; Core.ifelse(h, n, 0))
 @test Base.infer_return_type(stale_cond4, (Union{Nothing,Int}, Union{Nothing,Int})) == Union{Nothing, Int}
 @test stale_cond4(1, nothing) === nothing
 
+struct C64183 end
+struct Box64183
+    x::Any
+end
+function issue64183(a, b)
+    was_c = false
+    result = false
+    for element in (a, b)
+        result = was_c && element isa String
+        was_c = element isa C64183
+    end
+    return result
+end
+@test issue64183(C64183(), "y")
+function stale_loop64183(xs)
+    was_c = false
+    for x in xs
+        was_c && return x
+        was_c = x isa C64183
+    end
+    return nothing
+end
+@test Base.infer_return_type(stale_loop64183, (Vector{Any},)) == Any
+function stale_nothing64183(xs)
+    prev_nothing = false
+    for x in xs
+        prev_nothing && return x
+        prev_nothing = x === nothing
+    end
+    return 0.0
+end
+@test Base.infer_return_type(stale_nothing64183, (Vector{Union{Nothing,Int}},)) == Union{Nothing, Int, Float64}
+function stale_field64183(bs)
+    was_c = false
+    for b in bs
+        was_c && return b.x
+        was_c = b.x isa C64183
+    end
+    return nothing
+end
+@test Base.infer_return_type(stale_field64183, (Vector{Box64183},)) == Any
+function stale_alias64183(bs, n)
+    local v
+    i = 1
+    for b in bs
+        if i > 1 && v === n
+            return b.x
+        end
+        v = b.x
+        i += 1
+    end
+    return nothing
+end
+@test Base.infer_return_type(stale_alias64183, (Vector{Box64183}, Int)) == Any
+function stale_merge64183(xs, flag)
+    was_c = false
+    i = 1
+    if flag
+        x = xs[1]
+    else
+        x = xs[2]
+    end
+    while i < length(xs)
+        was_c && return x
+        was_c = x isa C64183
+        i += 1
+        x = xs[i]
+    end
+    return nothing
+end
+@test Base.infer_return_type(stale_merge64183, (Vector{Any}, Bool)) == Any
+function stale_try64183(xs)
+    was_c = false
+    for x in xs
+        try
+            was_c && return x
+            was_c = x isa C64183
+            length(xs) > 1 && error()
+        catch
+        end
+    end
+    return nothing
+end
+@test Base.infer_return_type(stale_try64183, (Vector{Any},)) == Any
+function stale_nested64183(xs, n)
+    was_c = false
+    for x in xs
+        for _ in 1:n
+            was_c && return x
+        end
+        was_c = x isa C64183
+    end
+    return nothing
+end
+@test Base.infer_return_type(stale_nested64183, (Vector{Any}, Int)) == Any
+function stale_handler64183(xs)
+    was_c = false
+    for x in xs
+        try
+            was_c || error()
+            return x
+        catch
+            was_c = x isa C64183
+        end
+    end
+    return nothing
+end
+@test Base.infer_return_type(stale_handler64183, (Vector{Any},)) == Any
+function flag_loop64183(xs)
+    x = xs[1]
+    flag = x isa Int
+    i = 1
+    s = 0
+    while i < length(xs)
+        if flag
+            s += x
+        end
+        i += 1
+        x = xs[i]
+        flag = x isa Int
+    end
+    return s
+end
+@test Base.infer_return_type(flag_loop64183, (Vector{Any},)) == Int
+
 # issue #60883: conditional propagation through wrapper functions
 mutable struct A60883
     a::Int

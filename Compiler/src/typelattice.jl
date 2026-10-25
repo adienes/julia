@@ -763,10 +763,60 @@ end
 @nospecializeinfer @inline schanged(lattice::AbstractLattice, @nospecialize(n), @nospecialize(o), join_pc::Int) =
     (n !== o) && (o === NOT_FOUND || (n !== NOT_FOUND && !(n.undef <= o.undef && (n.ssadef === o.ssadef || o.ssadef === join_pc) && ⊑(lattice, n.typ, o.typ))))
 
+@inline function rename_slotwrapper(vt::VarState, from::VarTable, to::VarTable, join_pc::Int)
+    typ = vt.typ
+    if isa(typ, Conditional)
+        slotwrapper_unchanged(typ.slot, typ.ssadef, from, to) && return vt
+    elseif isa(typ, MustAlias)
+        slotwrapper_unchanged(typ.slot, typ.ssadef, from, to) && return vt
+    elseif !isa(typ, LimitedAccuracy)
+        return vt
+    end
+    return _rename_slotwrapper(vt, from, to, join_pc)
+end
+
+@inline slotwrapper_unchanged(slot::Int, def::Int, from::VarTable, to::VarTable) =
+    def == 0 || def == from[slot].ssadef == to[slot].ssadef
+
+function _rename_slotwrapper(vt::VarState, from::VarTable, to::VarTable, join_pc::Int)
+    typ = ignorelimited(vt.typ)
+    isa(typ, Union{Conditional,MustAlias}) || return vt
+    typ.ssadef == 0 && return vt
+    def = from[typ.slot].ssadef
+    if typ.ssadef != def
+        newtyp = widenslotwrapper(typ)
+    else
+        newdef = def == to[typ.slot].ssadef ? def : join_pc
+        newdef == def && return vt
+        newtyp = isa(typ, Conditional) ?
+            Conditional(typ.slot, newdef, typ.thentype, typ.elsetype; typ.isdefined) :
+            MustAlias(typ; ssadef=newdef)
+    end
+    if isa(vt.typ, LimitedAccuracy)
+        newtyp = LimitedAccuracy(newtyp, vt.typ.causes)
+    end
+    return VarState(newtyp, vt.ssadef, vt.undef)
+end
+
+function ssadefs_change(state::VarTable, changes::VarTable, join_pc::Int)
+    for i = 1:length(state)
+        def = state[i].ssadef
+        def == changes[i].ssadef || def == join_pc || return true
+    end
+    return false
+end
+
 function stupdate!(lattice::AbstractLattice, state::VarTable, changes::VarTable, join_pc::Int)
+    if ssadefs_change(state, changes, join_pc)
+        for i = 1:length(state)
+            vt = state[i]
+            newvt = rename_slotwrapper(vt, state, changes, join_pc)
+            newvt === vt || (state[i] = newvt)
+        end
+    end
     changed = false
     for i = 1:length(state)
-        newtype = changes[i]
+        newtype = rename_slotwrapper(changes[i], changes, state, join_pc)
         oldtype = state[i]
         # In addition to computing the type, the merge here computes the "reaching definition"
         # for a slot. The provided `join_pc` is a "virtual" PC, which corresponds to the ϕ-block
