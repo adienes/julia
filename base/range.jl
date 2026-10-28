@@ -38,6 +38,9 @@ _range_wrapping_sub(x, y) = x - y
 _range_wrapping_mul(x::_RangeWrappingInteger, y::_RangeWrappingInteger) = x *% y
 _range_wrapping_mul(x, y) = x * y
 
+_signed_int(x::Unsigned) = convert(signed(promote_type(typeof(x), Int)), x)
+_signed_int(x) = x
+
 """
     (:)(start, [step], stop)
 
@@ -977,6 +980,8 @@ let BitInteger64 = Union{Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64} # fo
         (0 < i) & ifelse(0 < step(v), res <= last(v), res >= last(v))
     end
 end
+
+_offset_diff(r, i) = _signed_int(oftype(r.offset, i)) - _signed_int(r.offset)
 
 # unsafe_getindex is separate to make it useful even when running with --check-bounds=yes
 # it assumes the index is inbounds but does not segfault even if the index is out of bounds.

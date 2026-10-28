@@ -479,7 +479,7 @@ end
 # This assumes that r.step has already been split so that (0:len-1)*r.step.hi is exact
 function unsafe_getindex(r::StepRangeLen{T,<:TwicePrecision,<:TwicePrecision}, i::Integer) where T
     # Very similar to _getindex_hiprec, but optimized to avoid a 2nd call to add12
-    u = oftype(r.offset, i) - r.offset
+    u = _offset_diff(r, i)
     shift_hi, shift_lo = u*r.step.hi, u*r.step.lo
     x_hi, x_lo = add12(r.ref.hi, shift_hi)
     T(x_hi + (x_lo + (shift_lo + r.ref.lo)))
@@ -487,7 +487,7 @@ end
 
 function _getindex_hiprec(r::StepRangeLen{<:Any,<:TwicePrecision,<:TwicePrecision}, i::Integer)
     i isa Bool && throw(ArgumentError("invalid index: $i of type Bool"))
-    u = oftype(r.offset, i) - r.offset
+    u = _offset_diff(r, i)
     shift_hi, shift_lo = u*r.step.hi, u*r.step.lo
     x_hi, x_lo = add12(r.ref.hi, shift_hi)
     x_hi, x_lo = add12(x_hi, x_lo + (shift_lo + r.ref.lo))
@@ -514,20 +514,20 @@ function getindex(r::StepRangeLen{T,<:TwicePrecision,<:TwicePrecision}, s::Ordin
             return StepRangeLen{T}(last(r), step(r), oneunit(L), oneunit(L))
         end
     else
-        soffset = round(L, (r.offset - first(s))/sstep + 1)
-        soffset = clamp(soffset, oneunit(L), len)
-        ioffset = L(first(s) + (soffset - oneunit(L)) * sstep)
-        if sstep == 1 || len < 2
+        f, st, n, o = _signed_int(first(s)), _signed_int(sstep), _signed_int(len), _signed_int(r.offset)
+        q = (o - f)/st + 1
+        soffset = q <= 1 ? oneunit(n) : q >= n ? max(n, oneunit(n)) : round(typeof(n), q)
+        ioffset = oftype(soffset, f + (soffset - oneunit(soffset)) * st)
+        if st == 1 || n < 2
             newstep = rstep #* one(sstep)
         else
-            newstep = rstep * sstep
-            newstep = twiceprecision(newstep, nbitslen(T, len, soffset))
+            newstep = rstep * st
+            newstep = twiceprecision(newstep, nbitslen(T, n, soffset))
         end
-        soffset = max(oneunit(L), soffset)
-        if ioffset == r.offset
-            return StepRangeLen{T}(r.ref, newstep, len, soffset)
+        if ioffset == o
+            return StepRangeLen{T}(r.ref, newstep, n, soffset)
         else
-            return StepRangeLen{T}(r.ref + (ioffset-r.offset)*rstep, newstep, len, soffset)
+            return StepRangeLen{T}(r.ref + (ioffset - o)*rstep, newstep, n, soffset)
         end
     end
 end

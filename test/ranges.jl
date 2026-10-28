@@ -2100,6 +2100,15 @@ end
 
 @testset "getindex" begin
     @test getindex((typemax(UInt64)//one(UInt64):typemax(UInt64)//one(UInt64)), 1) == typemax(UInt64)//one(UInt64)
+    @test first(range(-1.0, 1.0, length=5)[2:1]) == -0.5
+    r = StepRangeLen(Base.TwicePrecision(0.0), Base.TwicePrecision(1.0), typemax(Int), typemax(Int))
+    @test r[1:3] == r[[1, 2, 3]]
+    n = (Int(1) << 53) + 3
+    r = StepRangeLen(Base.TwicePrecision(0.0), Base.TwicePrecision(1.0), n, n)
+    @test r[1:n] == r
+    h = Int(1) << 54
+    r = StepRangeLen(Base.TwicePrecision(0.0), Base.TwicePrecision(1.0, 2.0^-53), h + 8, h - 3)
+    @test r[StepRange(1, 3//1, 4)] == r[[1, 4]]
 end
 
 @testset "Issue #30006" begin
@@ -2728,6 +2737,10 @@ end
     @test x[UInt(1)] == -1.0
     a = StepRangeLen(1,2,3,2)
     @test a[UInt(1)] == -1
+    @test collect((UInt(1):UInt(2):UInt(5)) .- 2.0) == [-1.0, 1.0, 3.0]
+    @test collect(range(9.0, 1.0; step=-1.0)[UInt(1):UInt(5)]) == 9:-1:5
+    tp(o) = StepRangeLen(Base.TwicePrecision(0.0), Base.TwicePrecision(1.0), UInt(3), UInt(o))
+    @test first(tp(1) + tp(3)) == -2.0
 end
 
 @testset "StepRangeLen of CartesianIndex-es" begin
