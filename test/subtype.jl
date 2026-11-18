@@ -3817,3 +3817,12 @@ struct Q61645{T,S} end
         @test typeintersect(Y, X) === Union{}
     end
 end
+
+@testset "repeated invariant occurrences of a variable" begin
+    let S = Tuple{Ref{V},Ref{V}} where V
+        @testintersect(Tuple{Ref{Union{Nothing,T}} where T, Ref{Union{Nothing,T}} where T}, S,
+                       Tuple{Ref{Union{Nothing,T}},Ref{Union{Nothing,T}}} where T)
+        @testintersect(Tuple{Ref{Tuple{Vararg{T}}} where T, Ref{Tuple{Vararg{T}}} where T}, S,
+                       Tuple{Ref{Tuple{Vararg{T}}},Ref{Tuple{Vararg{T}}}} where T)
+    end
+end

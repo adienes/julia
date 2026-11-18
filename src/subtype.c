@@ -4764,10 +4764,14 @@ static jl_value_t *intersect_var(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int
             }
             bb->ub = ub;
             if ((jl_is_uniontype(ub) && !jl_is_uniontype(a)) ||
-                (jl_is_unionall(ub) && !jl_is_unionall(a)))
+                (jl_is_unionall(ub) && !jl_is_unionall(a))) {
                 ub = (jl_value_t*)b;
-            else
+            }
+            else {
                 bb->lb = ub;
+                if (jl_has_free_typevars(ub))
+                    ub = (jl_value_t*)b;
+            }
         }
         JL_GC_POP();
         return ub;
