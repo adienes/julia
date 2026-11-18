@@ -4431,6 +4431,18 @@ static jl_value_t *intersect_aside(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, 
     return res;
 }
 
+static jl_value_t *join_closed_members(jl_value_t *t, jl_value_t *u) JL_CANSAFEPOINT
+{
+    if (jl_is_uniontype(u)) {
+        JL_GC_PUSH1(&t);
+        t = join_closed_members(t, ((jl_uniontype_t*)u)->a);
+        t = join_closed_members(t, ((jl_uniontype_t*)u)->b);
+        JL_GC_POP();
+        return t;
+    }
+    return jl_has_free_typevars(u) ? t : simple_join(t, u);
+}
+
 static jl_value_t *intersect_union(jl_value_t *x, jl_uniontype_t *u, jl_stenv_t *e, int8_t R, jl_param_pos_t param) JL_CANSAFEPOINT
 {
     int no_free = !jl_has_free_typevars(x) && !jl_has_free_typevars((jl_value_t*)u);
@@ -4448,6 +4460,14 @@ static jl_value_t *intersect_union(jl_value_t *x, jl_uniontype_t *u, jl_stenv_t 
         pop_unionstate(&e->Runions, &oldRunions);
         if (vars) e->vars = vars;
         jl_value_t *i = simple_join(a,b);
+        if (!no_free && i != jl_bottom_type) {
+            if (!jl_has_free_typevars((jl_value_t*)u))
+                i = (jl_value_t*)u;
+            else if (!jl_has_free_typevars(x))
+                i = x;
+            else
+                i = join_closed_members(x, (jl_value_t*)u);
+        }
         JL_GC_POP();
         return i;
     }

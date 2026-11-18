@@ -3825,4 +3825,13 @@ end
         @testintersect(Tuple{Ref{Tuple{Vararg{T}}} where T, Ref{Tuple{Vararg{T}}} where T}, S,
                        Tuple{Ref{Tuple{Vararg{T}}},Ref{Tuple{Vararg{T}}}} where T)
     end
+    # issue #65046
+    let D = Dict{K,Union{Vector{V},V}} where {K,V}
+        @testintersect(Tuple{Type{Dict},Pair{Int,D{K,V}} where {K,V},Pair{Int,D{K,V}} where {K,V}},
+                       Tuple{Type{Dict},Vararg{Pair{K,V}}} where {K,V},
+                       Tuple{Type{Dict},Pair{Int,D{K,V}},Pair{Int,D{K,V}}} where {K,V})
+    end
+    @testintersect(Tuple{Ref{Union{Vector{T},T}},Int,Any} where T,
+                   Tuple{Ref{Union{Vector{T},T}},Any,Int} where T,
+                   Tuple{Ref{Union{Vector{T},T}},Int,Int} where T)
 end
