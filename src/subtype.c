@@ -4707,6 +4707,8 @@ static jl_value_t *intersect_var(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int
     }
     if (reachable_var(bb->lb, b, e) || reachable_var(bb->ub, b, e))
         return a;
+    if (var_occurs_inside(bb->lb, b, 0) || var_occurs_inside(bb->ub, b, 0))
+        return a;
     for (jl_typeenv_t *f = e->intersecting; f != NULL; f = f->prev) {
         if (f->var == b && obviously_egal(f->val, a))
             return a;

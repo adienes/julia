@@ -3715,6 +3715,11 @@ end
     end
 
     @testintersect(Tuple{Tuple{T}, T, T} where T, Tuple{S, Tuple{S}, S} where S, Union{})
+
+    let A = Ref{Union{Vector{S}, S}} where S, B = Ref{Vector{Union{Vector{T}, T}}} where T
+        @test typeintersect(A, B) isa Type
+        @test typeintersect(B, A) isa Type
+    end
 end
 
 # an outer existential var below an inner forall var is bounded by its lower bound
