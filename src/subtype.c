@@ -4988,7 +4988,7 @@ static int has_typevar_via_flatten_env(jl_value_t *x, jl_tvar_t *t, jl_ivarbindi
 }
 
 // Caller might not have rooted `res`
-static jl_value_t *finish_unionall(jl_value_t *res JL_MAYBE_UNROOTED, jl_varbinding_t *vb, jl_unionall_t *u, jl_stenv_t *e) JL_CANSAFEPOINT
+static jl_value_t *finish_unionall(jl_value_t *res JL_MAYBE_UNROOTED, jl_varbinding_t *vb, jl_stenv_t *e) JL_CANSAFEPOINT
 {
     jl_value_t *varval = NULL, *ilb = NULL, *iub = NULL, *nivar = NULL;
     jl_tvar_t *newvar = vb->var, *ivar = NULL;
@@ -5338,6 +5338,31 @@ static jl_value_t *finish_unionall(jl_value_t *res JL_MAYBE_UNROOTED, jl_varbind
     return res;
 }
 
+static jl_value_t *close_unionall(jl_value_t *res JL_MAYBE_UNROOTED, jl_varbinding_t *vb, jl_stenv_t *e) JL_CANSAFEPOINT
+{
+    if (res != jl_bottom_type) {
+        if (vb->ub == jl_bottom_type && cov_count(vb)) {
+            // T=Bottom in covariant position
+            res = jl_bottom_type;
+        }
+        else if (jl_has_typevar(vb->lb, vb->var)) {
+            // fail on circular constraints
+            res = jl_bottom_type;
+        }
+        else {
+            JL_GC_PUSH1(&res);
+            vb->ub = omit_bad_union(vb->ub, vb->var);
+            JL_GC_POP();
+            if (vb->ub == jl_bottom_type && vb->ub != vb->lb)
+                res = jl_bottom_type;
+        }
+    }
+    if (res != jl_bottom_type)
+        // res is rooted by callee
+        res = finish_unionall(res, vb, e);
+    return res;
+}
+
 static jl_value_t *intersect_unionall_(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8_t R, jl_param_pos_t param, jl_varbinding_t *vb) JL_CANSAFEPOINT
 {
     jl_varbinding_t *btemp = e->vars;
@@ -5396,27 +5421,7 @@ static jl_value_t *intersect_unionall_(jl_value_t *t, jl_unionall_t *u, jl_stenv
     }
 
     e->vars = vb->prev;
-
-    if (res != jl_bottom_type) {
-        if (vb->ub == jl_bottom_type && cov_count(vb)) {
-            // T=Bottom in covariant position
-            res = jl_bottom_type;
-        }
-        else if (jl_has_typevar(vb->lb, u->var)) {
-            // fail on circular constraints
-            res = jl_bottom_type;
-        }
-        else {
-            JL_GC_PUSH1(&res);
-            vb->ub = omit_bad_union(vb->ub, u->var);
-            JL_GC_POP();
-            if (vb->ub == jl_bottom_type && vb->ub != vb->lb)
-                res = jl_bottom_type;
-        }
-    }
-    if (res != jl_bottom_type)
-        // res is rooted by callee
-        res = finish_unionall(res, vb, u, e);
+    res = close_unionall(res, vb, e);
     JL_GC_POP();
     return res;
 }
@@ -5491,6 +5496,17 @@ static int unionall_always_cov(jl_unionall_t *u, jl_param_pos_t param) JL_NOTSAF
                                 never_occurs_in_inside_ub(u->body, u->var));
 }
 
+static int reintersection_kind(jl_varbinding_t *vb, jl_unionall_t *u) JL_NOTSAFEPOINT
+{
+    if (vb->concrete || vb->occurs_inv > 1 || (vb->occurs_inv && cov_count(vb)))
+        return vb->concrete ? 1 : 2;
+    if (u->var->lb != jl_bottom_type)
+        return 2;
+    if (cov_count(vb) && vb->occurs < 2 && !vb->body_occurs_inv && never_occurs_in_inside_ub(u->body, u->var))
+        return 1;
+    return vb->constraintkind;
+}
+
 static jl_value_t *intersect_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8_t R, jl_param_pos_t param) JL_CANSAFEPOINT
 {
     jl_value_t *res = NULL;
@@ -5519,12 +5535,7 @@ static jl_value_t *intersect_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_
     }
     else if (res != jl_bottom_type) {
         int constraint1 = vb.constraintkind;
-        if (vb.concrete || vb.occurs_inv>1 || (vb.occurs_inv && cov_count(&vb)))
-            vb.constraintkind = vb.concrete ? 1 : 2;
-        else if (u->var->lb != jl_bottom_type)
-            vb.constraintkind = 2;
-        else if (cov_count(&vb) && vb.occurs < 2 && noinv && never_occurs_in_inside_ub(u->body, u->var))
-            vb.constraintkind = 1;
+        vb.constraintkind = reintersection_kind(&vb, u);
         int reintersection = constraint1 != vb.constraintkind || vb.concrete || (vb.occurs_inv == 1 && vb.occurs > 1);
         if (reintersection) {
             if (constraint1 == 1) {
