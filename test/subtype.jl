@@ -1126,10 +1126,7 @@ function test_intersection()
                    Bottom)
     @testintersect(Tuple{Type{Z},Z} where Z,
                    Tuple{Type{Ref{T}} where T, Ref{Float64}},
-                   !Bottom)
-    @test_broken typeintersect(Tuple{Type{Z},Z} where Z,
-                               Tuple{Type{Ref{T}} where T, Ref{Float64}}) ==
-        Tuple{Type{Ref{Float64}},Ref{Float64}}
+                   Tuple{Type{Ref{Float64}},Ref{Float64}})
 
     # issue #32607
     @testintersect(Type{<:Tuple{Integer,Integer}},
@@ -3824,6 +3821,16 @@ end
                        Tuple{Ref{Union{Nothing,T}},Ref{Union{Nothing,T}}} where T)
         @testintersect(Tuple{Ref{Tuple{Vararg{T}}} where T, Ref{Tuple{Vararg{T}}} where T}, S,
                        Tuple{Ref{Tuple{Vararg{T}}},Ref{Tuple{Vararg{T}}}} where T)
+        @testintersect(Tuple{Ref{Union{Vector{Int},Int}}, Ref{Union{Vector{T},T}} where T}, S,
+                       Tuple{Ref{Union{Vector{Int},Int}},Ref{Union{Vector{Int},Int}}})
+        @testintersect(Tuple{Ref{Union{Nothing,T}} where T<:Number, Ref{Union{Vector{T},T}} where T}, S,
+                       Union{})
+        @testintersect(Tuple{Ref{Union{Vector{T},T}} where T, Ref{Union{Vector{T},T}} where T}, S,
+                       Tuple{Ref{Union{Vector{T},T}},Ref{Union{Vector{T},T}}} where T)
+        @testintersect(Tuple{Ref{Union{Vector{T},T}} where T, Ref{W}} where W, S,
+                       Tuple{Ref{Union{Vector{T},T}},Ref{Union{Vector{T},T}}} where T)
+        @testintersect(Tuple{Ref{Tuple{Vector{T},T}} where T, Ref{Tuple{Vector{T},T}} where T}, S,
+                       Tuple{Ref{Tuple{Vector{T},T}},Ref{Tuple{Vector{T},T}}} where T)
     end
     # issue #65046
     let D = Dict{K,Union{Vector{V},V}} where {K,V}

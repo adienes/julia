@@ -169,6 +169,16 @@ static void set_ivar_slot(jl_ivarbinding_t *b, void *slot, jl_value_t *val) JL_N
     *(jl_value_t**)slot = val;
 }
 
+#define JL_MAX_PENDING_VARS 8
+typedef struct jl_pending_vars_t {
+    jl_gcframe_t gcframe;
+    jl_value_t **roots[4 * JL_MAX_PENDING_VARS];
+    jl_varbinding_t vars[JL_MAX_PENDING_VARS];
+    int n;
+    int depth0;
+    struct jl_pending_vars_t *outer;
+} jl_pending_vars_t;
+
 // subtype algorithm state
 typedef struct JL_GC_TRACKED_TYPE jl_stenv_t {
     // N.B.: varbindings are created on the stack and rooted there
@@ -221,6 +231,7 @@ typedef struct JL_GC_TRACKED_TYPE jl_stenv_t {
     // Nesting depth of Vararg element intersections, where disjoint types admit empty tuples.
     // Each intersect_all starts a new scope.
     int vararg_elements;
+    jl_pending_vars_t *pending;
 } jl_stenv_t;
 
 // state manipulation utilities
@@ -3643,6 +3654,7 @@ static void init_stenv(jl_stenv_t *e, jl_value_t **env, int envsz)
     e->intersecting = NULL;
     e->Loffset = 0;
     e->vararg_elements = 0;
+    e->pending = NULL;
     e->Lunions.depth = 0;      e->Runions.depth = 0;
     e->Lunions.more = 0;       e->Runions.more = 0;
     e->Lunions.used = 0;       e->Runions.used = 0;
@@ -4382,6 +4394,26 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_par
 
 static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e) JL_CANSAFEPOINT;
 
+static int has_value(jl_varbinding_t *bb) JL_NOTSAFEPOINT
+{
+    return obviously_egal(bb->lb, bb->ub) && jl_is_type(bb->ub);
+}
+
+static void forget_open_values(jl_stenv_t *e, jl_savedenv_t *se) JL_NOTSAFEPOINT
+{
+    if (se->gcframe.nroots == 0)
+        return;
+    jl_value_t **roots = se->roots;
+    if (se->gcframe.nroots == JL_GC_ENCODE_PUSHARGS(1))
+        roots = jl_svec_data((jl_svec_t*)se->roots[0]);
+    for (jl_varbinding_t *v = e->vars; v != NULL; v = v->prev, roots += 3) {
+        if (has_value(v) && jl_has_free_typevars(v->ub)) {
+            v->lb = roots[0];
+            v->ub = roots[1];
+        }
+    }
+}
+
 // intersect in nested union environment, similar to subtype_ccheck
 static jl_value_t *intersect_aside(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int depth)
 {
@@ -4717,8 +4749,10 @@ static jl_value_t *intersect_var(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int
     int innervar = 0;
     jl_varbinding_t *bb = lookup_binding(e, b, &innervar);
     if (bb == NULL) {
-        if (innervar)
-            return R ? intersect_aside(a, b->ub, e, 0) : intersect_aside(b->ub, a, e, 0);
+        if (innervar) {
+            jl_value_t *ub = R ? intersect_aside(a, b->ub, e, 0) : intersect_aside(b->ub, a, e, 0);
+            return obviously_egal(ub, b->ub) ? (jl_value_t*)b : ub;
+        }
         if (singleton_typevar_subtype(b, a))
             return (jl_value_t*)b;
         if (subtype_singleton_typevar(a, b))
@@ -4751,7 +4785,14 @@ static jl_value_t *intersect_var(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int
             ub = a;
         }
         else {
-            if (jl_subtype(a, bb->ub)) {
+            if (has_value(bb)) {
+                ub = R ? intersect(a, bb->ub, e, PARAM_INVARIANT) : intersect(bb->ub, a, e, PARAM_INVARIANT);
+                if (ub == jl_bottom_type) {
+                    JL_GC_POP();
+                    return jl_bottom_type;
+                }
+            }
+            else if (jl_subtype(a, bb->ub)) {
                 ub = a;
             }
             else {
@@ -5363,8 +5404,83 @@ static jl_value_t *close_unionall(jl_value_t *res JL_MAYBE_UNROOTED, jl_varbindi
     return res;
 }
 
-static jl_value_t *intersect_unionall_(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8_t R, jl_param_pos_t param, jl_varbinding_t *vb) JL_CANSAFEPOINT
+static void push_pending_vars(jl_stenv_t *e, jl_pending_vars_t *pending) JL_NOTSAFEPOINT
 {
+    jl_task_t *ct = jl_current_task;
+    pending->gcframe.nroots = JL_GC_ENCODE_PUSH(0);
+    pending->gcframe.prev = ct->gcstack;
+    ct->gcstack = &pending->gcframe;
+    pending->n = 0;
+    pending->depth0 = e->invdepth;
+    pending->outer = e->pending;
+    e->pending = pending;
+}
+
+static void pop_pending_vars(jl_stenv_t *e, jl_pending_vars_t *pending) JL_NOTSAFEPOINT
+{
+    jl_task_t *ct = jl_current_task;
+    assert(pending->n == 0 && ct->gcstack == &pending->gcframe);
+    ct->gcstack = pending->gcframe.prev;
+    e->pending = pending->outer;
+}
+
+static jl_value_t *close_pending_vars(jl_value_t *res JL_MAYBE_UNROOTED, jl_stenv_t *e, int mark) JL_CANSAFEPOINT
+{
+    jl_pending_vars_t *pending = e->pending;
+    if (pending == NULL || pending->n == mark)
+        return res;
+    JL_GC_PUSH1(&res);
+    for (int i = pending->n; i > mark; i--) {
+        jl_varbinding_t *vb = e->vars;
+        assert(vb >= &pending->vars[mark] && vb < &pending->vars[pending->n]);
+        e->vars = vb->prev;
+        if (vb->limited && e->vars)
+            e->vars->limited = 1;
+        res = close_unionall(res, vb, e);
+    }
+    pending->n = mark;
+    pending->gcframe.nroots = JL_GC_ENCODE_PUSH(4 * mark);
+    JL_GC_POP();
+    return res;
+}
+
+static int is_captured(jl_stenv_t *e, jl_varbinding_t *vb) JL_NOTSAFEPOINT
+{
+    for (jl_varbinding_t *b = e->vars; b != NULL; b = b->prev) {
+        if (b != vb && b->depth0 == vb->depth0 &&
+            (jl_has_typevar(b->lb, vb->var) || jl_has_typevar(b->ub, vb->var)))
+            return 1;
+    }
+    return 0;
+}
+
+static int defer_unionall(jl_stenv_t *e, jl_varbinding_t *vb) JL_NOTSAFEPOINT
+{
+    jl_pending_vars_t *pending = e->pending;
+    if (pending == NULL || pending->n == JL_MAX_PENDING_VARS || vb->depth0 != pending->depth0 ||
+        vb->intvalued || obviously_egal(vb->lb, vb->ub) || !is_captured(e, vb))
+        return 0;
+    jl_varbinding_t *node = &pending->vars[pending->n];
+    *node = *vb;
+    jl_value_t ***roots = &pending->roots[4 * pending->n];
+    roots[0] = (jl_value_t**)&node->var;
+    roots[1] = &node->lb;
+    roots[2] = &node->ub;
+    roots[3] = (jl_value_t**)&node->innervars;
+    pending->n++;
+    pending->gcframe.nroots = JL_GC_ENCODE_PUSH(4 * pending->n);
+    jl_varbinding_t **link = &e->vars;
+    while (*link != vb)
+        link = &(*link)->prev;
+    *link = node;
+    return 1;
+}
+
+static int unionall_needs_pass(jl_varbinding_t *vb, jl_unionall_t *u, int pass) JL_NOTSAFEPOINT;
+
+static jl_value_t *intersect_unionall_(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8_t R, jl_param_pos_t param, jl_varbinding_t *vb, int pass) JL_CANSAFEPOINT
+{
+    jl_unionall_t *u0 = u;
     jl_varbinding_t *btemp = e->vars;
     int envsize = 0;
     while (btemp != NULL) {
@@ -5381,6 +5497,7 @@ static jl_value_t *intersect_unionall_(jl_value_t *t, jl_unionall_t *u, jl_stenv
         u = jl_rename_unionall(u);
     vb->var = u->var;
     e->vars = vb;
+    int mark = e->pending ? e->pending->n : 0;
     jl_value_t *res;
     if (R) {
         e->envidx++;
@@ -5420,6 +5537,11 @@ static jl_value_t *intersect_unionall_(jl_value_t *t, jl_unionall_t *u, jl_stenv
         }
     }
 
+    if (res != jl_bottom_type && !unionall_needs_pass(vb, u0, pass) && defer_unionall(e, vb)) {
+        JL_GC_POP();
+        return res;
+    }
+    res = close_pending_vars(res, e, mark);
     e->vars = vb->prev;
     res = close_unionall(res, vb, e);
     JL_GC_POP();
@@ -5507,6 +5629,15 @@ static int reintersection_kind(jl_varbinding_t *vb, jl_unionall_t *u) JL_NOTSAFE
     return vb->constraintkind;
 }
 
+static int unionall_needs_pass(jl_varbinding_t *vb, jl_unionall_t *u, int pass) JL_NOTSAFEPOINT
+{
+    if (pass == 1 && !vb->limited &&
+        (reintersection_kind(vb, u) != vb->constraintkind || vb->concrete || (vb->occurs_inv == 1 && vb->occurs > 1)))
+        return 1;
+    return pass < 3 && vb->constraintkind == 1 && vb->widened_to_kind == 1 &&
+           (cov_count(vb) <= 1 || is_leaf_bound(vb->ub));
+}
+
 static jl_value_t *intersect_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8_t R, jl_param_pos_t param) JL_CANSAFEPOINT
 {
     jl_value_t *res = NULL;
@@ -5526,7 +5657,7 @@ static jl_value_t *intersect_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_
     int noinv = !body_occurs_inv;
     if (is_leaf_typevar(u->var) && noinv && unionall_always_cov(u, param))
         vb.constraintkind = 1;
-    res = intersect_unionall_(t, u, e, R, param, &vb);
+    res = intersect_unionall_(t, u, e, R, param, &vb, 1);
     vb.intersected = 1;
     if (vb.limited) {
         // if the environment got too big, avoid tree recursion and propagate the flag
@@ -5538,16 +5669,20 @@ static jl_value_t *intersect_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_
         vb.constraintkind = reintersection_kind(&vb, u);
         int reintersection = constraint1 != vb.constraintkind || vb.concrete || (vb.occurs_inv == 1 && vb.occurs > 1);
         if (reintersection) {
+            assert(e->vars == vb.prev);
             if (constraint1 == 1) {
                 vb.lb = vb.var->lb;
                 vb.ub = vb.var->ub;
             }
+            if (vb.constraintkind != 1)
+                forget_open_values(e, &se);
             restore_env(e, &se, vb.constraintkind == 1 ? 1 : 0);
             vb.occurs = vb.occurs_cov = vb.occurs_inv = vb.cov_diag = 0;
-            res = intersect_unionall_(t, u, e, R, param, &vb);
+            res = intersect_unionall_(t, u, e, R, param, &vb, 2);
         }
     }
     if (res != jl_bottom_type && vb.constraintkind == 1 && vb.widened_to_kind == 1) {
+        assert(e->vars == vb.prev);
         // a `Type` was widened to a non-concrete kind union during intersection
         if (cov_count(&vb) > 1) {
             // diagonal: reintersect if able to narrow across positions to a leaf bound
@@ -5556,7 +5691,7 @@ static jl_value_t *intersect_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_
                 restore_env(e, &se, 1);
                 vb.lb = vb.var->lb;
                 vb.occurs = vb.occurs_cov = vb.occurs_inv = vb.cov_diag = 0;
-                res = intersect_unionall_(t, u, e, R, param, &vb);
+                res = intersect_unionall_(t, u, e, R, param, &vb, 3);
             }
         }
         else {
@@ -5567,7 +5702,7 @@ static jl_value_t *intersect_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_
             vb.constraintkind = 0;
             vb.widened_to_kind = 0;
             vb.occurs = vb.occurs_cov = vb.occurs_inv = vb.cov_diag = 0;
-            res = intersect_unionall_(t, u, e, R, param, &vb);
+            res = intersect_unionall_(t, u, e, R, param, &vb, 3);
         }
     }
     free_env(&se);
@@ -5731,6 +5866,8 @@ static jl_value_t *intersect_tuple(jl_datatype_t *xd, jl_datatype_t *yd, jl_sten
     size_t i=0, j=0;
     jl_value_t *xi, *yi;
     int isx = 1, isy = 1; // try to reuse the object x or y as res whenever we can (e.g. when it is the supertype) instead of allocating a copy
+    jl_pending_vars_t pending;
+    push_pending_vars(e, &pending);
     while (1) {
         vx = vy = 0;
         xi = i < llx ? jl_tparam(xd, i < lx ? i : lx - 1) : NULL;
@@ -5760,12 +5897,14 @@ static jl_value_t *intersect_tuple(jl_datatype_t *xd, jl_datatype_t *yd, jl_sten
             jl_savedenv_t se;
             save_env(e, &se, 1);
             e->vararg_elements++;
+            e->pending = NULL;
             ii = intersect_varargs((jl_vararg_t*)xi,
                                    (jl_vararg_t*)yi,
                                    lly - llx, // xi's offset: {A^n...,Vararg{T,N}} ∩ {Vararg{S,M}}
                                             // {(A∩S)^n...,Vararg{T∩S,N}} plus N = M-n
                                    e,
                                    param);
+            e->pending = &pending;
             e->vararg_elements--;
             if (ii == jl_bottom_type)
                 restore_env(e, &se, 1);
@@ -5842,6 +5981,8 @@ static jl_value_t *intersect_tuple(jl_datatype_t *xd, jl_datatype_t *yd, jl_sten
         else
             res = jl_apply_tuple_type_v(params, np);
     }
+    res = close_pending_vars(res, e, 0);
+    pop_pending_vars(e, &pending);
     JL_GC_POP();
     return res;
 }
@@ -6191,6 +6332,21 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_par
                     }
                     return jl_bottom_type;
                 }
+                if (xx && yy && xoffset == 0 && has_value(xx) && has_value(yy) &&
+                    !jl_has_typevar(xlb, (jl_tvar_t*)y) && !jl_has_typevar(ylb, (jl_tvar_t*)x)) {
+                    jl_value_t *val = R ? intersect(yub, xub, e, param) : intersect(xub, yub, e, param);
+                    if (val == jl_bottom_type)
+                        return jl_bottom_type;
+                    if (!reachable_var(val, (jl_tvar_t*)y, e) && !reachable_var(val, (jl_tvar_t*)x, e)) {
+                        yy->lb = val;
+                        yy->ub = val;
+                    }
+                    if (!reachable_var(y, (jl_tvar_t*)x, e)) {
+                        xx->lb = y;
+                        xx->ub = y;
+                    }
+                    return y;
+                }
                 int ccheck;
                 if (R) flip_offset(e);
                 if (xlb == xub && ylb == yub &&
@@ -6289,6 +6445,8 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_par
             JL_GC_PUSH2(&a, &b);
             jl_savedenv_t se;
             save_env(e, &se, 0);
+            jl_pending_vars_t *pending = e->pending;
+            e->pending = NULL;
             a = intersect_unionall(y, (jl_unionall_t*)x, e, 0, param);
             if (jl_is_unionall(a)) {
                 jl_unionall_t *ua = (jl_unionall_t*)a;
@@ -6301,6 +6459,7 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_par
                     }
                 }
             }
+            e->pending = pending;
             free_env(&se);
             if (!jl_has_free_typevars(a) && !jl_has_free_typevars(b)) {
                 if (jl_subtype(a, b))
@@ -6526,6 +6685,8 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     e->Runions.used = 0;
     int vararg_elements = e->vararg_elements;
     e->vararg_elements = 0;
+    jl_pending_vars_t *pending = e->pending;
+    e->pending = NULL;
     jl_value_t **is;
     JL_GC_PUSHARGS(is, 2);
     jl_savedenv_t se, me;
@@ -6580,6 +6741,7 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     }
     free_env(&se);
     e->vararg_elements = vararg_elements;
+    e->pending = pending;
     JL_GC_POP();
     return is[0];
 }
