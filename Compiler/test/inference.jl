@@ -4777,6 +4777,25 @@ let
     @test mergewith(+, d, e, f).dicts == (Dict(1 => 10, 2 => 7), Dict(4.0 => 2, 5.0 => 20))
 end
 
+# issue #64493
+struct Wrap64493{F}
+    f::F
+end
+(w::Wrap64493)(acc, x) = w.f(x)
+(w::Wrap64493)(::Missing, x) = w.f(x)
+unwrap64493(x) = x
+unwrap64493(x::Tuple) = Wrap64493(unwrap64493)(Base.inferencebarrier(nothing), x[1])
+@test Base.return_types(unwrap64493, (Tuple{Tuple{Tuple{Int}}},)) == Any[Int]
+
+struct Rewrap64493{F}
+    f::F
+end
+(w::Rewrap64493)(acc, x) = w.f(Base.inferencebarrier(nothing), x)
+(w::Rewrap64493)(::Missing, x) = w.f(Base.inferencebarrier(nothing), x)
+rewrap64493(x) = x
+rewrap64493(x::Tuple) = Rewrap64493(Wrap64493(rewrap64493))(Base.inferencebarrier(nothing), x[1])
+@test Base.return_types(rewrap64493, (Tuple{Tuple{Tuple{Int}}},)) == Any[Int]
+
 # Issue #31974
 f31974(a::UnitRange) = (if first(a) <= last(a); f31974((first(a)+1):last(a)); end; a)
 f31974(n::Int) = f31974(1:n)
