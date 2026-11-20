@@ -115,6 +115,49 @@ function is_derived_type_from_any(@nospecialize(t), sources::SimpleVector, minde
     return false
 end
 
+function is_tuple_tail(t::DataType, c::DataType)
+    tP = t.parameters
+    cP = c.parameters
+    ntail = length(cP) - length(tP)
+    ntail > 0 || return false
+    for i = 1:length(tP)
+        tPi = tP[i]
+        isvarargtype(tPi) && return false
+        tPi === cP[i + ntail] || return false
+    end
+    return true
+end
+
+function is_derived_tuple_tail(t::DataType, @nospecialize(c))
+    isa(c, DataType) || return false
+    c.name === Tuple.name && is_tuple_tail(t, c) && return true
+    for p in c.parameters
+        is_derived_tuple_tail(t, p) && return true
+    end
+    return false
+end
+
+function is_structural_descent(@nospecialize(t), @nospecialize(c))
+    isa(t, DataType) && isa(c, DataType) || return false
+    tP = t.parameters
+    cP = c.parameters
+    length(tP) == length(cP) || return false
+    descends = false
+    for i = 1:length(tP)
+        tPi = tP[i]
+        cPi = cP[i]
+        tPi === cPi && continue
+        isvarargtype(tPi) && return false
+        isvarargtype(cPi) && return false
+        if !is_derived_type(tPi, cPi, 2)
+            isa(tPi, DataType) && tPi.name === Tuple.name || return false
+            is_derived_tuple_tail(tPi, cPi) || return false
+        end
+        descends = true
+    end
+    return descends
+end
+
 # The goal of this function is to return a type of greater "size" and less "complexity" than
 # both `t` or `c` over the lattice defined by `sources`, `depth`, and `allowed_tuplelen`.
 function _limit_type_size(@nospecialize(t), @nospecialize(c), sources::SimpleVector, depth::Int, allowed_tuplelen::Int)

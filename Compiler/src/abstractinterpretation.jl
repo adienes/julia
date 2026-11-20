@@ -728,6 +728,8 @@ function abstract_call_method(interp::AbstractInterpreter,
             # n.b. currently don't allow vararg reducers
             #l_comparison = length((unwrap_unionall(comparison)::DataType).parameters)
             #spec_len = max(spec_len, l_comparison)
+        elseif is_structural_descent(sig, frame_instance(topmost).specTypes)
+            comparison = sig
         else
             comparison = method.sig
         end
