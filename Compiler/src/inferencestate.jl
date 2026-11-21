@@ -1075,6 +1075,8 @@ function is_free_typevar_in_spec(v::TypeVar, @nospecialize(specTypes))
     return false
 end
 
+sparam_slot_defined(@nospecialize(sp)) = ccall(:jl_sparam_slot_value, Ptr{Cvoid}, (Any,), sp) != C_NULL
+
 function sptypes_from_meth_instance(mi::MethodInstance)
     def = mi.def
     isa(def, Method) || return EMPTY_SPTYPES # toplevel
@@ -1126,7 +1128,8 @@ function sptypes_from_meth_instance(mi::MethodInstance)
                 ty = rewrap_free_typevars(TypeEq{v}, find_free_typevars(mi.specTypes))
                 v_egal = false
             end
-            undef = !v_constrained && !constrains_var(vᵢ, temp.body, MATCH_TYPEOF)
+            undef = isdispatchtuple(mi.specTypes) ? !sparam_slot_defined(spvals[i]) :
+                !v_constrained && !constrains_var(vᵢ, temp.body, MATCH_TYPEOF)
         elseif isvarargtype(v)
             # this parameter came from `func(..., ::Vararg{T,v})`,
             # so the type is known to be `Int`

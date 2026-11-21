@@ -9423,6 +9423,24 @@ end
 @test gtuple_sparam_value_62099(Tuple{Type{Int}}) === Type{Int}
 @test gvararg_sparam_value_62099(Tuple{Type{Int}}) === Type{Int}
 
+bound_only_sparam(::Type{S}) where {T,S>:Vector{T}} = @isdefined(T) ? T : nothing
+@test bound_only_sparam(Vector) === nothing
+@test (() -> try bound_only_sparam(Vector) catch; :caught end)() === nothing
+bound_pair_sparam(::Type{S}) where {T,S>:Pair{T,Int}} = @isdefined(T) ? T : nothing
+@test bound_pair_sparam(Pair{X,Int} where X) === nothing
+@test bound_pair_sparam(Pair{X,X} where X) === Int
+bound_bottom_sparam(::Type{S}) where {T,S>:Pair{T,Union{}}} = @isdefined(T) ? T : nothing
+@test bound_bottom_sparam(Pair{X,X} where X) === Union{}
+bound_range_sparam(::Type{S}) where {T<:Real,S>:Vector{T}} = @isdefined(T) ? T : nothing
+@test bound_range_sparam(Vector{X} where X>:Int) === Int
+bound_equal_sparam(::Type{S}) where {T<:Tuple{Vector},S>:Vector{T}} = @isdefined(T) ? T : nothing
+@test bound_equal_sparam(Vector{X} where X>:(Tuple{Vector{Y}} where Y)) == Tuple{Vector}
+bound_nested_sparam(::Type{S}) where {T,S>:Pair{Int,T}} = @isdefined(T) ? T : nothing
+@test bound_nested_sparam(Pair{X,Vector{X}} where X) === Vector{Int}
+const unresolved_sparam_arg = Pair{X,X} where X
+unresolved_sparam(::Type{S}, x::T) where {U,T,S>:Pair{T,U}} = T
+@test (() -> try unresolved_sparam(unresolved_sparam_arg, 1) catch; Int end)() === Int
+
 # An inferred / constant-folded type must not contain a `(tvar, constrains_bool)`
 # SimpleVector pair as a type parameter. The intersection-env svec format must
 # stay confined to env entries; downstream consumers of intersection results
