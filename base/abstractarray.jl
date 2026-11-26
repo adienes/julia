@@ -1579,8 +1579,9 @@ unalias(dest, A) = A
 """
     Base.unaliascopy(A)
 
-Make a preventative copy of `A` in an operation where `A` [`Base.mightalias`](@ref) against
-another array in order to preserve consistent semantics as that other array is mutated.
+Make a preventative copy of `A` in an operation where `A` might share memory with another
+array, as reported by their [`Base.dataids`](@ref), in order to preserve consistent semantics
+as that other array is mutated.
 
 This must return an object of the same type as `A` to preserve optimal performance in the
 much more common case where aliasing does not occur. By default,
@@ -1630,7 +1631,7 @@ Return a tuple of `UInt`s that represent the mutable data segments of an array.
 Custom arrays that would like to opt-in to aliasing detection of their component
 parts can specialize this method to return the concatenation of the `dataids` of
 their component parts.  A typical definition for an array that wraps a parent is
-`Base.dataids(C::CustomArray) = dataids(C.parent)`.
+`Base.dataids(C::CustomArray) = Base.dataids(C.parent)`.
 """
 dataids(A::AbstractArray) = (objectid(A),)
 dataids(A::Memory) = (UInt(A.ptr),)

@@ -158,6 +158,17 @@ Base.vec
 Base.SubArray
 ```
 
+## Aliasing
+
+Operations that write to one array while reading from another, such as `copyto!`, broadcasting
+and indexed assignment, first copy the source if the two might share memory. Custom arrays take
+part in this check through the following [optional methods](@ref man-interface-array).
+
+```@docs
+Base.dataids
+Base.unaliascopy
+```
+
 ## Concatenation and permutation
 
 ```@docs

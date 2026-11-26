@@ -56,6 +56,8 @@ New library functions
   of `x`, excluding the padding that `sizeof` includes. It throws for any other type or value ([#61359]).
 * `filterfirst(f, itr)` returns the first element of `itr` for which `f` returns `true` ([#60913]).
 * `growat!(a::Vector, i, delta)` grows `a` by `delta` uninitialized elements inserted at index `i` ([#63573]).
+* `Base.dataids` and `Base.unaliascopy` have been made `public` (but not exported); they are how
+  custom arrays take part in the aliasing checks of `copyto!`, broadcasting and indexed assignment.
 
 New library features
 --------------------

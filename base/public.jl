@@ -56,6 +56,8 @@ public
     memoryindex,
     unsetindex!,
     unsetindex_atomic!,
+    dataids,
+    unaliascopy,
 
 # collections
     IteratorEltype,
