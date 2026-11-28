@@ -292,9 +292,14 @@ end
 
 function Base.copyto!(dest::PermutedDimsArray{<:Any,N}, src::AbstractArray{<:Any,N}) where {N}
     isempty(src) && return dest
-    checkbounds(dest, axes(src)...)
-    src′ = Base.unalias(dest, src)
-    _copy!(dest, src′)
+    if axes(dest) == axes(src)
+        _copy!(dest, Base.unalias(dest, src))
+    else
+        length(src) <= length(dest) || Base.throw_boundserror(dest, LinearIndices(src))
+        src′ = Base.unalias(dest, src)
+        Base.copyto_unaliased!(IndexStyle(dest), dest, IndexStyle(src′), src′)
+    end
+    return dest
 end
 
 function _copy!(P::PermutedDimsArray{T,N,perm}, src) where {T,N,perm}
